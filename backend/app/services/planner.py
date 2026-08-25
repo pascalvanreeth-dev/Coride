@@ -4,18 +4,42 @@ import asyncio
 from typing import Any
 
 from app.config import settings
-from app.models import Knooppunt, Place, PlanRequest, RerouteRequest, RerouteResponse, RoutePlan, Stop
+from app.models import Knooppunt, Locality, Place, PlanRequest, RerouteRequest, RerouteResponse, RoutePlan, Stop, WeatherInfo
 from app.services import events as events_service
 from app.services import geocoding
 from app.services import knooppunten as knoop_service
+from app.services import places as places_service
 from app.services import pois as pois_service
 from app.services import routing
+from app.services import suggestions as suggestion_service
+from app.services import weather as weather_service
 from app.services import wikipedia
 from app.services.ai import enrich_with_ai, fallback_scripts, polish_scripts
 from app.services.geo import haversine_m, point_to_segment_m, unique_key
 
 
+SPEED_KMH = {
+    ("recreant", "stadsfiets"): 14,
+    ("recreant", "ebike"): 18,
+    ("recreant", "racefiets"): 18,
+    ("recreant", "gravel"): 15,
+    ("sportief", "stadsfiets"): 17,
+    ("sportief", "ebike"): 22,
+    ("sportief", "racefiets"): 24,
+    ("sportief", "gravel"): 19,
+    ("wielrenner", "stadsfiets"): 20,
+    ("wielrenner", "ebike"): 24,
+    ("wielrenner", "racefiets"): 28,
+    ("wielrenner", "gravel"): 22,
+}
+
+
 async def plan_route(request: PlanRequest) -> RoutePlan:
+    catalog_route = suggestion_service.get_route_by_id(request.suggestion_id) if request.suggestion_id else None
+    if catalog_route:
+        request.interests = suggestion_service.merge_interests(catalog_route, request.interests)
+        request.notes = suggestion_service.merge_notes(catalog_route, request.notes)
+
     start = await geocoding.geocode_one(request.start)
     if request.mode == "punt":
         if not request.end:
@@ -24,9 +48,16 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     else:
         end = start
 
+    profile = request.profile
+    weather = WeatherInfo(**await weather_service.fetch_weather(start.lat, start.lng))
+    request.distance_km = _effective_distance(request, profile, weather)
+
     radius = _search_radius(request, start, end)
     extra = (end.lat, end.lng) if request.mode == "punt" else None
-    want_horeca = pois_service.notes_want_horeca(request.notes)
+    horeca_prefs = list(profile.horeca) if profile else []
+    want_horeca = pois_service.notes_want_horeca(request.notes, request.interests, horeca_prefs)
+    want_wiki = any(item in request.interests for item in ("geschiedenis", "oorlog", "architectuur"))
+    rider_notes = _profile_notes(profile, request.notes, request.adapt_reason, weather)
     nodes, osm_pois, wiki_places, live_events, horeca = await asyncio.gather(
         _optional(knoop_service.fetch_nodes(start.lat, start.lng, radius, extra), [], 14),
         _optional(pois_service.fetch_pois(start.lat, start.lng, radius, request.interests, extra), [], 8),
@@ -39,24 +70,35 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             6,
         ),
         _optional(
-            pois_service.fetch_horeca(start.lat, start.lng, radius, extra) if want_horeca else asyncio.sleep(0, result=[]),
+            pois_service.fetch_horeca(start.lat, start.lng, radius, extra, horeca_prefs) if want_horeca else asyncio.sleep(0, result=[]),
             [],
             10,
         ),
     )
-    if "geschiedenis" not in request.interests:
+    if not want_wiki:
         wiki_places = []
     candidates = _merge(osm_pois, wiki_places, live_events, horeca)
     knoop_service.attach_nearby(nodes, candidates)
-    knoop_service.score_nodes_for_notes(nodes, request.notes)
+    knoop_service.score_nodes_for_notes(nodes, rider_notes)
+
+    user_chain = knoop_service.chain_from_user(
+        [n.model_dump() for n in request.knooppunten],
+        request.mode == "lus",
+    )
+    if user_chain:
+        seen = {n.get("id") for n in nodes}
+        for node in user_chain:
+            if node["id"] not in seen:
+                nodes.append(node)
+                seen.add(node["id"])
 
     geometric = knoop_service.plan_node_chain(nodes, start.lat, start.lng, request.distance_km, extra)
     noted = (
         knoop_service.chain_from_notes(nodes, start.lat, start.lng, request.distance_km, extra)
-        if request.notes.strip()
+        if rider_notes.strip()
         else []
     )
-    chain = noted or geometric
+    chain = user_chain or noted or geometric
     start_node = knoop_service.nearest_node(nodes, start.lat, start.lng) if nodes else None
     ai_nodes = _nodes_for_ai(nodes, start_node) if nodes else []
 
@@ -71,15 +113,16 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     ai_choice = await enrich_with_ai(
         start.label,
         request.interests,
-        request.notes,
+        rider_notes,
         wiki_targets,
         request.mode,
         request.distance_km,
         knoop_service.chain_label(chain) if chain else "",
-        ai_nodes if request.notes.strip() else [],
+        ai_nodes if rider_notes.strip() else [],
+        profile,
     )
-    route_reason = ""
-    if request.notes.strip() and ai_choice and start_node and nodes:
+    route_reason = "Eigen knooppuntenroute" if user_chain else ""
+    if rider_notes.strip() and ai_choice and start_node and nodes and not user_chain:
         ai_chain = knoop_service.resolve_chain(
             ai_choice.get("knoop_ids") or [],
             nodes,
@@ -88,9 +131,9 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         )
         if ai_chain:
             chain = ai_chain
-            route_reason = ai_choice.get("reason") or f"Route aangepast aan: {request.notes}"
-    if request.notes.strip() and (noted or (ai_choice or {}).get("knoop_ids")):
-        route_reason = route_reason or f"Knooppunten gekozen bij: {request.notes}"
+            route_reason = ai_choice.get("reason") or f"Route aangepast aan: {rider_notes}"
+    if rider_notes.strip() and (noted or (ai_choice or {}).get("knoop_ids")):
+        route_reason = route_reason or f"Knooppunten gekozen bij: {rider_notes}"
 
     knoop_label = knoop_service.chain_label(chain) if chain else ""
     if chain:
@@ -104,22 +147,27 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     selected = _pick(wiki_targets, ai_choice, request) if wiki_targets else []
 
     if chain:
-        route_points = [(start.lat, start.lng), *[(n["lat"], n["lng"]) for n in chain]]
-        if request.mode == "punt":
-            route_points.append((end.lat, end.lng))
-        else:
-            route_points.append((start.lat, start.lng))
+        spine = _chain_spine(chain)
+        expanded, route = await _build_knoop_route(
+            start.lat,
+            start.lng,
+            spine,
+            close_loop=request.mode != "punt",
+            end_lat=end.lat if request.mode == "punt" else None,
+            end_lng=end.lng if request.mode == "punt" else None,
+        )
+        chain = expanded
+        knoop_label = knoop_service.chain_label(chain)
+        selected = _along_geometry(selected, route["geometry"])
     elif request.mode == "lus":
         order = await routing.round_trip_order((start.lat, start.lng), [(s["lat"], s["lng"]) for s in selected])
         selected = [selected[i] for i in order]
         route_points = [(start.lat, start.lng), *[(s["lat"], s["lng"]) for s in selected], (start.lat, start.lng)]
+        route = await routing.bike_route(route_points)
     else:
         selected = _along_corridor(selected, start, end)
         route_points = [(start.lat, start.lng), *[(s["lat"], s["lng"]) for s in selected], (end.lat, end.lng)]
-
-    route = await routing.bike_route(route_points)
-    if chain:
-        selected = _along_geometry(selected, route["geometry"])
+        route = await routing.bike_route(route_points)
 
     stops = []
     for index, poi in enumerate(selected, start=1):
@@ -147,8 +195,36 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         )
 
     stops = await polish_scripts(stops, request.explanation_level)
-    title = (ai_choice or {}).get("title") or _title(request, start, end, knoop_label)
-    intro = (ai_choice or {}).get("intro") or _intro(request, start, selected, route, knoop_label)
+    stops = await places_service.enrich_stops_with_places(stops, request.interests)
+    stops = places_service.assign_sides(stops, route["geometry"])
+    for stop in stops:
+        place = stop.get("place_name") or ""
+        pop = stop.get("population")
+        fact = stop.get("local_fact") or ""
+        side = stop.get("side") or ""
+        extras = []
+        if place:
+            extras.append(f"in {place}" + (f" ({pop} inwoners)" if pop else ""))
+        if side and side not in {"langs de route", ""}:
+            extras.append(f"aan je {side}")
+        if fact and fact not in (stop.get("arrived") or ""):
+            extras.append(fact)
+        if extras and request.explanation_level != "kort":
+            stop["arrived"] = f"{stop['arrived']} {' · '.join(extras)}"
+        elif place and place not in (stop.get("approaching") or ""):
+            stop["approaching"] = f"{stop['approaching']} Je bent in {place}."
+
+    title = (ai_choice or {}).get("title") or (catalog_route["title"] if catalog_route else _title(request, start, end, knoop_label))
+    intro = (ai_choice or {}).get("intro") or (
+        suggestion_service.catalog_intro(
+            catalog_route,
+            request.interests,
+            round(route["distance_m"] / 1000, 1),
+            start.label,
+        )
+        if catalog_route
+        else _intro(request, start, selected, route, knoop_label, weather)
+    )
 
     model_stops = [
         Stop(
@@ -165,6 +241,10 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             why=s["why"],
             wikipedia_url=s.get("wikipedia_url"),
             image_url=s.get("image_url"),
+            place_name=s.get("place_name"),
+            population=s.get("population"),
+            local_fact=s.get("local_fact"),
+            side=s.get("side"),
         )
         for s in stops
     ]
@@ -181,11 +261,18 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     ]
     chain_ids = {n.get("id") for n in chain if n.get("id")}
     all_knoop = _unique_knooppunten(nodes, chain_ids)
+    localities = _localities_from_stops(model_stops)
+    if catalog_route:
+        localities = suggestion_service.merge_localities(catalog_route, localities)
+        if not route_reason:
+            route_reason = f"Route Top 10 · {catalog_route['title']}"
     sources = sorted(
         {stop.source for stop in model_stops}
         | {n.get("source") or "Toerisme Vlaanderen" for n in chain}
-        | {"OpenStreetMap", "OSRM fietsrouting", "Wikipedia", "Fietsknooppuntennetwerk Vlaanderen"}
+        | {"OpenStreetMap", "OSRM fietsrouting", "Wikipedia", "Fietsknooppuntennetwerk Vlaanderen", "Open-Meteo"}
     )
+    if weather.alert and not route_reason:
+        route_reason = weather.alert
     return RoutePlan(
         title=title,
         intro=intro,
@@ -203,39 +290,77 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         route_reason=route_reason,
         steps=route.get("steps") or [],
         explanation_level=request.explanation_level,
+        interaction=(profile.interaction if profile else "live"),
+        weather=weather,
+        budget_mode=request.budget_mode,
+        duration_budget_min=request.duration_min,
+        localities=localities,
         sources=sources,
         ai_used=bool(ai_choice),
     )
 
 
 async def reroute(request: RerouteRequest) -> RerouteResponse:
-    if len(request.nodes) < 1:
+    weather = WeatherInfo(**await weather_service.fetch_weather(request.start_lat, request.start_lng))
+    nodes = list(request.nodes)
+    reason = ""
+    if request.reason in {"regen", "wind", "korter"} or (request.reason is None and weather.suggest_shorter):
+        target = request.target_km or max(8.0, (weather.suggest_shorter and 12.0) or 12.0)
+        if request.reason == "wind":
+            reason = weather.alert or "Kortere lus door wind."
+        elif request.reason == "regen":
+            reason = weather.alert or "Kortere lus door regen."
+        else:
+            reason = weather.alert or "Kortere knooppuntenroute voorgesteld."
+        nodes = _shorten_nodes(nodes, request.start_lat, request.start_lng, target, request.close_loop)
+    elif request.reason == "veer":
+        reason = "Omleiding: veerpont vermeden of route verkort."
+        if len(nodes) > 3:
+            mid = len(nodes) // 2
+            nodes = nodes[:mid] + nodes[mid + 1 :]
+    if request.remaining_nodes:
+        nodes = [
+            Knooppunt(
+                id=n.id,
+                number=n.number,
+                lat=n.lat,
+                lng=n.lng,
+                network=n.network,
+                on_route=True,
+            )
+            for n in request.remaining_nodes
+        ] or nodes
+
+    if len(nodes) < 1:
         raise ValueError("Selecteer minstens één knooppunt.")
-    points: list[tuple[float, float]] = [(request.start_lat, request.start_lng)]
-    for node in request.nodes:
-        candidate = (node.lat, node.lng)
-        if haversine_m(candidate[0], candidate[1], points[-1][0], points[-1][1]) > 20:
-            points.append(candidate)
-    if request.close_loop:
-        start = (request.start_lat, request.start_lng)
-        if haversine_m(points[-1][0], points[-1][1], start[0], start[1]) > 20:
-            points.append(start)
-    if len(points) < 2:
-        raise ValueError("Te weinig punten voor een fietsroute.")
-    route = await routing.bike_route(points)
+    chain = [
+        {
+            "id": n.id or f"{n.number}|{round(n.lat, 4)}",
+            "number": n.number,
+            "lat": n.lat,
+            "lng": n.lng,
+            "network": n.network,
+            "geoid": None,
+        }
+        for n in nodes
+    ]
+    expanded, route = await _build_knoop_route(
+        request.start_lat,
+        request.start_lng,
+        chain,
+        close_loop=request.close_loop,
+    )
     knoop_models = [
         Knooppunt(
-            id=n.id,
-            number=n.number,
-            lat=n.lat,
-            lng=n.lng,
-            network=n.network,
+            id=n.get("id") or "",
+            number=n["number"],
+            lat=n["lat"],
+            lng=n["lng"],
+            network=n.get("network"),
             on_route=True,
         )
-        for n in request.nodes
+        for n in expanded
     ]
-    if request.close_loop and knoop_models and knoop_models[0].id != knoop_models[-1].id:
-        knoop_models.append(knoop_models[0])
     return RerouteResponse(
         geometry=route["geometry"],
         distance_km=round(route["distance_m"] / 1000, 1),
@@ -243,7 +368,63 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
         knooppunten=knoop_models,
         knoop_chain=" → ".join(n.number for n in knoop_models),
         steps=route.get("steps") or [],
+        reason=reason,
+        weather=weather,
     )
+
+
+async def preview_route(
+    lat: float,
+    lng: float,
+    distance_km: int,
+    mode: str = "lus",
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    extra = (end_lat, end_lng) if mode == "punt" and end_lat is not None and end_lng is not None else None
+    if mode == "punt" and extra:
+        direct = haversine_m(lat, lng, end_lat, end_lng)
+        radius = int(min(16000, max(5000, direct / 2 + 4000)))
+    else:
+        radius = int(min(16000, max(5000, distance_km * 1000 / 2.2)))
+
+    nodes = await knoop_service.fetch_nodes(lat, lng, radius, extra)
+    geometric = knoop_service.plan_node_chain(nodes, lat, lng, distance_km, extra)
+    noted = (
+        knoop_service.chain_from_notes(nodes, lat, lng, distance_km, extra)
+        if notes.strip()
+        else []
+    )
+    chain = noted or geometric
+    if not chain:
+        raise ValueError("Geen knooppunten gevonden voor een routevoorbeeld.")
+
+    expanded, route = await _build_knoop_route(
+        lat,
+        lng,
+        _chain_spine(chain),
+        close_loop=mode == "lus",
+        end_lat=end_lat if mode == "punt" else None,
+        end_lng=end_lng if mode == "punt" else None,
+    )
+    return {
+        "geometry": route["geometry"],
+        "distance_km": round(route["distance_m"] / 1000, 1),
+        "duration_min": max(1, round(route["duration_s"] / 60)),
+        "knooppunten": [
+            Knooppunt(
+                id=n.get("id") or "",
+                number=n["number"],
+                lat=n["lat"],
+                lng=n["lng"],
+                network=n.get("network"),
+                on_route=True,
+            )
+            for n in expanded
+        ],
+        "knoop_chain": knoop_service.chain_label(expanded),
+    }
 
 
 def _unique_knooppunten(nodes: list[dict[str, Any]], chain_ids: set[str]) -> list[Knooppunt]:
@@ -265,6 +446,41 @@ def _unique_knooppunten(nodes: list[dict[str, Any]], chain_ids: set[str]) -> lis
             )
         )
     return result
+
+
+async def _build_knoop_route(
+    start_lat: float,
+    start_lng: float,
+    chain: list[dict[str, Any]],
+    *,
+    close_loop: bool = True,
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    spine = _chain_spine(chain)
+    network_nodes, trajects = await knoop_service.fetch_network_for_chain(spine)
+    spine = knoop_service.enrich_chain_geoids(spine, network_nodes)
+    expanded = knoop_service.expand_chain(spine, network_nodes, trajects)
+    waypoints = knoop_service.waypoints_for_chain(
+        start_lat,
+        start_lng,
+        expanded,
+        close_loop=close_loop,
+        end_lat=end_lat,
+        end_lng=end_lng,
+    )
+    try:
+        route = await routing.bike_route_via_waypoints(waypoints)
+    except Exception:
+        route = knoop_service.route_from_trajects(waypoints, expanded, trajects)
+    return expanded, route
+
+
+def _chain_spine(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned = knoop_service._dedupe_adjacent(chain)
+    if len(cleaned) >= 2 and cleaned[0].get("id") == cleaned[-1].get("id"):
+        return cleaned[:-1]
+    return cleaned
 
 
 def _search_radius(request: PlanRequest, start: Place, end: Place) -> int:
@@ -396,15 +612,88 @@ def _intro(
     selected: list[dict[str, Any]],
     route: dict[str, Any],
     knoop_chain: str,
+    weather: WeatherInfo | None = None,
 ) -> str:
     km = round(route["distance_m"] / 1000, 1)
     names = ", ".join(poi["name"] for poi in selected[:3])
     extra = f" {request.notes}." if request.notes else ""
     chain = f" Volg knooppunten {knoop_chain}." if knoop_chain else ""
     sights = f" Onderweg: {names}." if names else ""
+    place = start.place_name or start.label.split(",")[0]
+    weather_bit = f" Weer: {weather.summary}." if weather and weather.summary else ""
     return (
-        f"Vanaf {start.label.split(',')[0]} fiets je ongeveer {km} km.{chain}{sights}{extra}"
+        f"Vanaf {place} fiets je ongeveer {km} km.{chain}{sights}{extra}{weather_bit}"
     )
+
+
+def _effective_distance(request: PlanRequest, profile, weather: WeatherInfo) -> int:
+    distance = int(request.distance_km)
+    if request.budget_mode == "time" and request.duration_min:
+        speed = SPEED_KMH.get(
+            (getattr(profile, "fitness", "recreant"), getattr(profile, "bike", "stadsfiets")),
+            16,
+        )
+        distance = max(8, min(90, round(request.duration_min / 60 * speed)))
+    if request.adapt_reason in {"regen", "wind", "korter"} or weather.suggest_shorter:
+        distance = max(8, min(distance, round(distance * 0.65)))
+    return distance
+
+
+def _shorten_nodes(nodes: list[Knooppunt], start_lat: float, start_lng: float, target_km: float, loop: bool) -> list[Knooppunt]:
+    if len(nodes) <= 2:
+        return nodes
+    unique = []
+    seen = set()
+    for node in nodes:
+        key = node.id or f"{node.number}|{round(node.lat, 4)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(node)
+    unique.sort(key=lambda n: haversine_m(start_lat, start_lng, n.lat, n.lng))
+    keep = max(2, min(len(unique), 3 if target_km < 15 else 4))
+    picked = unique[:keep]
+    if loop and picked:
+        return picked
+    return picked
+
+
+def _localities_from_stops(stops: list[Stop]) -> list[Locality]:
+    seen: set[str] = set()
+    result: list[Locality] = []
+    for stop in stops:
+        name = (stop.place_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(
+            Locality(
+                name=name,
+                municipality=None,
+                population=stop.population,
+                fact=stop.local_fact or "",
+                lat=stop.lat,
+                lng=stop.lng,
+            )
+        )
+    return result
+
+
+def _profile_notes(profile, notes: str, adapt_reason: str | None = None, weather: WeatherInfo | None = None) -> str:
+    parts = [notes.strip()] if notes and notes.strip() else []
+    if profile and profile.horeca:
+        labels = {
+            "snack": "snack of terras",
+            "tafelen": "restaurant",
+            "koffie": "koffie en taart",
+            "brouwerijen": "brouwerij of café",
+        }
+        parts.append("horeca: " + ", ".join(labels.get(item, item) for item in profile.horeca))
+    if adapt_reason == "veer":
+        parts.append("vermijd veerponten")
+    if adapt_reason in {"regen", "wind", "korter"} or (weather and weather.suggest_shorter):
+        parts.append("kortere beschutte lus")
+    return ". ".join(part for part in parts if part)
 
 
 async def _optional(task, fallback, timeout: float = 8):

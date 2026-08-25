@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import heapq
 import math
 import re
 from typing import Any
@@ -75,6 +77,7 @@ async def _from_wfs(points: list[tuple[float, float]], radius_m: int) -> list[di
                             "number": str(number),
                             "lat": float(coords[1]),
                             "lng": float(coords[0]),
+                            "geoid": props.get("geoid"),
                             "network": props.get("naam") or "Fietsknooppuntennetwerk Vlaanderen",
                             "source": "Toerisme Vlaanderen",
                         }
@@ -189,8 +192,338 @@ def plan_node_chain(
     return _dedupe_adjacent(chain)
 
 
+def chain_from_user(selected: list[dict[str, Any]], loop: bool) -> list[dict[str, Any]]:
+    chain = _dedupe_adjacent(
+        [
+            {
+                "id": str(node.get("id") or f"{node['number']}|{round(float(node['lat']), 4)}"),
+                "number": str(node["number"]),
+                "lat": float(node["lat"]),
+                "lng": float(node["lng"]),
+                "network": node.get("network") or "Fietsknooppuntennetwerk Vlaanderen",
+            }
+            for node in selected
+            if node.get("number") is not None and node.get("lat") is not None
+        ]
+    )
+    if loop and chain and chain[0]["id"] != chain[-1]["id"]:
+        chain.append(chain[0])
+    return chain
+
+
 def chain_label(nodes: list[dict[str, Any]]) -> str:
     return " → ".join(n["number"] for n in nodes)
+
+
+async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 2500) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not chain:
+        return [], []
+    min_lat = min(node["lat"] for node in chain)
+    max_lat = max(node["lat"] for node in chain)
+    min_lng = min(node["lng"] for node in chain)
+    max_lng = max(node["lng"] for node in chain)
+    pad_lat = padding_m / 111_000
+    pad_lng = padding_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
+    bbox = (min_lng - pad_lng, min_lat - pad_lat, max_lng + pad_lng, max_lat + pad_lat)
+    nodes, trajects = await _fetch_bbox(bbox)
+    return nodes, trajects
+
+
+def build_adjacency(trajects: list[dict[str, Any]]) -> dict[int, list[tuple[int, float]]]:
+    adj: dict[int, list[tuple[int, float]]] = {}
+    for traject in trajects:
+        start = traject.get("begin_geoid")
+        end = traject.get("end_geoid")
+        if not start or not end:
+            continue
+        weight = float(traject.get("shape_length") or traject.get("length_m") or 1.0)
+        adj.setdefault(int(start), []).append((int(end), weight))
+        adj.setdefault(int(end), []).append((int(start), weight))
+    return adj
+
+
+def expand_chain(
+    chain: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]],
+    trajects: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    chain = enrich_chain_geoids(chain, network_nodes)
+    if len(chain) <= 1:
+        return list(chain)
+    by_geoid = {
+        int(node["geoid"]): node
+        for node in network_nodes
+        if node.get("geoid") is not None
+    }
+    for node in chain:
+        if node.get("geoid") is not None:
+            by_geoid[int(node["geoid"])] = node
+    adj = build_adjacency(trajects)
+    expanded: list[dict[str, Any]] = []
+    for index in range(len(chain) - 1):
+        segment = _segment_through_network(chain[index], chain[index + 1], by_geoid, adj)
+        for node in segment:
+            if expanded and expanded[-1].get("geoid") == node.get("geoid") and expanded[-1].get("number") == node.get("number"):
+                continue
+            if expanded and expanded[-1]["id"] == node["id"]:
+                continue
+            expanded.append(node)
+    return expanded or list(chain)
+
+
+def enrich_chain_geoids(chain: list[dict[str, Any]], network_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_number: dict[str, list[dict[str, Any]]] = {}
+    for node in network_nodes:
+        by_number.setdefault(str(node["number"]), []).append(node)
+    enriched: list[dict[str, Any]] = []
+    for node in chain:
+        if node.get("geoid") is not None:
+            enriched.append(node)
+            continue
+        options = by_number.get(str(node["number"]), [])
+        if not options:
+            enriched.append(node)
+            continue
+        best = min(
+            options,
+            key=lambda item: haversine_m(node["lat"], node["lng"], item["lat"], item["lng"]),
+        )
+        enriched.append({**node, "geoid": best.get("geoid")})
+    return enriched
+
+
+def waypoints_for_chain(
+    start_lat: float,
+    start_lng: float,
+    chain: list[dict[str, Any]],
+    *,
+    close_loop: bool = True,
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = [(start_lat, start_lng)]
+    for node in chain:
+        candidate = (float(node["lat"]), float(node["lng"]))
+        if haversine_m(points[-1][0], points[-1][1], candidate[0], candidate[1]) > 15:
+            points.append(candidate)
+    if close_loop:
+        start = (start_lat, start_lng)
+        if haversine_m(points[-1][0], points[-1][1], start[0], start[1]) > 15:
+            points.append(start)
+    elif end_lat is not None and end_lng is not None:
+        end = (end_lat, end_lng)
+        if haversine_m(points[-1][0], points[-1][1], end[0], end[1]) > 15:
+            points.append(end)
+    return points
+
+
+def route_from_trajects(
+    waypoints: list[tuple[float, float]],
+    expanded: list[dict[str, Any]],
+    trajects: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Official knooppunten shapes from WFS when OSRM is unavailable."""
+    by_edge: dict[tuple[int, int], list[list[float]]] = {}
+    edge_length: dict[tuple[int, int], float] = {}
+    for traject in trajects:
+        begin = traject.get("begin_geoid")
+        end = traject.get("end_geoid")
+        coords = traject.get("coordinates") or []
+        if begin is None or end is None or len(coords) < 2:
+            continue
+        a, b = int(begin), int(end)
+        by_edge[(a, b)] = coords
+        by_edge[(b, a)] = list(reversed(coords))
+        length = float(traject.get("shape_length") or 0)
+        if length > 0:
+            edge_length[(a, b)] = length
+            edge_length[(b, a)] = length
+
+    geometry: list[list[float]] = []
+    distance_m = 0.0
+
+    def append_segment(segment: list[list[float]], *, known_length: float | None = None) -> None:
+        nonlocal distance_m
+        if not segment:
+            return
+        trimmed = segment
+        if geometry and trimmed:
+            if haversine_m(geometry[-1][0], geometry[-1][1], trimmed[0][0], trimmed[0][1]) < 8:
+                trimmed = trimmed[1:]
+        if not trimmed:
+            return
+        geometry.extend(trimmed)
+        if known_length and known_length > 0:
+            distance_m += known_length
+            return
+        for index in range(1, len(trimmed)):
+            distance_m += haversine_m(
+                trimmed[index - 1][0],
+                trimmed[index - 1][1],
+                trimmed[index][0],
+                trimmed[index][1],
+            )
+
+    def straight(left: dict[str, Any] | tuple[float, float], right: dict[str, Any] | tuple[float, float]) -> list[list[float]]:
+        if isinstance(left, dict):
+            left = (float(left["lat"]), float(left["lng"]))
+        if isinstance(right, dict):
+            right = (float(right["lat"]), float(right["lng"]))
+        return [[left[0], left[1]], [right[0], right[1]]]
+
+    if waypoints and expanded:
+        append_segment(straight(waypoints[0], expanded[0]))
+
+    for index in range(len(expanded) - 1):
+        left = expanded[index]
+        right = expanded[index + 1]
+        left_id = left.get("geoid")
+        right_id = right.get("geoid")
+        segment: list[list[float]] | None = None
+        known_length: float | None = None
+        if left_id is not None and right_id is not None:
+            key = (int(left_id), int(right_id))
+            segment = by_edge.get(key)
+            known_length = edge_length.get(key)
+        append_segment(segment or straight(left, right), known_length=known_length)
+
+    if waypoints and len(waypoints) >= 2 and expanded:
+        append_segment(straight(expanded[-1], waypoints[-1]))
+
+    if not geometry:
+        raise RuntimeError("Geen routegeometrie gevonden langs de knooppunten.")
+
+    return {
+        "geometry": geometry,
+        "distance_m": distance_m,
+        "duration_s": max(60.0, distance_m / 3.9),
+        "steps": [],
+    }
+
+
+def _segment_through_network(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    by_geoid: dict[int, dict[str, Any]],
+    adj: dict[int, list[tuple[int, float]]],
+) -> list[dict[str, Any]]:
+    left_id = left.get("geoid")
+    right_id = right.get("geoid")
+    if left_id is not None and right_id is not None and int(left_id) in adj and int(right_id) in adj:
+        path = _shortest_path(adj, int(left_id), int(right_id))
+        if len(path) >= 2:
+            return [by_geoid[geoid] for geoid in path if geoid in by_geoid]
+    return [left, right]
+
+
+def _shortest_path(adj: dict[int, list[tuple[int, float]]], start: int, goal: int) -> list[int]:
+    if start == goal:
+        return [start]
+    dist: dict[int, float] = {start: 0.0}
+    prev: dict[int, int] = {}
+    heap: list[tuple[float, int]] = [(0.0, start)]
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if cost > dist.get(node, float("inf")):
+            continue
+        if node == goal:
+            break
+        for neighbor, weight in adj.get(node, []):
+            next_cost = cost + weight
+            if next_cost < dist.get(neighbor, float("inf")):
+                dist[neighbor] = next_cost
+                prev[neighbor] = node
+                heapq.heappush(heap, (next_cost, neighbor))
+    if goal not in prev and start != goal:
+        return [start, goal]
+    path: list[int] = []
+    current = goal
+    while True:
+        path.append(current)
+        if current == start:
+            break
+        current = prev.get(current, start)
+        if current == goal:
+            break
+    path.reverse()
+    return path
+
+
+async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    min_lng, min_lat, max_lng, max_lat = bbox
+    cql = f"BBOX(geom,{min_lng:.5f},{min_lat:.5f},{max_lng:.5f},{max_lat:.5f},'EPSG:4326')"
+    nodes: list[dict[str, Any]] = []
+    trajects: list[dict[str, Any]] = []
+    try:
+        async with client() as http:
+            node_response = await http.get(
+                WFS_URL,
+                params={
+                    "service": "WFS",
+                    "version": "1.1.0",
+                    "request": "GetFeature",
+                    "typeName": "routes:knoop_fiets",
+                    "outputFormat": "application/json",
+                    "srsName": "EPSG:4326",
+                    "maxFeatures": 400,
+                    "cql_filter": f"{cql} AND knooptype=1",
+                },
+                timeout=14.0,
+            )
+            if node_response.status_code == 200:
+                for feature in node_response.json().get("features") or []:
+                    props = feature.get("properties") or {}
+                    geom = feature.get("geometry") or {}
+                    coords = geom.get("coordinates") or []
+                    number = props.get("knoopnr")
+                    if number is None or len(coords) < 2:
+                        continue
+                    nodes.append(
+                        {
+                            "id": str(feature.get("id") or f"knoop-{number}"),
+                            "number": str(number),
+                            "lat": float(coords[1]),
+                            "lng": float(coords[0]),
+                            "geoid": props.get("geoid"),
+                            "network": props.get("naam") or "Fietsknooppuntennetwerk Vlaanderen",
+                            "source": "Toerisme Vlaanderen",
+                        }
+                    )
+            traject_response = await http.get(
+                WFS_URL,
+                params={
+                    "service": "WFS",
+                    "version": "1.1.0",
+                    "request": "GetFeature",
+                    "typeName": "routes:traject_fiets",
+                    "outputFormat": "application/json",
+                    "srsName": "EPSG:4326",
+                    "maxFeatures": 1200,
+                    "cql_filter": cql,
+                },
+                timeout=16.0,
+            )
+            if traject_response.status_code == 200:
+                for feature in traject_response.json().get("features") or []:
+                    props = feature.get("properties") or {}
+                    geom = feature.get("geometry") or {}
+                    raw_coords = geom.get("coordinates") or []
+                    coordinates = (
+                        [[float(c[1]), float(c[0])] for c in raw_coords if len(c) >= 2]
+                        if raw_coords
+                        else []
+                    )
+                    trajects.append(
+                        {
+                            "begin_geoid": props.get("begin_geoid"),
+                            "end_geoid": props.get("end_geoid"),
+                            "shape_length": props.get("shape_length") or 0,
+                            "coordinates": coordinates,
+                        }
+                    )
+    except Exception:
+        return [], []
+    return nodes, trajects
 
 
 def attach_nearby(nodes: list[dict[str, Any]], pois: list[dict[str, Any]], radius_m: int = 550) -> list[dict[str, Any]]:

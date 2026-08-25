@@ -21,9 +21,18 @@ export async function planRoute(payload) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.detail || "De route kon niet worden gepland.");
+    throw new Error(formatApiError(data.detail, "De route kon niet worden gepland."));
   }
   return data;
+}
+
+function formatApiError(detail, fallback) {
+  if (!detail) return fallback;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item.msg || item.message || String(item)).join(" ");
+  }
+  return fallback;
 }
 
 export async function askAbout(payload) {
@@ -35,6 +44,48 @@ export async function askAbout(payload) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.detail || "De vraag kon niet beantwoord worden.");
+  }
+  return data;
+}
+
+export async function fetchRoutePreview(payload) {
+  const response = await fetch("/api/route-preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.detail || "Routevoorbeeld kon niet geladen worden.");
+  }
+  return data;
+}
+
+export async function fetchRouteSuggestions(lat, lng, interests = [], used = []) {
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+  });
+  for (const interest of interests) params.append("interests", interest);
+  for (const id of used) params.append("used", id);
+  const response = await fetch(`/api/route-suggestions?${params}`);
+  const data = await response.json().catch(() => []);
+  if (!response.ok) {
+    throw new Error(data.detail || "Route Top 10 kon niet geladen worden.");
+  }
+  return data;
+}
+
+export async function fetchKnooppunten(lat, lng, radius = 12000) {
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    radius: String(radius),
+  });
+  const response = await fetch(`/api/knooppunten?${params}`);
+  const data = await response.json().catch(() => []);
+  if (!response.ok) {
+    throw new Error(data.detail || "Knooppunten konden niet geladen worden.");
   }
   return data;
 }

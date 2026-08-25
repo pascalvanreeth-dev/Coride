@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from app.config import settings
-from app.http import client
+from app.http import client, routing_client
 from app.models import Step
+from app.services.geo import haversine_m
 
 _MOD = {
     "uturn": "keer om",
@@ -18,34 +20,59 @@ _MOD = {
 }
 
 
-async def bike_route(points: list[tuple[float, float]]) -> dict[str, Any]:
+def _clean_waypoints(waypoints: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    cleaned: list[tuple[float, float]] = []
+    for point in waypoints:
+        if cleaned and haversine_m(cleaned[-1][0], cleaned[-1][1], point[0], point[1]) < 12:
+            continue
+        cleaned.append(point)
+    return cleaned
+
+
+async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> dict[str, Any]:
     if len(points) < 2:
         raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
     coords = ";".join(f"{lng:.6f},{lat:.6f}" for lat, lng in points)
     url = f"{settings.osrm_bike_url}/route/v1/driving/{coords}"
-    async with client() as http:
-        response = await http.get(
-            url,
-            params={
-                "overview": "full",
-                "geometries": "geojson",
-                "steps": "true",
-                "annotations": "false",
-                "alternatives": "false",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-    if payload.get("code") != "Ok" or not payload.get("routes"):
-        raise RuntimeError("Geen fietsroute gevonden tussen deze punten.")
-    route = payload["routes"][0]
-    geometry = [[lat, lng] for lng, lat in route["geometry"]["coordinates"]]
-    return {
-        "geometry": geometry,
-        "distance_m": float(route["distance"]),
-        "duration_s": float(route["duration"]),
-        "steps": _parse_steps(route.get("legs") or []),
-    }
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            async with routing_client() as http:
+                response = await http.get(
+                    url,
+                    params={
+                        "overview": "full",
+                        "geometries": "geojson",
+                        "steps": "true",
+                        "annotations": "false",
+                        "alternatives": "false",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            if payload.get("code") != "Ok" or not payload.get("routes"):
+                raise RuntimeError("Geen fietsroute gevonden tussen deze punten.")
+            route = payload["routes"][0]
+            geometry = [[lat, lng] for lng, lat in route["geometry"]["coordinates"]]
+            return {
+                "geometry": geometry,
+                "distance_m": float(route["distance"]),
+                "duration_s": float(route["duration"]),
+                "steps": _parse_steps(route.get("legs") or []),
+            }
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < retries:
+                await asyncio.sleep(0.8)
+    assert last_error is not None
+    raise last_error
+
+
+async def bike_route_via_waypoints(waypoints: list[tuple[float, float]]) -> dict[str, Any]:
+    cleaned = _clean_waypoints(waypoints)
+    if len(cleaned) < 2:
+        raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
+    return await bike_route(cleaned, retries=1)
 
 
 def _parse_steps(legs: list[dict[str, Any]]) -> list[Step]:

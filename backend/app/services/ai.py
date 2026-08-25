@@ -25,6 +25,11 @@ def fallback_scripts(poi: dict[str, Any], wiki: dict[str, str], level: str = "no
     arrived = extract or f"{name} is een {kind} langs je fietsroute."
     why = {
         "geschiedenis": f"{name} past bij je interesse in geschiedenis.",
+        "natuur": f"{name} is een groene stop langs je fietsroute.",
+        "landbouw": f"{name} laat iets zien van het landschap en de streek.",
+        "horeca": f"{name} is een plek om even af te stappen en iets te nuttigen.",
+        "oorlog": f"{name} herinnert aan een stuk oorlogsgeschiedenis.",
+        "architectuur": f"{name} is architecturaal de moeite om even bij stil te staan.",
         "activiteiten": f"{name} is een plek om even af te stappen.",
         "evenementen": f"{name} is een evenement of evenementenlocatie.",
     }.get(poi.get("interest"), f"{name} hoort bij de criteria die je koos.")
@@ -46,6 +51,7 @@ async def enrich_with_ai(
     distance_km: int,
     knoop_chain: str = "",
     nodes: list[dict[str, Any]] | None = None,
+    profile: Any | None = None,
 ) -> dict[str, Any] | None:
     if not has_ai():
         return None
@@ -72,10 +78,20 @@ async def enrich_with_ai(
             }
         )
     start_id = (nodes or [{}])[0].get("id") if nodes else ""
+    rider = {}
+    if profile:
+        rider = {
+            "leeftijd": getattr(profile, "age_band", ""),
+            "tempo": getattr(profile, "fitness", ""),
+            "fiets": getattr(profile, "bike", ""),
+            "horeca": list(getattr(profile, "horeca", []) or []),
+            "commentaar": getattr(profile, "commentary", "normaal"),
+        }
     prompt = (
-        "Pas de fietsroute AAN op de extra wens. Kies knooppunten waar die wens het best klopt. "
+        "Pas de fietsroute AAN op de extra wens en het fietsersprofiel. "
+        "Kies knooppunten waar die wens het best klopt. "
         "Voorbeeld: extra='cafe' -> knooppunten met cafés/pubs in de buurt, niet een willekeurige lus.\n"
-        f"{json.dumps({'start': start_label, 'start_knoop_id': start_id, 'mode': mode, 'distance_km': distance_km, 'interests': interests, 'extra_wens': notes, 'knooppunten': node_pack, 'plekken_voor_uitleg': compact}, ensure_ascii=False)}"
+        f"{json.dumps({'start': start_label, 'start_knoop_id': start_id, 'mode': mode, 'distance_km': distance_km, 'interests': interests, 'extra_wens': notes, 'fietser': rider, 'knooppunten': node_pack, 'plekken_voor_uitleg': compact}, ensure_ascii=False)}"
     )
     system = (
         "Je bent een fietsrouteplanner in Vlaanderen. "
@@ -119,6 +135,11 @@ async def answer_about_stop(
     arrived: str,
     question: str,
     explanation_level: str = "normaal",
+    lat: float | None = None,
+    lng: float | None = None,
+    heading: float | None = None,
+    place_name: str | None = None,
+    interests: list[str] | None = None,
 ) -> str:
     length = {
         "kort": "Antwoord in 1 tot 2 zinnen.",
@@ -127,24 +148,55 @@ async def answer_about_stop(
     }.get(explanation_level, "Antwoord in 3 tot 5 zinnen.")
     fallback = first_sentences(summary or arrived or "", SENTENCE_COUNTS.get(explanation_level, 2))
     if not has_ai():
-        return fallback or f"Over {name} heb ik nu geen extra details."
+        return fallback or f"Over {name or 'deze plek'} heb ik nu geen extra details."
+
+    nearby = []
+    if lat is not None and lng is not None:
+        try:
+            from app.services import pois as pois_service
+
+            nearby = await pois_service.fetch_pois(lat, lng, 350, interests or ["geschiedenis", "architectuur"], None)
+            nearby = nearby[:6]
+        except Exception:
+            nearby = []
+
+    direction = ""
+    if heading is not None:
+        dirs = ["noord", "noordoost", "oost", "zuidoost", "zuid", "zuidwest", "west", "noordwest"]
+        direction = dirs[int((heading + 22.5) % 360 // 45)]
+
     parsed = await _generate_json(
-        "Je bent een fietsgids in Vlaanderen. Beantwoord een extra vraag over deze bezienswaardigheid. "
-        f"{length} Nederlands. Blijf bij de gegeven context. Verzin geen feiten; zeg het als je het niet weet. "
-        "JSON: {answer: string}.",
+        "Je bent een fietsgids in Vlaanderen die live meefietst. "
+        "Beantwoord een gesproken vraag van de fietser. "
+        f"{length} Nederlands. Gebruik alleen de gegeven context en nabije plekken. "
+        "Als de vraag over 'rechts/links/dat gebouw' gaat, kies de meest waarschijnlijke nabije plek. "
+        "Verzin geen feiten; zeg het als je het niet zeker weet. JSON: {answer: string}.",
         json.dumps(
             {
-                "plek": name,
+                "vraag": question,
+                "actieve_plek": name,
                 "soort": kind,
+                "dorp": place_name or "",
+                "rijrichting": direction,
+                "positie": {"lat": lat, "lng": lng} if lat is not None else None,
                 "samenvatting": (summary or "")[:900],
                 "gids_tekst": (arrived or "")[:500],
-                "vraag": question,
+                "interesses": interests or [],
+                "nabije_plekken": [
+                    {
+                        "name": p.get("name"),
+                        "kind": p.get("kind_label") or p.get("kind"),
+                        "lat": p.get("lat"),
+                        "lng": p.get("lng"),
+                    }
+                    for p in nearby
+                ],
             },
             ensure_ascii=False,
         ),
     )
     answer = (parsed or {}).get("answer") if isinstance(parsed, dict) else None
-    return (answer or fallback or f"Ik heb geen extra info over {name}.").strip()
+    return (answer or fallback or f"Ik heb geen extra info over {name or 'deze plek'}.").strip()
 
 
 async def _generate_json(system: str, user: str) -> dict[str, Any] | None:

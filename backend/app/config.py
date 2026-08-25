@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.1-flash-lite"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
-    user_agent: str = "Veloverhaal/0.1 (fietsgids voor Belgie; lokaal prototype)"
+    user_agent: str = "Veloverhaal/0.2 (local dev; contact: veloverhaal@example.com)"
     wikipedia_user_agent: str = (
         "Veloverhaal/0.1 (https://www.openstreetmap.org/; veloverhaal-local@example.com)"
     )

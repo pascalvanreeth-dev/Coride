@@ -16,6 +16,33 @@ OVERPASS_FILTERS: dict[str, list[str]] = {
         '["tourism"="artwork"]',
         '["amenity"="place_of_worship"]',
     ],
+    "natuur": [
+        '["leisure"~"park|nature_reserve|garden"]',
+        '["tourism"="viewpoint"]',
+        '["boundary"="national_park"]',
+        '["natural"="wood"]["name"]',
+    ],
+    "landbouw": [
+        '["tourism"="farm"]',
+        '["shop"="farm"]',
+        '["craft"="winery"]',
+        '["landuse"="vineyard"]["name"]',
+    ],
+    "horeca": [
+        '["amenity"~"cafe|pub|bar|restaurant|ice_cream|biergarten|fast_food"]',
+        '["craft"="brewery"]',
+        '["shop"="bakery"]',
+    ],
+    "oorlog": [
+        '["historic"~"memorial|fort|bunker|battlefield|ruins"]',
+        '["memorial"]',
+        '["landuse"="military"]["name"]',
+    ],
+    "architectuur": [
+        '["man_made"="windmill"]',
+        '["historic"~"manor|castle|church|tower"]',
+        '["building"~"cathedral|church|chapel"]["name"]',
+    ],
     "activiteiten": [
         '["leisure"~"park|nature_reserve|garden|sports_centre"]',
         '["tourism"~"attraction|viewpoint"]',
@@ -55,6 +82,19 @@ KIND_LABELS = {
     "restaurant": "restaurant",
     "ice_cream": "ijssalon",
     "biergarten": "biertuin",
+    "fast_food": "snack",
+    "bakery": "bakker",
+    "brewery": "brouwerij",
+    "farm": "hoeve",
+    "vineyard": "wijngaard",
+    "winery": "wijnhuis",
+    "windmill": "molen",
+    "manor": "herenhuis",
+    "fort": "fort",
+    "bunker": "bunker",
+    "battlefield": "slagveld",
+    "national_park": "natuurpark",
+    "wood": "bos",
 }
 
 
@@ -64,14 +104,35 @@ def classify(tags: dict[str, str], interests: list[str]) -> tuple[str, str]:
     amenity = tags.get("amenity", "")
     leisure = tags.get("leisure", "")
     building = tags.get("building", "")
+    craft = tags.get("craft", "")
+    shop = tags.get("shop", "")
+    man_made = tags.get("man_made", "")
 
-    if amenity in {"cafe", "pub", "bar", "restaurant", "ice_cream", "biergarten"}:
-        return "activiteiten", amenity
+    if amenity in {"cafe", "pub", "bar", "restaurant", "ice_cream", "biergarten", "fast_food"} or craft == "brewery" or shop == "bakery":
+        kind = amenity or craft or shop
+        return ("horeca" if "horeca" in interests else "activiteiten"), kind
+    if "oorlog" in interests and (
+        historic in {"memorial", "fort", "bunker", "battlefield"}
+        or tags.get("memorial")
+        or tags.get("military")
+        or tags.get("landuse") == "military"
+    ):
+        return "oorlog", historic or "gedenkteken"
+    if "architectuur" in interests and (
+        man_made == "windmill" or historic in {"manor", "castle", "church", "tower"} or building in {"cathedral", "church", "chapel"}
+    ):
+        return "architectuur", man_made or historic or building
     if "geschiedenis" in interests and (
         historic or tags.get("heritage") or tourism in {"museum", "artwork"} or amenity == "place_of_worship"
     ):
         kind = historic or tourism or amenity or building or "erfgoed"
         return "geschiedenis", kind
+    if "natuur" in interests and (
+        leisure in {"park", "nature_reserve", "garden"} or tourism == "viewpoint" or tags.get("natural") == "wood"
+    ):
+        return "natuur", leisure or tourism or tags.get("natural") or "natuur"
+    if "landbouw" in interests and (tourism == "farm" or shop == "farm" or craft == "winery" or tags.get("landuse") == "vineyard"):
+        return "landbouw", tourism or shop or craft or "hoeve"
     if "evenementen" in interests and (
         amenity in {"theatre", "arts_centre", "marketplace", "community_centre", "events_venue", "cinema", "concert_hall"}
         or leisure in {"stadium", "bandstand"}
@@ -147,9 +208,19 @@ async def fetch_pois(
 
 
 HORECA_FILTER = '["amenity"~"cafe|pub|bar|restaurant|ice_cream|biergarten"]'
+HORECA_PREF_FILTERS: dict[str, list[str]] = {
+    "snack": ['["amenity"~"fast_food|ice_cream|kiosk|cafe"]'],
+    "tafelen": ['["amenity"="restaurant"]'],
+    "koffie": ['["amenity"="cafe"]', '["shop"="bakery"]'],
+    "brouwerijen": ['["amenity"~"pub|bar|biergarten"]', '["craft"="brewery"]'],
+}
 
 
-def notes_want_horeca(notes: str) -> bool:
+def notes_want_horeca(notes: str, interests: list[str] | None = None, prefs: list[str] | None = None) -> bool:
+    if prefs:
+        return True
+    if interests and "horeca" in interests:
+        return True
     text = (notes or "").lower()
     keys = (
         "cafe", "café", "koffie", "koffi", "coffee", "pub", "bar", "bier",
@@ -163,15 +234,22 @@ async def fetch_horeca(
     lng: float,
     radius_m: int,
     extra_point: tuple[float, float] | None = None,
+    prefs: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     radius_m = max(2500, min(radius_m, 16000))
     points = [(lat, lng)]
     if extra_point:
         points.append(extra_point)
-    clauses = [
-        f'nwr{HORECA_FILTER}["name"](around:{radius_m},{plat:.5f},{plng:.5f});'
-        for plat, plng in points
-    ]
+    filters = []
+    for pref in prefs or []:
+        filters.extend(HORECA_PREF_FILTERS.get(pref, []))
+    if not filters:
+        filters = [HORECA_FILTER]
+    clauses: list[str] = []
+    for plat, plng in points:
+        around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
+        for filt in filters:
+            clauses.append(f'nwr{filt}["name"]({around});')
     query = f"[out:json][timeout:15];({''.join(clauses)});out center 80;"
     try:
         data = await _overpass(query)
@@ -191,7 +269,7 @@ async def fetch_horeca(
         if key in seen:
             continue
         seen.add(key)
-        kind = tags.get("amenity") or "cafe"
+        kind = tags.get("amenity") or tags.get("craft") or tags.get("shop") or "cafe"
         pois.append(
             {
                 "id": f"horeca-{element.get('id')}",
@@ -200,7 +278,7 @@ async def fetch_horeca(
                 "lng": center[1],
                 "kind": kind,
                 "kind_label": kind_label(kind),
-                "interest": "activiteiten",
+                "interest": "horeca",
                 "source": "OpenStreetMap",
                 "wikipedia": tags.get("wikipedia"),
                 "wikidata": tags.get("wikidata"),
