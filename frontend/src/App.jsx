@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { geocode, planRoute } from "./api.js";
+import { planRoute } from "./api.js";
 import Onboarding from "./components/Onboarding.jsx";
 import Planner from "./components/Planner.jsx";
 import Ride from "./components/Ride.jsx";
@@ -12,7 +12,7 @@ export default function App() {
   const [plan, setPlan] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [preview, setPreview] = useState({ lat: 50.85, lng: 4.35, zoom: 8 });
+  const [preview, setPreview] = useState({ lat: 51.05, lng: 3.72, zoom: 14 });
 
   const center = useMemo(() => [preview.lat, preview.lng], [preview]);
 
@@ -47,11 +47,11 @@ export default function App() {
       busy={busy}
       error={error}
       center={center}
+      zoom={preview.zoom}
       profile={profile}
       onEditProfile={() => setEditProfile(true)}
       onPreview={setPreview}
       onPlan={onPlan}
-      geocode={geocode}
     />
   );
 }

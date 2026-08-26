@@ -38,6 +38,27 @@ class KnoopPick(BaseModel):
     lat: float
     lng: float
     network: str | None = None
+    geoid: int | str | None = None
+
+
+class PoiPick(BaseModel):
+    id: str
+    name: str
+    lat: float
+    lng: float
+    kind: str = "plek"
+    kind_label: str | None = None
+    interest: Interest = "geschiedenis"
+
+
+class PoiHit(BaseModel):
+    id: str
+    name: str
+    lat: float
+    lng: float
+    kind: str
+    kind_label: str | None = None
+    interest: Interest
 
 
 class PlanRequest(BaseModel):
@@ -51,6 +72,7 @@ class PlanRequest(BaseModel):
     notes: str = Field(default="", max_length=500)
     explanation_level: ExplanationLevel = "normaal"
     knooppunten: list[KnoopPick] = Field(default_factory=list, max_length=40)
+    poi_picks: list[PoiPick] = Field(default_factory=list, max_length=20)
     profile: RiderProfile | None = None
     adapt_reason: AdaptReason | None = None
     suggestion_id: str | None = None
@@ -92,6 +114,7 @@ class Knooppunt(BaseModel):
     lng: float
     network: str | None = None
     on_route: bool = False
+    geoid: int | str | None = None
 
 
 class Step(BaseModel):
@@ -174,8 +197,11 @@ class RerouteRequest(BaseModel):
     start_lng: float
     nodes: list[Knooppunt]
     close_loop: bool = True
+    end_lat: float | None = None
+    end_lng: float | None = None
     reason: AdaptReason | None = None
     remaining_nodes: list[KnoopPick] = Field(default_factory=list)
+    poi_picks: list[PoiPick] = Field(default_factory=list, max_length=20)
     target_km: float | None = Field(default=None, ge=3, le=90)
     interests: list[Interest] = Field(default_factory=list)
     profile: RiderProfile | None = None

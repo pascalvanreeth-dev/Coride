@@ -222,8 +222,16 @@ async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 
     max_lat = max(node["lat"] for node in chain)
     min_lng = min(node["lng"] for node in chain)
     max_lng = max(node["lng"] for node in chain)
-    pad_lat = padding_m / 111_000
-    pad_lng = padding_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
+    max_gap = 0.0
+    for index in range(len(chain) - 1):
+        max_gap = max(
+            max_gap,
+            haversine_m(chain[index]["lat"], chain[index]["lng"], chain[index + 1]["lat"], chain[index + 1]["lng"]),
+        )
+    # Ruimere bbox zodat overgeslagen knooppunten tussen twee picks ook meegenomen worden.
+    pad_m = max(padding_m, min(14000, max_gap * 0.75 + 2000))
+    pad_lat = pad_m / 111_000
+    pad_lng = pad_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
     bbox = (min_lng - pad_lng, min_lat - pad_lat, max_lng + pad_lng, max_lat + pad_lat)
     nodes, trajects = await _fetch_bbox(bbox)
     return nodes, trajects
@@ -409,11 +417,34 @@ def _segment_through_network(
 ) -> list[dict[str, Any]]:
     left_id = left.get("geoid")
     right_id = right.get("geoid")
+    if left_id is None:
+        left_id = _geoid_for_number(left.get("number"), left, by_geoid)
+    if right_id is None:
+        right_id = _geoid_for_number(right.get("number"), right, by_geoid)
     if left_id is not None and right_id is not None and int(left_id) in adj and int(right_id) in adj:
         path = _shortest_path(adj, int(left_id), int(right_id))
         if len(path) >= 2:
             return [by_geoid[geoid] for geoid in path if geoid in by_geoid]
     return [left, right]
+
+
+def _geoid_for_number(
+    number: Any,
+    node: dict[str, Any],
+    by_geoid: dict[int, dict[str, Any]],
+) -> int | None:
+    if number is None:
+        return None
+    best_id: int | None = None
+    best_dist = float("inf")
+    for geoid, candidate in by_geoid.items():
+        if str(candidate.get("number")) != str(number):
+            continue
+        dist = haversine_m(node["lat"], node["lng"], candidate["lat"], candidate["lng"])
+        if dist < best_dist:
+            best_dist = dist
+            best_id = int(geoid)
+    return best_id if best_dist <= 250 else None
 
 
 def _shortest_path(adj: dict[int, list[tuple[int, float]]], start: int, goal: int) -> list[int]:
@@ -465,7 +496,7 @@ async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dic
                     "typeName": "routes:knoop_fiets",
                     "outputFormat": "application/json",
                     "srsName": "EPSG:4326",
-                    "maxFeatures": 400,
+                    "maxFeatures": 800,
                     "cql_filter": f"{cql} AND knooptype=1",
                 },
                 timeout=14.0,

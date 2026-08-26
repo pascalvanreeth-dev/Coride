@@ -7,15 +7,20 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from app.http import client
 
-MIN_INTERVAL_S = 1.1
+MIN_INTERVAL_S = 1.2
 CACHE_TTL_S = 6 * 3600
 MAX_RETRIES = 2
 
 _lock = asyncio.Lock()
 _last_request = 0.0
 _cache: dict[str, tuple[float, Any]] = {}
+
+NOMINATIM_HEADERS = {
+    "User-Agent": settings.nominatim_user_agent,
+    "Accept": "application/json",
+    "Accept-Language": "nl,fr,de,en",
+}
 
 
 def _cache_get(key: str) -> Any | None:
@@ -57,11 +62,15 @@ async def _get(path: str, params: dict[str, Any]) -> Any:
     for attempt in range(MAX_RETRIES + 1):
         await _throttle()
         try:
-            async with client() as http:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                headers=NOMINATIM_HEADERS,
+                follow_redirects=True,
+            ) as http:
                 response = await http.get(f"{settings.nominatim_url}{path}", params=params)
-                if response.status_code == 429:
+                if response.status_code in {403, 429}:
                     last_error = httpx.HTTPStatusError(
-                        "Nominatim rate limit",
+                        "Nominatim blocked or rate limited",
                         request=response.request,
                         response=response,
                     )
@@ -73,7 +82,7 @@ async def _get(path: str, params: dict[str, Any]) -> Any:
                 return payload
         except httpx.HTTPStatusError as exc:
             last_error = exc
-            if exc.response.status_code == 429 and attempt < MAX_RETRIES:
+            if exc.response.status_code in {403, 429} and attempt < MAX_RETRIES:
                 await asyncio.sleep(MIN_INTERVAL_S * (attempt + 2))
                 continue
             raise
@@ -91,6 +100,8 @@ async def search(query: str, limit: int = 5) -> list[dict[str, Any]]:
             "addressdetails": 1,
             "limit": limit,
             "countrycodes": "be",
+            "viewbox": "2.3,51.55,6.45,49.45",
+            "bounded": 0,
             "accept-language": "nl,fr,de,en",
         },
     )

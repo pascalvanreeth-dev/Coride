@@ -9,9 +9,13 @@ export function haversine(a, b) {
   return 2 * radius * Math.asin(Math.sqrt(sin));
 }
 
+export function stopSpeaking() {
+  window.speechSynthesis?.cancel();
+}
+
 export function speak(text) {
   if (!window.speechSynthesis || !text) return;
-  window.speechSynthesis.cancel();
+  stopSpeaking();
   const utterance = new SpeechSynthesisUtterance(text);
   const voices = window.speechSynthesis.getVoices();
   const dutch =
@@ -59,6 +63,16 @@ export function formatKm(km) {
   if (value < 0.05) return "0 km";
   if (value < 10) return `${value.toFixed(1).replace(".", ",")} km`;
   return `${Math.round(value * 10) / 10} km`.replace(".", ",");
+}
+
+export function formatDuration(minutes) {
+  const total = Math.max(0, Math.round(Number(minutes) || 0));
+  if (!total) return "—";
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  if (hours === 0) return `${mins} min`;
+  if (mins === 0) return `${hours} u`;
+  return `${hours} u ${mins} min`;
 }
 
 export function routeLength(geometry) {
@@ -128,8 +142,46 @@ export function uniqueChainIds(nodes) {
   return ids;
 }
 
+export function dedupeNearbyPoints(points, minM = 700) {
+  const kept = [];
+  for (const point of points || []) {
+    if (!Number.isFinite(point?.lat) || !Number.isFinite(point?.lng)) continue;
+    if (kept.some((other) => haversine(other, point) < minM)) continue;
+    kept.push(point);
+  }
+  return kept;
+}
+
 export function nodeId(node) {
   return node?.id || `${node?.number}|${Number(node?.lat).toFixed(4)}`;
+}
+
+export function poiId(poi) {
+  return poi?.id || `${poi?.name}|${Number(poi?.lat).toFixed(4)}`;
+}
+
+export function knoopMatches(a, b, maxM = 150) {
+  if (!a || !b || String(a.number) !== String(b.number)) return false;
+  if (!Number.isFinite(a.lat) || !Number.isFinite(b.lat)) return false;
+  return haversine(a, b) <= maxM;
+}
+
+export function knoopOnRoute(node, routeNodes) {
+  return (routeNodes || []).some((routeNode) => knoopMatches(node, routeNode));
+}
+
+export function mergeMapKnooppunten(nearby, routeNodes, pinned = []) {
+  const byId = new Map();
+  for (const node of nearby || []) byId.set(nodeId(node), node);
+  for (const node of routeNodes || []) {
+    const id = nodeId(node);
+    byId.set(id, { ...byId.get(id), ...node, on_route: true });
+  }
+  for (const node of pinned || []) {
+    const id = nodeId(node);
+    byId.set(id, { ...byId.get(id), ...node });
+  }
+  return [...byId.values()];
 }
 
 export function getBrowserLocation() {

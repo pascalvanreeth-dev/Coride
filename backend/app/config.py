@@ -13,12 +13,17 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.1-flash-lite"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
-    user_agent: str = "Veloverhaal/0.2 (local dev; contact: veloverhaal@example.com)"
+    user_agent: str = "CoRide/0.2 (+https://github.com/Mathissev/CoRide)"
+    nominatim_user_agent: str = (
+        "CoRide/0.2 (+https://github.com/Mathissev/CoRide; veloverhaal-local@users.noreply.github.com)"
+    )
     wikipedia_user_agent: str = (
         "Veloverhaal/0.1 (https://www.openstreetmap.org/; veloverhaal-local@example.com)"
     )
     nominatim_url: str = "https://nominatim.openstreetmap.org"
     overpass_urls: str = (
+        "https://overpass.kumi.systems/api/interpreter,"
+        "https://z.overpass-api.de/api/interpreter,"
         "https://overpass-api.de/api/interpreter,"
         "https://lz4.overpass-api.de/api/interpreter"
     )

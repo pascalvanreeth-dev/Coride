@@ -42,9 +42,15 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
 
     start = await geocoding.geocode_one(request.start)
     if request.mode == "punt":
-        if not request.end:
-            raise ValueError("Vul een eindlocatie in, of kies een lus.")
-        end = await geocoding.geocode_one(request.end)
+        if request.knooppunten and len(request.knooppunten) >= 2:
+            first = request.knooppunten[0]
+            last = request.knooppunten[-1]
+            start = await geocoding.geocode_one(f"{first.lat},{first.lng}")
+            end = await geocoding.geocode_one(f"{last.lat},{last.lng}")
+        elif not request.end:
+            raise ValueError("Kies minstens twee knooppunten voor Van A naar B, of kies een lus.")
+        else:
+            end = await geocoding.geocode_one(request.end)
     else:
         end = start
 
@@ -145,6 +151,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         )
     wiki_targets = ranked[:16]
     selected = _pick(wiki_targets, ai_choice, request) if wiki_targets else []
+    selected = _merge_user_pois(selected, request.poi_picks)
 
     if chain:
         spine = _chain_spine(chain)
@@ -256,6 +263,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             lng=n["lng"],
             network=n.get("network"),
             on_route=True,
+            geoid=n.get("geoid"),
         )
         for n in chain
     ]
@@ -340,7 +348,7 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
             "lat": n.lat,
             "lng": n.lng,
             "network": n.network,
-            "geoid": None,
+            "geoid": n.geoid,
         }
         for n in nodes
     ]
@@ -349,6 +357,9 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
         request.start_lng,
         chain,
         close_loop=request.close_loop,
+        end_lat=request.end_lat,
+        end_lng=request.end_lng,
+        poi_picks=request.poi_picks,
     )
     knoop_models = [
         Knooppunt(
@@ -358,6 +369,7 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
             lng=n["lng"],
             network=n.get("network"),
             on_route=True,
+            geoid=n.get("geoid"),
         )
         for n in expanded
     ]
@@ -443,9 +455,40 @@ def _unique_knooppunten(nodes: list[dict[str, Any]], chain_ids: set[str]) -> lis
                 lng=node["lng"],
                 network=node.get("network"),
                 on_route=nid in chain_ids,
+                geoid=node.get("geoid"),
             )
         )
     return result
+
+
+def _insert_poi_waypoints(
+    waypoints: list[tuple[float, float]],
+    picks: list[Any],
+) -> list[tuple[float, float]]:
+    if not picks:
+        return waypoints
+    points = list(waypoints)
+    ordered: list[tuple[float, float, float]] = []
+    for pick in picks:
+        data = pick.model_dump() if hasattr(pick, "model_dump") else dict(pick)
+        plat = float(data["lat"])
+        plng = float(data["lng"])
+        best_i = 0
+        best_score = float("inf")
+        for index in range(len(points) - 1):
+            a_lat, a_lng = points[index]
+            b_lat, b_lng = points[index + 1]
+            score = point_to_segment_m(plat, plng, a_lat, a_lng, b_lat, b_lng)
+            if score < best_score:
+                best_score = score
+                best_i = index
+        ordered.append((best_score, best_i, plat, plng))
+    for _, index, plat, plng in sorted(ordered, key=lambda item: item[1], reverse=True):
+        insert_at = index + 1
+        if insert_at < len(points) and haversine_m(plat, plng, points[insert_at][0], points[insert_at][1]) < 15:
+            continue
+        points.insert(insert_at, (plat, plng))
+    return routing._clean_waypoints(points)
 
 
 async def _build_knoop_route(
@@ -456,6 +499,7 @@ async def _build_knoop_route(
     close_loop: bool = True,
     end_lat: float | None = None,
     end_lng: float | None = None,
+    poi_picks: list[Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     spine = _chain_spine(chain)
     network_nodes, trajects = await knoop_service.fetch_network_for_chain(spine)
@@ -469,6 +513,8 @@ async def _build_knoop_route(
         end_lat=end_lat,
         end_lng=end_lng,
     )
+    if poi_picks:
+        waypoints = _insert_poi_waypoints(waypoints, poi_picks)
     try:
         route = await routing.bike_route_via_waypoints(waypoints)
     except Exception:
@@ -577,6 +623,29 @@ def _spread(ranked: list[dict[str, Any]], wanted: int) -> list[dict[str, Any]]:
         if len(selected) >= wanted:
             break
     return selected or ranked[:wanted]
+
+
+def _merge_user_pois(selected: list[dict[str, Any]], picks: list[Any]) -> list[dict[str, Any]]:
+    if not picks:
+        return selected
+    by_id = {poi["id"]: poi for poi in selected}
+    for pick in picks:
+        data = pick.model_dump() if hasattr(pick, "model_dump") else dict(pick)
+        poi = {
+            "id": str(data["id"]),
+            "name": data["name"],
+            "lat": float(data["lat"]),
+            "lng": float(data["lng"]),
+            "kind": data.get("kind") or "plek",
+            "kind_label": data.get("kind_label") or data.get("kind") or "plek",
+            "interest": data.get("interest") or "geschiedenis",
+            "source": "OpenStreetMap",
+            "description": "",
+        }
+        by_id[poi["id"]] = poi
+    merged = list(by_id.values())
+    merged.sort(key=lambda item: item["name"])
+    return merged
 
 
 def _nodes_for_ai(nodes: list[dict[str, Any]], start_node: dict[str, Any] | None) -> list[dict[str, Any]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -162,12 +163,12 @@ async def fetch_pois(
     points = [(lat, lng)]
     if extra_point:
         points.append(extra_point)
-    wanted = interests or ["geschiedenis"]
+    wanted = (interests or ["geschiedenis"])[:4]
     clauses: list[str] = []
     for plat, plng in points:
         around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
         for interest in wanted:
-            for filt in OVERPASS_FILTERS.get(interest, []):
+            for filt in OVERPASS_FILTERS.get(interest, [])[:2]:
                 clauses.append(f'nwr{filt}["name"]({around});')
 
     query = f"[out:json][timeout:25];({''.join(clauses)});out center 100;"
@@ -205,6 +206,72 @@ async def fetch_pois(
             }
         )
     return pois
+
+
+def _sample_route_points(points: list[tuple[float, float]], max_points: int = 5) -> list[tuple[float, float]]:
+    cleaned = [(float(lat), float(lng)) for lat, lng in points if lat is not None and lng is not None]
+    if len(cleaned) <= max_points:
+        return cleaned
+    step = max(1, (len(cleaned) - 1) // (max_points - 1))
+    sampled = [cleaned[0]]
+    for index in range(step, len(cleaned) - 1, step):
+        sampled.append(cleaned[index])
+        if len(sampled) >= max_points - 1:
+            break
+    if cleaned[-1] != sampled[-1]:
+        sampled.append(cleaned[-1])
+    return sampled[:max_points]
+
+
+async def fetch_pois_along_points(
+    points: list[tuple[float, float]],
+    radius_m: int,
+    interests: list[str],
+    *,
+    max_points: int = 4,
+) -> list[dict[str, Any]]:
+    sampled = _sample_route_points(points, max_points)
+    if not sampled:
+        return []
+    try:
+        return await asyncio.wait_for(
+            _fetch_pois_along_points_impl(sampled, radius_m, interests),
+            timeout=40.0,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError("Overpass API reageerde niet: timeout") from exc
+
+
+async def _fetch_pois_along_points_impl(
+    sampled: list[tuple[float, float]],
+    radius_m: int,
+    interests: list[str],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    results = await asyncio.gather(
+        *[fetch_pois(plat, plng, radius_m, interests) for plat, plng in sampled],
+        return_exceptions=True,
+    )
+    last_error: Exception | None = None
+    for result in results:
+        if isinstance(result, Exception):
+            last_error = result
+            continue
+        for poi in result:
+            merged[str(poi["id"])] = poi
+    if merged:
+        return list(merged.values())
+    try:
+        return await fetch_pois(
+            sampled[0][0],
+            sampled[0][1],
+            min(int(radius_m * 2), 16000),
+            interests[:4],
+        )
+    except Exception:
+        if last_error:
+            raise last_error
+        return []
 
 
 HORECA_FILTER = '["amenity"~"cafe|pub|bar|restaurant|ice_cream|biergarten"]'
@@ -291,28 +358,28 @@ async def fetch_horeca(
 
 async def _overpass(query: str) -> dict[str, Any]:
     errors: list[str] = []
+    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()][:2]
     async with client() as http:
-        for url in settings.overpass_urls.split(","):
-            target = url.strip()
+        for url in mirrors:
             try:
                 response = await http.post(
-                    target,
+                    url,
                     content=query.encode("utf-8"),
                     headers={"Content-Type": "text/plain; charset=utf-8"},
-                    timeout=httpx.Timeout(12.0, connect=8.0),
+                    timeout=httpx.Timeout(12.0, connect=5.0),
                 )
                 if response.status_code >= 400:
-                    errors.append(f"{target} -> HTTP {response.status_code}")
+                    errors.append(f"{url} -> HTTP {response.status_code}")
                     continue
                 payload = response.json()
                 remark = str(payload.get("remark") or "")
                 elements = payload.get("elements") or []
                 if "error" in remark.lower() or "runtime error" in remark.lower():
-                    errors.append(f"{target} -> {remark[:120]}")
+                    errors.append(f"{url} -> {remark[:120]}")
                     continue
                 if elements:
                     return payload
-                errors.append(f"{target} -> 0 resultaten")
+                errors.append(f"{url} -> 0 resultaten")
             except Exception as exc:  # noqa: BLE001 - try next mirror
-                errors.append(f"{target} -> {type(exc).__name__}: {exc or 'geen bericht'}")
+                errors.append(f"{url} -> {type(exc).__name__}: {exc or 'geen bericht'}")
     raise RuntimeError("Overpass API reageerde niet: " + "; ".join(errors))

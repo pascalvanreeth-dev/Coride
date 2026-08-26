@@ -1,7 +1,11 @@
 export async function geocode(q) {
   const response = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
-  if (!response.ok) return [];
-  return response.json();
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof data.detail === "string" ? data.detail : "Zoeken mislukt.";
+    throw new Error(detail);
+  }
+  return Array.isArray(data) ? data : [];
 }
 
 export async function reverseGeocode(lat, lng) {
@@ -74,6 +78,29 @@ export async function fetchRouteSuggestions(lat, lng, interests = [], used = [])
     throw new Error(data.detail || "Route Top 10 kon niet geladen worden.");
   }
   return data;
+}
+
+export async function fetchPoiSuggestions(lat, lng, interests = [], { radius = 7000, samples = [] } = {}) {
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    radius: String(radius),
+  });
+  for (const interest of interests) params.append("interests", interest);
+  for (const point of samples) {
+    params.append("sample_lat", String(point.lat));
+    params.append("sample_lng", String(point.lng));
+  }
+  const response = await fetch(`/api/poi-suggestions?${params}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    let message = typeof data.detail === "string" ? data.detail : "Suggesties konden niet geladen worden.";
+    if (/overpass/i.test(message)) {
+      message = "Kaartdata (OpenStreetMap) is tijdelijk niet bereikbaar. Probeer het over een minuut opnieuw.";
+    }
+    throw new Error(message);
+  }
+  return Array.isArray(data) ? data : [];
 }
 
 export async function fetchKnooppunten(lat, lng, radius = 12000) {

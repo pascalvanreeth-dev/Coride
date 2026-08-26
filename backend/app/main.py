@@ -2,11 +2,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-from app.models import AskRequest, AskResponse, GeocodeHit, Knooppunt, PlanRequest, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion
+from app.models import AskRequest, AskResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion
 from app.services.ai import answer_about_stop
 from app.services.geocoding import geocode, reverse
 from app.services import knooppunten as knoop_service
 from app.services.planner import plan_route, preview_route, reroute
+from app.services import pois as pois_service
 from app.services import suggestions as suggestion_service
 
 app = FastAPI(title="Veloverhaal", version="0.2.0")
@@ -26,9 +27,15 @@ async def health() -> dict[str, str]:
 @app.get("/api/geocode", response_model=list[GeocodeHit])
 async def geocode_endpoint(q: str = Query(min_length=2, max_length=200)) -> list[GeocodeHit]:
     try:
-        return await geocode(q)
+        hits = await geocode(q)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Plaats zoeken is tijdelijk niet beschikbaar. Probeer het zo dadelijk opnieuw.",
+        ) from exc
+    if not hits:
+        return []
+    return hits
 
 
 @app.get("/api/reverse", response_model=GeocodeHit)
@@ -67,6 +74,62 @@ async def knooppunten_endpoint(
         )
         for node in nodes
     ]
+
+
+@app.get("/api/poi-suggestions", response_model=list[PoiHit])
+async def poi_suggestions_endpoint(
+    lat: float = Query(ge=49.0, le=52.0),
+    lng: float = Query(ge=2.0, le=7.0),
+    interests: list[str] = Query(default=[]),
+    radius: int = Query(default=7000, ge=2000, le=16000),
+    sample_lat: list[float] = Query(default=[]),
+    sample_lng: list[float] = Query(default=[]),
+) -> list[PoiHit]:
+    wanted = (interests or ["geschiedenis"])[:4]
+    points: list[tuple[float, float]] = [(lat, lng)]
+    for slat, slng in zip(sample_lat, sample_lng, strict=False):
+        if 49.0 <= slat <= 52.0 and 2.0 <= slng <= 7.0:
+            points.append((slat, slng))
+    try:
+        if len(points) > 1:
+            pois = await pois_service.fetch_pois_along_points(points, radius, wanted)
+        else:
+            pois = await pois_service.fetch_pois(lat, lng, radius, wanted)
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if "overpass" in detail.lower():
+            detail = "Kaartdata (OpenStreetMap) is tijdelijk niet bereikbaar. Probeer het over een minuut opnieuw."
+        raise HTTPException(status_code=502, detail=detail) from exc
+    interest_set = set(wanted)
+    scored: list[tuple[int, dict]] = []
+    for poi in pois:
+        score = 0
+        if poi.get("interest") in interest_set:
+            score += 10
+        if poi.get("wikipedia") or poi.get("wikidata"):
+            score += 2
+        scored.append((score, poi))
+    scored.sort(key=lambda item: (-item[0], item[1]["name"]))
+    hits: list[PoiHit] = []
+    for _, poi in scored[:16]:
+        interest = poi.get("interest") or "geschiedenis"
+        if interest not in interest_set:
+            interest = wanted[0]
+        try:
+            hits.append(
+                PoiHit(
+                    id=str(poi["id"]),
+                    name=poi["name"],
+                    lat=float(poi["lat"]),
+                    lng=float(poi["lng"]),
+                    kind=str(poi.get("kind") or "plek"),
+                    kind_label=poi.get("kind_label"),
+                    interest=interest,
+                )
+            )
+        except Exception:
+            continue
+    return hits
 
 
 @app.get("/api/route-suggestions", response_model=list[RouteSuggestion])
