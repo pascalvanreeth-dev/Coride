@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from app.config import settings
 from app.http import client
@@ -19,6 +19,151 @@ def parse_wikipedia_tag(tag: str | None) -> tuple[str, str] | None:
         lang, title = tag.split(":", 1)
         return lang.strip(), title.strip().replace(" ", "_")
     return "nl", tag.replace(" ", "_")
+
+
+def parse_wikipedia_url(url: str | None) -> tuple[str, str] | None:
+    if not url:
+        return None
+    match = re.search(r"https?://([a-z]{2,3})\.wikipedia\.org/wiki/([^#?]+)", url, re.I)
+    if not match:
+        return None
+    return match.group(1).lower(), unquote(match.group(2).replace("_", " "))
+
+
+async def lookup_stop_summary(
+    name: str,
+    lat: float,
+    lng: float,
+    *,
+    wikipedia_url: str | None = None,
+    wikipedia: str | None = None,
+    wikidata: str | None = None,
+    description: str | None = None,
+    kind: str | None = None,
+) -> dict[str, str]:
+    """Look up 1–2 informative sentences about a route stop."""
+    from app.services import pois as pois_service
+
+    clean_name = name.strip()
+    kind_label = (kind or "plek").strip()
+
+    async def from_wiki_poi(poi: dict[str, Any]) -> dict[str, str] | None:
+        data = await summary_for_poi(poi)
+        blurb = stop_blurb(data.get("summary") or "", name=clean_name, kind=kind_label)
+        if blurb:
+            return {**data, "summary": blurb}
+        return None
+
+    if description and not is_generic_blurb(description, clean_name, kind_label):
+        return {"summary": stop_blurb(description, name=clean_name, kind=kind_label), "url": wikipedia_url or "", "image": ""}
+
+    if wikipedia or wikidata:
+        hit = await from_wiki_poi(
+            {"name": clean_name, "wikipedia": wikipedia, "wikidata": wikidata, "description": description or ""}
+        )
+        if hit:
+            return hit
+
+    parsed_url = parse_wikipedia_url(wikipedia_url)
+    if parsed_url:
+        data = await page_summary(*parsed_url)
+        blurb = stop_blurb(data.get("summary") or "", name=clean_name, kind=kind_label) if data else ""
+        if blurb:
+            return {**(data or {}), "summary": blurb}
+
+    osm = await pois_service.fetch_poi_at(lat, lng, name=clean_name)
+    if osm:
+        if osm.get("description") and not is_generic_blurb(osm["description"], clean_name, kind_label):
+            wiki = await from_wiki_poi(osm)
+            url = (wiki or {}).get("url") or wikipedia_url or ""
+            desc = stop_blurb(osm["description"], name=clean_name, kind=kind_label)
+            if wiki and wiki.get("summary"):
+                return {"summary": wiki["summary"], "url": wiki.get("url") or url, "image": wiki.get("image") or ""}
+            return {"summary": desc, "url": url, "image": ""}
+        hit = await from_wiki_poi(osm)
+        if hit:
+            return hit
+
+    lower_name = clean_name.lower()
+    for radius in (900, 2200, 4500):
+        nearby = await nearby_places(lat, lng, radius)
+        exact = next((poi for poi in nearby if poi["name"].strip().lower() == lower_name), None)
+        if exact:
+            hit = await from_wiki_poi(exact)
+            if hit:
+                return hit
+        fuzzy = next(
+            (
+                poi
+                for poi in nearby
+                if lower_name in poi["name"].strip().lower() or poi["name"].strip().lower() in lower_name
+            ),
+            None,
+        )
+        if fuzzy:
+            hit = await from_wiki_poi(fuzzy)
+            if hit:
+                return hit
+
+    for lang in LANGS:
+        title = await search_wikipedia_title(clean_name, lang)
+        if title:
+            data = await page_summary(lang, title.replace(" ", "_"))
+            blurb = stop_blurb(data.get("summary") or "", name=clean_name, kind=kind_label) if data else ""
+            if blurb:
+                return {**(data or {}), "summary": blurb}
+
+    for lang in LANGS:
+        data = await page_summary(lang, clean_name.replace(" ", "_"))
+        blurb = stop_blurb(data.get("summary") or "", name=clean_name, kind=kind_label) if data else ""
+        if blurb:
+            return {**(data or {}), "summary": blurb}
+
+    return {"summary": "", "url": wikipedia_url or "", "image": ""}
+
+
+async def search_wikipedia_title(name: str, lang: str) -> str | None:
+    async with client() as http:
+        response = await http.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params={"action": "opensearch", "search": name, "limit": 1, "namespace": 0, "format": "json"},
+            headers=WIKI_HEADERS,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        titles = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
+        return titles[0] if titles else None
+
+
+def is_generic_blurb(text: str, name: str, kind: str = "plek") -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    if "bekend via openstreetmap" in lowered:
+        return True
+    if "past bij je interesse" in lowered:
+        return True
+    if "langs je fietsroute" in lowered or "langs je route" in lowered:
+        return True
+    if name and kind:
+        pattern = re.compile(
+            rf"^{re.escape(name.strip())} is een {re.escape(kind.strip())} langs je (fiets)?route\.?$",
+            re.I,
+        )
+        if pattern.match(cleaned):
+            return True
+    if len(cleaned) < 28 and name.lower() in lowered and kind.lower() in lowered:
+        return True
+    return False
+
+
+def stop_blurb(text: str, *, name: str = "", kind: str = "plek", sentences: int = 2) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned or is_generic_blurb(cleaned, name, kind):
+        return ""
+    return first_sentences(cleaned, sentences)
 
 
 async def summary_for_poi(poi: dict[str, Any]) -> dict[str, str]:

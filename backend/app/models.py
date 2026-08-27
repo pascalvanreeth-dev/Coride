@@ -101,6 +101,9 @@ class Stop(BaseModel):
     why: str
     wikipedia_url: str | None = None
     image_url: str | None = None
+    wikipedia: str | None = None
+    wikidata: str | None = None
+    description: str | None = None
     place_name: str | None = None
     population: int | None = None
     local_fact: str | None = None
@@ -190,6 +193,33 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+
+
+class SurroundingsHighlight(BaseModel):
+    name: str
+    kind: str
+    interest: Interest
+    distance_m: float | None = None
+
+
+class SurroundingsRequest(BaseModel):
+    lat: float = Field(ge=49.0, le=52.0)
+    lng: float = Field(ge=2.0, le=7.0)
+    interests: list[Interest] = Field(default_factory=list)
+    explanation_level: ExplanationLevel = "normaal"
+    heading: float | None = None
+
+
+class SurroundingsResponse(BaseModel):
+    summary: str
+    place_name: str = ""
+    highlights: list[SurroundingsHighlight] = Field(default_factory=list)
+    ai_used: bool = False
+
+
+class StopSummaryResponse(BaseModel):
+    summary: str
+    url: str = ""
 
 
 class RerouteRequest(BaseModel):

@@ -62,7 +62,10 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     extra = (end.lat, end.lng) if request.mode == "punt" else None
     horeca_prefs = list(profile.horeca) if profile else []
     want_horeca = pois_service.notes_want_horeca(request.notes, request.interests, horeca_prefs)
-    want_wiki = any(item in request.interests for item in ("geschiedenis", "oorlog", "architectuur"))
+    want_wiki = any(
+        item in request.interests
+        for item in ("geschiedenis", "oorlog", "architectuur", "natuur", "landbouw", "activiteiten", "evenementen")
+    )
     rider_notes = _profile_notes(profile, request.notes, request.adapt_reason, weather)
     nodes, osm_pois, wiki_places, live_events, horeca = await asyncio.gather(
         _optional(knoop_service.fetch_nodes(start.lat, start.lng, radius, extra), [], 14),
@@ -109,7 +112,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     ai_nodes = _nodes_for_ai(nodes, start_node) if nodes else []
 
     ranked_all = _rank(candidates, start, end, request)
-    wiki_targets = ranked_all[:16]
+    wiki_targets = pois_service.build_stop_pool(ranked_all, request.interests, limit=20)
     if wiki_targets:
         wiki_results = await asyncio.gather(*(wikipedia.summary_for_poi(poi) for poi in wiki_targets))
         for poi, wiki in zip(wiki_targets, wiki_results, strict=True):
@@ -149,8 +152,8 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         raise ValueError(
             "Geen plekken of knooppunten gevonden. Probeer een andere startlocatie in Vlaanderen."
         )
-    wiki_targets = ranked[:16]
-    selected = _pick(wiki_targets, ai_choice, request) if wiki_targets else []
+    stop_pool = pois_service.build_stop_pool(ranked, request.interests)
+    selected = _pick(stop_pool, ai_choice, request) if stop_pool else []
     selected = _merge_user_pois(selected, request.poi_picks)
 
     if chain:
@@ -196,6 +199,9 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
                 "why": ai_scripts.get("why") or scripts["why"],
                 "wikipedia_url": wiki.get("url") or None,
                 "image_url": wiki.get("image") or None,
+                "wikipedia": poi.get("wikipedia"),
+                "wikidata": poi.get("wikidata"),
+                "description": poi.get("description") or "",
                 "kind_label": poi.get("kind_label"),
                 "index": index,
             }
@@ -248,6 +254,9 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             why=s["why"],
             wikipedia_url=s.get("wikipedia_url"),
             image_url=s.get("image_url"),
+            wikipedia=s.get("wikipedia"),
+            wikidata=s.get("wikidata"),
+            description=s.get("description"),
             place_name=s.get("place_name"),
             population=s.get("population"),
             local_fact=s.get("local_fact"),
@@ -312,7 +321,9 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
     weather = WeatherInfo(**await weather_service.fetch_weather(request.start_lat, request.start_lng))
     nodes = list(request.nodes)
     reason = ""
-    if request.reason in {"regen", "wind", "korter"} or (request.reason is None and weather.suggest_shorter):
+    # Alleen verkorten bij expliciete aanpassing (regen/wind/…), nooit automatisch
+    # bij eigen gekozen knooppunten — anders verdwijnen picks uit de route.
+    if request.reason in {"regen", "wind", "korter"}:
         target = request.target_km or max(8.0, (weather.suggest_shorter and 12.0) or 12.0)
         if request.reason == "wind":
             reason = weather.alert or "Kortere lus door wind."
@@ -501,25 +512,300 @@ async def _build_knoop_route(
     end_lng: float | None = None,
     poi_picks: list[Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    spine = _chain_spine(chain)
+    # Spine = exacte gebruikerskeuze (nummer + coördinaten blijven behouden).
+    spine = _chain_spine([{**n, "lat": float(n["lat"]), "lng": float(n["lng"]), "number": str(n["number"])} for n in chain])
     network_nodes, trajects = await knoop_service.fetch_network_for_chain(spine)
-    spine = knoop_service.enrich_chain_geoids(spine, network_nodes)
-    expanded = knoop_service.expand_chain(spine, network_nodes, trajects)
+    spine_geo = knoop_service.enrich_chain_geoids(spine, network_nodes)
+    expanded = knoop_service.expand_chain(spine_geo, network_nodes, trajects)
+    must_visit = knoop_service._ensure_picks_in_chain(expanded, spine_geo) if spine_geo else list(expanded)
+
+    # Waypoints altijd op de echte pick-coördinaten van de gebruiker.
     waypoints = knoop_service.waypoints_for_chain(
         start_lat,
         start_lng,
-        expanded,
+        must_visit,
         close_loop=close_loop,
         end_lat=end_lat,
         end_lng=end_lng,
     )
     if poi_picks:
         waypoints = _insert_poi_waypoints(waypoints, poi_picks)
-    try:
-        route = await routing.bike_route_via_waypoints(waypoints)
-    except Exception:
-        route = knoop_service.route_from_trajects(waypoints, expanded, trajects)
-    return expanded, route
+
+    route = await _route_along_must_visit(
+        start_lat,
+        start_lng,
+        must_visit,
+        network_nodes,
+        trajects,
+        close_loop=close_loop,
+        end_lat=end_lat,
+        end_lng=end_lng,
+        poi_picks=poi_picks,
+        waypoints_with_poi=waypoints if poi_picks else None,
+    )
+    # Absolute garantie: elke gekozen knoop ligt op de rode lijn.
+    route["geometry"] = _pin_nodes_on_geometry(route.get("geometry") or [], spine_geo)
+    if not _route_covers_nodes(route.get("geometry") or [], spine_geo, max_m=50):
+        route["geometry"] = _pin_nodes_on_geometry(route.get("geometry") or [], must_visit + spine_geo)
+
+    return must_visit, route
+
+
+async def _route_along_must_visit(
+    start_lat: float,
+    start_lng: float,
+    must_visit: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]],
+    trajects: list[dict[str, Any]],
+    *,
+    close_loop: bool = True,
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+    poi_picks: list[Any] | None = None,
+    waypoints_with_poi: list[tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """Build route geometry along official knooppunten trajects; OSRM only to/from GPS."""
+    if poi_picks and waypoints_with_poi:
+        return await _route_through_waypoints(waypoints_with_poi, must_visit, trajects, network_nodes)
+
+    by_edge, edge_length, adj = knoop_service.index_trajects(trajects)
+    by_geoid: dict[int, dict[str, Any]] = {
+        int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None
+    }
+    for node in must_visit:
+        if node.get("geoid") is not None:
+            by_geoid[int(node["geoid"])] = node
+
+    geometries: list[list[list[float]]] = []
+    distance_m = 0.0
+    duration_s = 0.0
+    steps: list[Any] = []
+
+    async def add_osrm_segment(a: tuple[float, float], b: tuple[float, float]) -> None:
+        nonlocal distance_m, duration_s
+        if haversine_m(a[0], a[1], b[0], b[1]) < 20:
+            return
+        try:
+            osrm = await routing.bike_route([a, b], retries=1)
+            piece = list(osrm["geometry"])
+            if piece:
+                piece[0] = [a[0], a[1]]
+                piece[-1] = [b[0], b[1]]
+                geometries.append(piece)
+                distance_m += float(osrm["distance_m"])
+                duration_s += float(osrm["duration_s"])
+                steps.extend(osrm.get("steps") or [])
+        except Exception:
+            geometries.append([[a[0], a[1]], [b[0], b[1]]])
+            distance_m += haversine_m(a[0], a[1], b[0], b[1])
+            duration_s += 60.0
+
+    if must_visit:
+        first = must_visit[0]
+        await add_osrm_segment((start_lat, start_lng), (float(first["lat"]), float(first["lng"])))
+
+    for index in range(len(must_visit) - 1):
+        left = must_visit[index]
+        right = must_visit[index + 1]
+        if knoop_service._same_knoop(left, right):
+            continue
+        segment, known_length = knoop_service.geometry_between_nodes(
+            left, right, by_edge, edge_length, adj, by_geoid
+        )
+        if segment and len(segment) >= 2:
+            geometries.append(segment)
+            if known_length > 0:
+                distance_m += known_length
+            else:
+                for i in range(1, len(segment)):
+                    distance_m += haversine_m(segment[i - 1][0], segment[i - 1][1], segment[i][0], segment[i][1])
+            duration_s += max(30.0, (known_length or 0) / 3.9)
+            continue
+        await add_osrm_segment(
+            (float(left["lat"]), float(left["lng"])),
+            (float(right["lat"]), float(right["lng"])),
+        )
+
+    if must_visit:
+        last = must_visit[-1]
+        if close_loop:
+            await add_osrm_segment((float(last["lat"]), float(last["lng"])), (start_lat, start_lng))
+        elif end_lat is not None and end_lng is not None:
+            await add_osrm_segment((float(last["lat"]), float(last["lng"])), (end_lat, end_lng))
+
+    geometry = routing._merge_geometries(geometries)
+    geometry = _pin_nodes_on_geometry(geometry, must_visit)
+    geometry = _pin_nodes_on_geometry(geometry, [{"lat": start_lat, "lng": start_lng, "number": ""}])
+    if len(geometry) < 2:
+        raise RuntimeError("Geen fietsroute gevonden langs de knooppunten.")
+    return {
+        "geometry": geometry,
+        "distance_m": distance_m,
+        "duration_s": max(60.0, duration_s),
+        "steps": steps,
+    }
+
+
+async def _route_through_waypoints(
+    waypoints: list[tuple[float, float]],
+    nodes: list[dict[str, Any]],
+    trajects: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bouw de rode lijn via opeenvolgende waypoints (POI-detours); knoopsegmenten via trajecten."""
+    cleaned = routing._clean_waypoints(waypoints)
+    if len(cleaned) < 2:
+        raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
+
+    by_edge, edge_length, adj = knoop_service.index_trajects(trajects)
+    by_geoid: dict[int, dict[str, Any]] = {
+        int(node["geoid"]): node for node in (network_nodes or nodes) if node.get("geoid") is not None
+    }
+    for node in nodes:
+        if node.get("geoid") is not None:
+            by_geoid[int(node["geoid"])] = node
+
+    node_at = [_nearest_node(lat, lng, nodes, max_m=120.0) for lat, lng in cleaned]
+
+    geometries: list[list[list[float]]] = []
+    distance_m = 0.0
+    duration_s = 0.0
+    steps: list[Any] = []
+
+    for index in range(len(cleaned) - 1):
+        a = cleaned[index]
+        b = cleaned[index + 1]
+        left = node_at[index]
+        right = node_at[index + 1]
+        segment: list[list[float]] | None = None
+        known_length: float | None = None
+        if (
+            left
+            and right
+            and left.get("geoid") is not None
+            and right.get("geoid") is not None
+            and (knoop_service._same_knoop(left, {"number": left["number"], "lat": a[0], "lng": a[1]}) or haversine_m(left["lat"], left["lng"], a[0], a[1]) <= 120)
+            and (knoop_service._same_knoop(right, {"number": right["number"], "lat": b[0], "lng": b[1]}) or haversine_m(right["lat"], right["lng"], b[0], b[1]) <= 120)
+        ):
+            segment, known_length = knoop_service.geometry_between_nodes(
+                left, right, by_edge, edge_length, adj, by_geoid
+            )
+
+        if segment and len(segment) >= 2:
+            piece = list(segment)
+            if haversine_m(a[0], a[1], piece[0][0], piece[0][1]) > 25:
+                piece = [[a[0], a[1]], *piece]
+            else:
+                piece[0] = [a[0], a[1]]
+            if haversine_m(b[0], b[1], piece[-1][0], piece[-1][1]) > 25:
+                piece = [*piece, [b[0], b[1]]]
+            else:
+                piece[-1] = [b[0], b[1]]
+            geometries.append(piece)
+            if known_length and known_length > 0:
+                distance_m += known_length
+            else:
+                for i in range(1, len(piece)):
+                    distance_m += haversine_m(piece[i - 1][0], piece[i - 1][1], piece[i][0], piece[i][1])
+            duration_s += max(30.0, (known_length or 0) / 3.9)
+            continue
+
+        # Geen netwerktraject: OSRM tussen twee punten (start/eind of POI-detour).
+        try:
+            osrm = await routing.bike_route([a, b], retries=1)
+            piece = list(osrm["geometry"])
+            if not piece or haversine_m(a[0], a[1], piece[0][0], piece[0][1]) > 15:
+                piece = [[a[0], a[1]], *piece]
+            if haversine_m(b[0], b[1], piece[-1][0], piece[-1][1]) > 15:
+                piece = [*piece, [b[0], b[1]]]
+            # Forceer eindpunten exact op de gekozen knooppunten.
+            piece[0] = [a[0], a[1]]
+            piece[-1] = [b[0], b[1]]
+            geometries.append(piece)
+            distance_m += float(osrm["distance_m"])
+            duration_s += float(osrm["duration_s"])
+            steps.extend(osrm.get("steps") or [])
+        except Exception:
+            geometries.append([[a[0], a[1]], [b[0], b[1]]])
+            distance_m += haversine_m(a[0], a[1], b[0], b[1])
+            duration_s += 60.0
+
+    geometry = routing._merge_geometries(geometries)
+    geometry = _pin_nodes_on_geometry(geometry, [n for n in node_at if n])
+    # Pin ook de ruwe waypoints zelf (GPS-start / eind).
+    for lat, lng in cleaned:
+        geometry = _pin_nodes_on_geometry(geometry, [{"lat": lat, "lng": lng, "number": ""}])
+    if len(geometry) < 2:
+        raise RuntimeError("Geen fietsroute gevonden langs de knooppunten.")
+    return {
+        "geometry": geometry,
+        "distance_m": distance_m,
+        "duration_s": max(60.0, duration_s),
+        "steps": steps,
+    }
+
+
+def _nearest_node(lat: float, lng: float, nodes: list[dict[str, Any]], max_m: float = 80.0) -> dict[str, Any] | None:
+    best = None
+    best_d = float("inf")
+    for node in nodes:
+        dist = haversine_m(lat, lng, float(node["lat"]), float(node["lng"]))
+        if dist < best_d:
+            best_d = dist
+            best = node
+    return best if best is not None and best_d <= max_m else None
+
+
+def _pin_nodes_on_geometry(geometry: list[list[float]], nodes: list[dict[str, Any]]) -> list[list[float]]:
+    """Zorg dat elk knooppunt letterlijk op de lijn ligt (geen voorbijrijden)."""
+    if not geometry or not nodes:
+        return geometry
+    result = list(geometry)
+    for node in nodes:
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        best_i = 0
+        best_d = float("inf")
+        for index, point in enumerate(result):
+            dist = haversine_m(lat, lng, point[0], point[1])
+            if dist < best_d:
+                best_d = dist
+                best_i = index
+        if best_d <= 25:
+            result[best_i] = [lat, lng]
+            continue
+        # Zoek beste segment om het knooppunt in te voegen.
+        insert_at = best_i
+        best_score = float("inf")
+        for index in range(len(result) - 1):
+            score = point_to_segment_m(lat, lng, result[index][0], result[index][1], result[index + 1][0], result[index + 1][1])
+            if score < best_score:
+                best_score = score
+                insert_at = index + 1
+        result.insert(insert_at, [lat, lng])
+    return result
+
+
+def _route_covers_nodes(geometry: list[list[float]], nodes: list[dict[str, Any]], max_m: float = 90.0) -> bool:
+    if not nodes:
+        return True
+    if len(geometry) < 2:
+        return False
+    for node in nodes:
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        best = min(haversine_m(lat, lng, point[0], point[1]) for point in geometry)
+        if best > max_m:
+            # Ook corridor-check tussen opeenvolgende punten.
+            along = False
+            for index in range(0, len(geometry) - 1, max(1, len(geometry) // 300)):
+                nxt = min(len(geometry) - 1, index + max(1, len(geometry) // 300))
+                if point_to_segment_m(lat, lng, geometry[index][0], geometry[index][1], geometry[nxt][0], geometry[nxt][1]) <= max_m:
+                    along = True
+                    break
+            if not along:
+                return False
+    return True
 
 
 def _chain_spine(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -602,15 +888,38 @@ def _rank(candidates: list[dict[str, Any]], start: Place, end: Place, request: P
 
 
 def _pick(ranked: list[dict[str, Any]], ai_choice: dict[str, Any] | None, request: PlanRequest) -> list[dict[str, Any]]:
-    wanted = 5 if request.distance_km < 30 else 6
+    interests = list(dict.fromkeys(request.interests or ["geschiedenis"]))
+    wanted = min(16, max(len(interests), len(interests) + 2))
     by_id = {poi["id"]: poi for poi in ranked}
     chosen: list[dict[str, Any]] = []
+    chosen_ids: set[str] = set()
     if ai_choice and ai_choice.get("stop_ids"):
         for stop_id in ai_choice["stop_ids"]:
-            if stop_id in by_id:
+            if stop_id in by_id and stop_id not in chosen_ids:
                 chosen.append(by_id[stop_id])
+                chosen_ids.add(stop_id)
     if not chosen:
-        chosen = _spread(ranked, wanted)
+        chosen = pois_service.pick_diverse_pois(ranked, interests, wanted=wanted)
+    else:
+        present = {poi.get("interest") for poi in chosen}
+        for interest in interests:
+            if interest in present:
+                continue
+            for poi in ranked:
+                if poi.get("interest") != interest or poi["id"] in chosen_ids:
+                    continue
+                chosen.append(poi)
+                chosen_ids.add(poi["id"])
+                present.add(interest)
+                break
+        if len(chosen) < wanted:
+            for poi in pois_service.pick_diverse_pois(ranked, interests, wanted=wanted):
+                if poi["id"] in chosen_ids:
+                    continue
+                chosen.append(poi)
+                chosen_ids.add(poi["id"])
+                if len(chosen) >= wanted:
+                    break
     return chosen[:wanted]
 
 

@@ -48,20 +48,21 @@ export default function Onboarding({ initial, onComplete }) {
   return (
     <div className="onboard">
       <div className="onboard-card">
-        <div className="eyebrow">Welkom bij Veloverhaal · stap {step + 1} van {STEPS.length}</div>
-        <div className="step-dots" aria-hidden="true">
-          {STEPS.map((item, index) => (
-            <span key={item.id} className={index <= step ? "on" : ""} />
-          ))}
-        </div>
-        <div>
-          <h1 className="brand" style={{ fontSize: "1.7rem" }}>
-            {current.title}
-          </h1>
-          <p className="lede">{current.lede}</p>
-        </div>
+        <div className="onboard-scroll">
+          <div className="eyebrow">Welkom bij Veloverhaal · stap {step + 1} van {STEPS.length}</div>
+          <div className="step-dots" aria-hidden="true">
+            {STEPS.map((item, index) => (
+              <span key={item.id} className={index <= step ? "on" : ""} />
+            ))}
+          </div>
+          <div>
+            <h1 className="brand" style={{ fontSize: "1.7rem" }}>
+              {current.title}
+            </h1>
+            <p className="lede">{current.lede}</p>
+          </div>
 
-        {step === 0 && (
+          {step === 0 && (
           <>
             <Section title="Leeftijd">
               <div className="row">
@@ -187,7 +188,8 @@ export default function Onboarding({ initial, onComplete }) {
           </>
         )}
 
-        {!canNext && <div className="error">Kies minstens één optie om verder te gaan.</div>}
+          {!canNext && <div className="error">Kies minstens één optie om verder te gaan.</div>}
+        </div>
 
         <div className="onboard-nav">
           {step > 0 ? (

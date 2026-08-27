@@ -7,7 +7,7 @@ import httpx
 
 from app.config import settings
 from app.http import client
-from app.services.geo import osm_center, unique_key
+from app.services.geo import haversine_m, osm_center, unique_key
 
 
 OVERPASS_FILTERS: dict[str, list[str]] = {
@@ -26,8 +26,9 @@ OVERPASS_FILTERS: dict[str, list[str]] = {
     "landbouw": [
         '["tourism"="farm"]',
         '["shop"="farm"]',
-        '["craft"="winery"]',
+        '["craft"~"winery|cider"]',
         '["landuse"="vineyard"]["name"]',
+        '["amenity"="marketplace"]',
     ],
     "horeca": [
         '["amenity"~"cafe|pub|bar|restaurant|ice_cream|biergarten|fast_food"]',
@@ -45,8 +46,9 @@ OVERPASS_FILTERS: dict[str, list[str]] = {
         '["building"~"cathedral|church|chapel"]["name"]',
     ],
     "activiteiten": [
-        '["leisure"~"park|nature_reserve|garden|sports_centre"]',
-        '["tourism"~"attraction|viewpoint"]',
+        '["leisure"~"park|nature_reserve|garden|sports_centre|playground|miniature_golf|water_park"]',
+        '["tourism"~"attraction|viewpoint|theme_park|zoo|aquarium"]',
+        '["amenity"~"swimming_pool|bowling_alley|ice_rink"]',
     ],
     "evenementen": [
         '["amenity"~"theatre|arts_centre|marketplace|community_centre|events_venue|cinema"]',
@@ -159,20 +161,57 @@ async def fetch_pois(
     interests: list[str],
     extra_point: tuple[float, float] | None = None,
 ) -> list[dict[str, Any]]:
+    """Fetch named POIs for every selected interest (parallel per theme)."""
     radius_m = max(2500, min(radius_m, 22000))
+    wanted = _unique_interests(interests)
+    batches = await asyncio.gather(
+        *[_fetch_pois_for_interest(lat, lng, radius_m, interest, extra_point) for interest in wanted],
+        return_exceptions=True,
+    )
+    merged: dict[str, dict[str, Any]] = {}
+    for batch in batches:
+        if isinstance(batch, Exception):
+            continue
+        for poi in batch:
+            merged[str(poi["id"])] = poi
+    return list(merged.values())
+
+
+def _unique_interests(interests: list[str] | None) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in interests or ["geschiedenis"]:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+async def _fetch_pois_for_interest(
+    lat: float,
+    lng: float,
+    radius_m: int,
+    interest: str,
+    extra_point: tuple[float, float] | None = None,
+) -> list[dict[str, Any]]:
     points = [(lat, lng)]
     if extra_point:
         points.append(extra_point)
-    wanted = (interests or ["geschiedenis"])[:4]
+    filters = OVERPASS_FILTERS.get(interest, [])
+    if not filters:
+        return []
     clauses: list[str] = []
     for plat, plng in points:
         around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
-        for interest in wanted:
-            for filt in OVERPASS_FILTERS.get(interest, [])[:2]:
-                clauses.append(f'nwr{filt}["name"]({around});')
-
-    query = f"[out:json][timeout:25];({''.join(clauses)});out center 100;"
-    data = await _overpass(query)
+        for filt in filters[:3]:
+            clauses.append(f'nwr{filt}["name"]({around});')
+    if not clauses:
+        return []
+    query = f"[out:json][timeout:25];({''.join(clauses)});out center 80;"
+    try:
+        data = await _overpass(query)
+    except Exception:
+        return []
     seen: set[str] = set()
     pois: list[dict[str, Any]] = []
     for element in data.get("elements", []):
@@ -188,10 +227,10 @@ async def fetch_pois(
         if key in seen:
             continue
         seen.add(key)
-        interest, kind = classify(tags, wanted)
+        _, kind = classify(tags, [interest])
         pois.append(
             {
-                "id": str(element.get("id")),
+                "id": f"{interest}-{element.get('id')}",
                 "name": name,
                 "lat": plat,
                 "lng": plng,
@@ -206,6 +245,85 @@ async def fetch_pois(
             }
         )
     return pois
+
+
+def build_stop_pool(
+    ranked: list[dict[str, Any]],
+    interests: list[str],
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Ranked POIs with at least one candidate per selected interest."""
+    themes = _unique_interests(interests)
+    cap = limit or min(24, max(16, len(themes) * 2))
+    pool: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    def add(poi: dict[str, Any]) -> None:
+        pid = str(poi.get("id") or "")
+        if not pid or pid in used_ids:
+            return
+        pool.append(poi)
+        used_ids.add(pid)
+
+    for interest in themes:
+        for poi in ranked:
+            if poi.get("interest") == interest:
+                add(poi)
+                break
+
+    for poi in ranked:
+        if len(pool) >= cap:
+            break
+        add(poi)
+
+    return pool
+
+
+def pick_diverse_pois(
+    ranked: list[dict[str, Any]],
+    interests: list[str],
+    *,
+    wanted: int = 12,
+    min_distance_m: float = 800,
+) -> list[dict[str, Any]]:
+    """Spread picks along the route and cover each selected interest when possible."""
+    themes = _unique_interests(interests)
+    selected: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    def far_enough(poi: dict[str, Any]) -> bool:
+        return not any(
+            haversine_m(poi["lat"], poi["lng"], other["lat"], other["lng"]) < min_distance_m for other in selected
+        )
+
+    def try_add(poi: dict[str, Any]) -> bool:
+        pid = str(poi.get("id") or "")
+        if pid in used_ids:
+            return False
+        if not far_enough(poi):
+            return False
+        selected.append(poi)
+        used_ids.add(pid)
+        return True
+
+    for interest in themes:
+        for poi in ranked:
+            if poi.get("interest") != interest:
+                continue
+            pid = str(poi.get("id") or "")
+            if pid in used_ids:
+                continue
+            selected.append(poi)
+            used_ids.add(pid)
+            break
+
+    for poi in ranked:
+        if len(selected) >= wanted:
+            break
+        try_add(poi)
+
+    return selected or ranked[:wanted]
 
 
 def _sample_route_points(points: list[tuple[float, float]], max_points: int = 5) -> list[tuple[float, float]]:
@@ -266,7 +384,7 @@ async def _fetch_pois_along_points_impl(
             sampled[0][0],
             sampled[0][1],
             min(int(radius_m * 2), 16000),
-            interests[:4],
+            interests,
         )
     except Exception:
         if last_error:
@@ -354,6 +472,56 @@ async def fetch_horeca(
             }
         )
     return pois
+
+
+async def fetch_poi_at(lat: float, lng: float, *, name: str | None = None, radius_m: int = 70) -> dict[str, Any] | None:
+    """Nearest named OSM feature at a stop coordinate."""
+    query = (
+        f"[out:json][timeout:12];"
+        f'(nwr(around:{max(25, radius_m)},{lat:.6f},{lng:.6f})["name"];);'
+        f"out tags center 40;"
+    )
+    try:
+        data = await _overpass(query)
+    except Exception:
+        return None
+    best: dict[str, Any] | None = None
+    best_score = float("inf")
+    target = (name or "").strip().lower()
+    for element in data.get("elements") or []:
+        tags = element.get("tags") or {}
+        label = (tags.get("name:nl") or tags.get("name") or "").strip()
+        if not label:
+            continue
+        center = osm_center(element)
+        if not center:
+            continue
+        plat, plng = center
+        dist = haversine_m(lat, lng, plat, plng)
+        score = dist
+        if target:
+            lower = label.lower()
+            if lower == target:
+                score -= 120
+            elif target in lower or lower in target:
+                score -= 60
+        if score < best_score:
+            best_score = score
+            interest, kind = classify(tags, ["geschiedenis", "natuur", "architectuur"])
+            best = {
+                "name": label,
+                "lat": plat,
+                "lng": plng,
+                "kind": kind,
+                "kind_label": kind_label(kind),
+                "interest": interest,
+                "source": "OpenStreetMap",
+                "wikipedia": tags.get("wikipedia"),
+                "wikidata": tags.get("wikidata"),
+                "description": tags.get("description:nl") or tags.get("description") or "",
+                "heritage": tags.get("heritage") or tags.get("heritage:operator") or "",
+            }
+    return best
 
 
 async def _overpass(query: str) -> dict[str, Any]:

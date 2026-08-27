@@ -130,6 +130,8 @@ export function listenOnce(lang = "nl-BE") {
   });
 }
 
+export const ID_JOIN = "\u001f";
+
 export function uniqueChainIds(nodes) {
   const ids = [];
   const seen = new Set();
@@ -180,6 +182,13 @@ export function mergeMapKnooppunten(nearby, routeNodes, pinned = []) {
   for (const node of pinned || []) {
     const id = nodeId(node);
     byId.set(id, { ...byId.get(id), ...node });
+  }
+  // Zelfde knoop met andere id (OSM/WFS) ook als on_route markeren, zodat die groen blijft.
+  for (const [id, node] of [...byId.entries()]) {
+    if (node.on_route) continue;
+    if (knoopOnRoute(node, routeNodes)) {
+      byId.set(id, { ...node, on_route: true });
+    }
   }
   return [...byId.values()];
 }

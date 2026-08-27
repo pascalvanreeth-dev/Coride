@@ -2,15 +2,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { fetchKnooppunten, fetchPoiSuggestions, fetchRoutePreview, fetchRouteSuggestions, reverseGeocode, reroute } from "../api.js";
-import { estimateRouteKm, formatDuration, formatKm, getBrowserLocation, knoopMatches, knoopOnRoute, mergeMapKnooppunten, nodeId, poiId, dedupeNearbyPoints } from "../geo.js";
+import { fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, reverseGeocode, reroute } from "../api.js";
+import { estimateRouteKm, formatDuration, formatKm, getBrowserLocation, ID_JOIN, knoopMatches, knoopOnRoute, mergeMapKnooppunten, nodeId } from "../geo.js";
 import { useDebounced } from "../hooks.js";
-import { nodeIcon, poiIcon, startIcon } from "../icons.js";
+import { nodeIcon, startIcon } from "../icons.js";
 import { profileSummary, suggestedDistance, suggestedMinutes, toApiProfile, mergeInterests, interestLabels } from "../profile.js";
 import { MAP_SOURCES, MAP_TILE } from "../mapTiles.js";
+import { getUsedRouteIds } from "../routeHistory.js";
 import HereMarker from "./HereMarker.jsx";
 import MapChrome from "./MapChrome.jsx";
-import MapFlyTo, { MAP_FLY_PADDING } from "./MapFlyTo.jsx";
+import MapFlyTo from "./MapFlyTo.jsx";
 import MapReady from "./MapReady.jsx";
 import MapResize from "./MapResize.jsx";
 import MapZoomScale, { useMapZoom } from "./MapZoomScale.jsx";
@@ -52,22 +53,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const [suggestionPreview, setSuggestionPreview] = useState(null);
   const [suggestionPreviewBusy, setSuggestionPreviewBusy] = useState(false);
   const [modePickerOpen, setModePickerOpen] = useState(false);
+  const [startPickerOpen, setStartPickerOpen] = useState(false);
   const [pendingStartChoice, setPendingStartChoice] = useState(null); // "map" | "gps"
-  const [poiSuggestions, setPoiSuggestions] = useState([]);
-  const [poiSuggestionsBusy, setPoiSuggestionsBusy] = useState(false);
-  const [poiSuggestionsError, setPoiSuggestionsError] = useState("");
-  const [poiCatalog, setPoiCatalog] = useState({});
-  const [routePoiIds, setRoutePoiIds] = useState([]);
-  const [focusedPoi, setFocusedPoi] = useState(null);
-  const [poiPickerOpen, setPoiPickerOpen] = useState(false);
-  const [poiFocusTarget, setPoiFocusTarget] = useState(null);
-  const mapRef = useRef(null);
-  const poiFetchGen = useRef(0);
-  const poiPickerTimerRef = useRef(null);
   originRef.current = origin;
-  mapRef.current = map;
   const reverseKeyRef = useRef("");
-  const selectedKey = useDebounced(selectedIds.join("|"), 450);
+  const selectedKey = useDebounced(selectedIds.join(ID_JOIN), 450);
   const previewKey = useDebounced(
     origin &&
       ((buildMode === "suggest" && selectedSuggestionId) || buildMode === "auto")
@@ -121,44 +111,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const estimateKm = estimateRouteKm(origin, selectedNodes, mode !== "punt");
   const liveKm = draft?.distance_km ?? estimateKm;
   const liveMin = draft?.duration_min;
-
-  const poiSamplePoints = useMemo(() => {
-    const raw = [];
-    if (origin?.lat != null && origin?.lng != null) {
-      raw.push({ lat: origin.lat, lng: origin.lng });
-    }
-    for (const node of selectedNodes) {
-      raw.push({ lat: node.lat, lng: node.lng });
-    }
-    const geometry =
-      draft?.geometry?.length > 1
-        ? draft.geometry
-        : suggestionPreview?.geometry?.length > 1
-          ? suggestionPreview.geometry
-          : null;
-    if (geometry) {
-      const step = Math.max(1, Math.floor(geometry.length / 4));
-      for (let index = 0; index < geometry.length; index += step) {
-        raw.push({ lat: geometry[index][0], lng: geometry[index][1] });
-      }
-    } else if (!selectedNodes.length && routeNodes.length) {
-      const step = Math.max(1, Math.floor(routeNodes.length / 3));
-      for (let index = 0; index < routeNodes.length; index += step) {
-        raw.push({ lat: routeNodes[index].lat, lng: routeNodes[index].lng });
-      }
-    }
-    return dedupeNearbyPoints(raw, 700).slice(0, 4);
-  }, [origin, selectedNodes, routeNodes, draft?.geometry, suggestionPreview?.geometry]);
-
-  const poiFocus = useMemo(() => poiSamplePoints[0] || (origin?.lat != null ? { lat: origin.lat, lng: origin.lng } : null), [
-    poiSamplePoints,
-    origin,
-  ]);
-
-  const routePois = useMemo(
-    () => routePoiIds.map((id) => poiCatalog[id]).filter(Boolean),
-    [routePoiIds, poiCatalog],
-  );
 
   // Kaart centreren op GPS bij start; origin pas na expliciete startkeuze.
   useEffect(() => {
@@ -230,7 +182,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       return undefined;
     }
     const picked = selectedKey
-      .split("|")
+      .split(ID_JOIN)
       .filter(Boolean)
       .map((id) => nodeLookup.get(id))
       .filter(Boolean);
@@ -244,7 +196,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       return undefined;
     }
     const endPoint = mode === "punt" && picked.length >= 2 ? picked[picked.length - 1] : null;
-    const poiPicks = routePoiIds.map((id) => poiCatalog[id]).filter(Boolean);
     let cancelled = false;
     setDraftBusy(true);
     reroute({
@@ -262,15 +213,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       close_loop: mode !== "punt",
       end_lat: endPoint?.lat ?? null,
       end_lng: endPoint?.lng ?? null,
-      poi_picks: poiPicks.map((poi) => ({
-        id: poi.id,
-        name: poi.name,
-        lat: poi.lat,
-        lng: poi.lng,
-        kind: poi.kind,
-        kind_label: poi.kind_label || null,
-        interest: poi.interest || "geschiedenis",
-      })),
+      poi_picks: [],
     })
       .then((next) => {
         if (!cancelled) {
@@ -287,68 +230,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     return () => {
       cancelled = true;
     };
-  }, [buildMode, mode, nodeLookup, origin, selectedKey, routePoiIds.join("|"), poiCatalog]);
+  }, [buildMode, mode, nodeLookup, origin, selectedKey]);
 
   useEffect(() => {
     if (profile?.interests?.length) setInterests(profile.interests);
   }, [profile]);
 
   const activeInterests = profile?.interests?.length ? profile.interests : interests;
-
-  const poiRouteReady =
-    buildMode === "manual"
-      ? Boolean(startChoice && selectedNodes.length > 0)
-      : buildMode === "auto"
-        ? Boolean(startChoice && origin)
-        : false;
-
-  const poiSuggestKey = useDebounced(
-    poiRouteReady && poiFocus
-      ? `${poiFocus.lat}|${poiFocus.lng}|${activeInterests.join(",")}|${poiSamplePoints.length}|${draft?.geometry?.length || 0}|${suggestionPreview?.geometry?.length || 0}|${selectedNodes.length}`
-      : "",
-    500,
-  );
-
-  useEffect(() => {
-    if (!poiSuggestKey || !poiFocus) {
-      setPoiSuggestions([]);
-      setPoiSuggestionsBusy(false);
-      setPoiSuggestionsError("");
-      return undefined;
-    }
-    const gen = ++poiFetchGen.current;
-    let cancelled = false;
-    setPoiSuggestionsBusy(true);
-    setPoiSuggestionsError("");
-    const samples = poiSamplePoints.slice(1);
-    fetchPoiSuggestions(poiFocus.lat, poiFocus.lng, activeInterests, {
-      radius: routeNodes.length > 1 ? 6500 : 8000,
-      samples,
-    })
-      .then((next) => {
-        if (cancelled || gen !== poiFetchGen.current) return;
-        setPoiSuggestions(next);
-        setPoiCatalog((current) => {
-          const merged = { ...current };
-          for (const poi of next) merged[poiId(poi)] = poi;
-          return merged;
-        });
-        if (!next.length) {
-          setPoiSuggestionsError("Geen plekken gevonden langs je route. Probeer extra interesses in je profiel.");
-        }
-      })
-      .catch((err) => {
-        if (cancelled || gen !== poiFetchGen.current) return;
-        setPoiSuggestions([]);
-        setPoiSuggestionsError(err.message || "Suggesties konden niet geladen worden.");
-      })
-      .finally(() => {
-        if (gen === poiFetchGen.current) setPoiSuggestionsBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [poiSuggestKey, poiFocus?.lat, poiFocus?.lng, poiSamplePoints, activeInterests.join("|"), routeNodes.length, selectedNodes.length]);
 
   useEffect(() => {
     if (buildMode !== "suggest") return undefined;
@@ -483,18 +371,74 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   }
 
   function requestMapStart() {
+    setStartPickerOpen(false);
+    if (buildMode === "manual") {
+      setMode("punt");
+      chooseMapStart();
+      return;
+    }
     setPendingStartChoice("map");
     setModePickerOpen(true);
   }
 
   function requestMyLocation() {
+    setStartPickerOpen(false);
+    if (buildMode === "manual") {
+      setMode("punt");
+      chooseMyLocation();
+      return;
+    }
     setPendingStartChoice("gps");
     setModePickerOpen(true);
+  }
+
+  function cancelStartPicker() {
+    setStartPickerOpen(false);
   }
 
   function cancelRouteModePicker() {
     setModePickerOpen(false);
     setPendingStartChoice(null);
+  }
+
+  function enterBuildMode(nextMode) {
+    const switching = buildMode !== nextMode;
+    setGeoError("");
+    setSelectedSuggestionId("");
+    setSuggestionPreview(null);
+    cancelRouteModePicker();
+    cancelStartPicker();
+
+    if (nextMode === "suggest") {
+      if (switching) {
+        setStartChoice(null);
+        setOrigin(null);
+        setStart("");
+        setSelectedIds([]);
+        setDraft(null);
+      }
+      setBuildMode("suggest");
+      return;
+    }
+
+    if (switching) {
+      setStartChoice(null);
+      setOrigin(null);
+      setStart("");
+      setSelectedIds([]);
+      setNodeCatalog({});
+      setViewFocus(null);
+      setDraft(null);
+      reverseKeyRef.current = "";
+    }
+
+    setBuildMode(nextMode);
+    if (nextMode === "manual") {
+      setMode("punt");
+    }
+    if (switching || !startChoice) {
+      setStartPickerOpen(true);
+    }
   }
 
   function confirmRouteMode(nextMode) {
@@ -504,123 +448,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setPendingStartChoice(null);
     if (pending === "map") chooseMapStart();
     else if (pending === "gps") chooseMyLocation();
-  }
-
-  function rememberPois(...items) {
-    setPoiCatalog((current) => {
-      const next = { ...current };
-      for (const poi of items) {
-        if (!poi) continue;
-        next[poiId(poi)] = poi;
-      }
-      return next;
-    });
-  }
-
-  function focusMapOnPoi(lat, lng) {
-    const fly = () => {
-      mapRef.current?.flyTo([lat, lng], 15, { duration: 0.75, ...MAP_FLY_PADDING });
-    };
-    fly();
-    requestAnimationFrame(fly);
-    setTimeout(fly, 80);
-  }
-
-  function openPoiPicker(poi) {
-    const lat = Number(poi?.lat);
-    const lng = Number(poi?.lng ?? poi?.lon);
-    if (!poi || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
-    const point = { ...poi, lat, lng };
-    rememberPois(point);
-    setPoiPickerOpen(false);
-    setFocusedPoi(point);
-    setPoiFocusTarget({ lat, lng, key: Date.now() });
-    onPreview({ lat, lng, zoom: 15 });
-    focusMapOnPoi(lat, lng);
-    document.querySelector(".hero-map")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    clearTimeout(poiPickerTimerRef.current);
-    poiPickerTimerRef.current = setTimeout(() => {
-      setPoiPickerOpen(true);
-    }, 780);
-  }
-
-  function closePoiPicker() {
-    clearTimeout(poiPickerTimerRef.current);
-    setPoiPickerOpen(false);
-    setFocusedPoi(null);
-  }
-
-  function addFocusedPoiToRoute() {
-    if (!focusedPoi) return;
-    const id = poiId(focusedPoi);
-    rememberPois(focusedPoi);
-    setRoutePoiIds((current) => (current.includes(id) ? current : [...current, id]));
-    closePoiPicker();
-  }
-
-  function removeFocusedPoiFromRoute() {
-    if (!focusedPoi) return;
-    setRoutePoiIds((current) => current.filter((item) => item !== poiId(focusedPoi)));
-    closePoiPicker();
-  }
-
-  function renderInterestSuggestions() {
-    if ((buildMode !== "manual" && buildMode !== "auto") || !startChoice) return null;
-    const routeReady =
-      buildMode === "manual" ? selectedNodes.length > 0 : Boolean(origin);
-    if (!routeReady) return null;
-    return (
-      <div className="poi-suggest-section" id="suggestieoverzicht">
-        <strong>Suggestieoverzicht</strong>
-        <p className="sources" style={{ margin: "6px 0 8px" }}>
-          {poiSuggestionsBusy && !poiSuggestions.length
-            ? "Plekken langs je route worden geladen..."
-            : poiSuggestions.length
-              ? "Klik een suggestie — de kaart gaat naar die plek op je route."
-              : "Suggesties op basis van je interesses, langs je gekozen route."}
-        </p>
-        {poiSuggestionsError && !poiSuggestionsBusy && !poiSuggestions.length && (
-          <p className="error" style={{ margin: "0 0 8px" }}>
-            {poiSuggestionsError}
-          </p>
-        )}
-        {poiSuggestions.length > 0 && (
-          <div className="poi-suggest-grid">
-            {poiSuggestions.map((poi) => {
-              const id = poiId(poi);
-              const onRoute = routePoiIds.includes(id);
-              const focused = focusedPoi && poiId(focusedPoi) === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={`poi-suggest-tile ${onRoute ? "on" : ""} ${focused ? "focus" : ""}`}
-                  onPointerUp={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    openPoiPicker(poi);
-                  }}
-                >
-                  <span className="poi-suggest-kind">{poi.kind_label || poi.kind}</span>
-                  <strong>{poi.name}</strong>
-                </button>
-              );
-            })}
-          </div>
-        )}
-        {poiSuggestionsBusy && poiSuggestions.length > 0 && (
-          <p className="sources" style={{ margin: "8px 0 0" }}>
-            Meer plekken worden geladen...
-          </p>
-        )}
-        {routePois.length > 0 && (
-          <p className="sources" style={{ margin: "8px 0 0" }}>
-            {routePois.length} plek{routePois.length === 1 ? "" : "ken"} toegevoegd — route wordt aangepast
-            {draftBusy ? "…" : "."}
-          </p>
-        )}
-      </div>
-    );
   }
 
   async function goToSearchPlace({ lat, lng, label, zoom = 12 }) {
@@ -735,10 +562,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       return "start";
     }
     const id = nodeId(node);
-    if (selectedIdSet.has(id) || selectedNodes.some((picked) => knoopMatches(picked, node, 80))) {
-      return "picked";
-    }
-    if (node.on_route || knoopOnRoute(node, routeNodes)) {
+    // Gekozen én tussenliggende knooppunten op de route: altijd groen.
+    if (
+      selectedIdSet.has(id) ||
+      selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
+      node.on_route ||
+      knoopOnRoute(node, routeNodes)
+    ) {
       return "picked";
     }
     // In handmatige modus meteen rood tonen, niet grijs/paars-achtig idle.
@@ -751,18 +581,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   function isSelectedNode(node) {
     const id = nodeId(node);
     if (selectedIdSet.has(id)) return true;
-    return selectedNodes.some(
-      (picked) =>
-        String(picked.number) === String(node.number) &&
-        Math.abs(picked.lat - node.lat) < 0.0008 &&
-        Math.abs(picked.lng - node.lng) < 0.0008,
-    );
+    return selectedNodes.some((picked) => knoopMatches(picked, node, 80));
   }
 
   function submit(event) {
     event.preventDefault();
     if (buildMode !== "suggest" && !startChoice) {
-      setGeoError("Kies eerst: startpositie op de kaart, of gebruik mijn locatie.");
+      setGeoError("Kies eerst je startpunt.");
+      setStartPickerOpen(true);
       return;
     }
     if (!origin && buildMode !== "suggest") {
@@ -835,15 +661,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               geoid: node.geoid ?? null,
             }))
           : [],
-      poi_picks: routePois.map((poi) => ({
-        id: poi.id,
-        name: poi.name,
-        lat: poi.lat,
-        lng: poi.lng,
-        kind: poi.kind,
-        kind_label: poi.kind_label || null,
-        interest: poi.interest,
-      })),
+      poi_picks: [],
     });
   }
 
@@ -870,13 +688,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <button
             type="button"
             className={`choice-card ${buildMode === "manual" ? "on" : ""}`}
-            onClick={() => {
-              setGeoError("");
-              setSelectedSuggestionId("");
-              setSuggestionPreview(null);
-              cancelRouteModePicker();
-              setBuildMode("manual");
-            }}
+            onClick={() => enterBuildMode("manual")}
           >
             <strong>Zelf knooppunten kiezen</strong>
             <span>Klik de nummers op de kaart. Je ziet meteen hoeveel kilometer de route al is.</span>
@@ -884,13 +696,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <button
             type="button"
             className={`choice-card ${buildMode === "auto" ? "on" : ""}`}
-            onClick={() => {
-              setGeoError("");
-              setSelectedSuggestionId("");
-              setSuggestionPreview(null);
-              cancelRouteModePicker();
-              setBuildMode("auto");
-            }}
+            onClick={() => enterBuildMode("auto")}
           >
             <strong>Plan mijn tocht</strong>
             <span>Geef afstand of tijd. De gids kiest knooppunten en plekken op basis van je profiel.</span>
@@ -898,120 +704,43 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <button
             type="button"
             className={`choice-card ${buildMode === "suggest" ? "on" : ""}`}
-            onClick={() => {
-              setGeoError("");
-              cancelRouteModePicker();
-              setBuildMode("suggest");
-            }}
+            onClick={() => enterBuildMode("suggest")}
           >
             <strong>Route Top 10</strong>
             <span>Tien kant-en-klare tochten (~50 km) rond Vlaamse steden en bezienswaardigheden.</span>
           </button>
         </div>
 
-          {buildMode === "manual" && (
-          <>
-          <div className="start-choice">
-            <span className="start-pick-label">Startpunt</span>
-            <div className="row">
-              <button
-                type="button"
-                className={`mode ${startChoice === "map" ? "on" : ""}`}
-                onClick={requestMapStart}
-              >
-                Kies startpositie op de kaart
-              </button>
-              <button
-                type="button"
-                className={`mode ${startChoice === "gps" ? "on" : ""}`}
-                onClick={requestMyLocation}
-                disabled={geoBusy}
-              >
-                {geoBusy && startChoice === "gps" ? "GPS..." : "Gebruik mijn locatie"}
-              </button>
-            </div>
-            {startChoice && (
-              <p className="sources" style={{ margin: "6px 0 0" }}>
-                Type route: <strong>{mode === "lus" ? "Lus" : "Van A naar B"}</strong>
-              </p>
-            )}
-            {startChoice && (
-              <p className="sources" style={{ margin: "8px 0 0" }}>
-                {startChoice === "gps"
-                  ? origin
-                    ? mode === "punt"
-                      ? selectedNodes.length
-                        ? selectedNodes.length >= 2
-                          ? `Van knooppunt ${selectedNodes[0].number} naar ${selectedNodes[selectedNodes.length - 1].number}.`
-                          : `Start A: knooppunt ${selectedNodes[0].number}. Kies nog een eindknooppunt (B).`
-                        : "Klik het eerste knooppunt (A), daarna het laatste (B)."
-                      : `Vanaf je locatie${start && !COORD_QUERY.test(start) ? ` (${start})` : ""}. Kies knooppunten op de kaart.`
-                    : "Je locatie wordt opgehaald…"
-                  : origin?.source === "knoop"
-                    ? mode === "punt"
-                      ? selectedNodes.length >= 2
-                        ? `Van knooppunt ${selectedNodes[0].number} naar ${selectedNodes[selectedNodes.length - 1].number}.`
-                        : `Start A: knooppunt ${selectedNodes[0].number}. Kies het eindknooppunt (B).`
-                      : `Startknooppunt: ${start}. Kies daarna volgende knooppunten.`
-                    : origin
-                      ? mode === "punt"
-                        ? "Klik het eerste knooppunt (A), daarna het laatste (B)."
-                        : "Kies nu een knooppunt op de kaart als startpunt van je route."
-                      : mode === "punt"
-                        ? "Klik het eerste knooppunt (A), daarna het laatste (B)."
-                        : "Klik op de kaart om te zoomen, of kies meteen een startknooppunt."}
-              </p>
-            )}
-          </div>
           {geoError && <div className="error">{geoError}</div>}
 
-          </>
-          )}
-
-          {buildMode === "auto" && (
-          <>
-          <div className="start-choice">
-            <span className="start-pick-label">Startpunt</span>
-            <div className="row">
-              <button
-                type="button"
-                className={`mode ${startChoice === "map" ? "on" : ""}`}
-                onClick={requestMapStart}
-              >
-                Kies startpositie op de kaart
-              </button>
-              <button
-                type="button"
-                className={`mode ${startChoice === "gps" ? "on" : ""}`}
-                onClick={requestMyLocation}
-                disabled={geoBusy}
-              >
-                {geoBusy && startChoice === "gps" ? "GPS..." : "Gebruik mijn locatie"}
-              </button>
-            </div>
-            {startChoice && (
-              <p className="sources" style={{ margin: "6px 0 0" }}>
-                Type route: <strong>{mode === "lus" ? "Lus" : "Van A naar B"}</strong>
-              </p>
-            )}
-            {startChoice && (
-              <p className="sources" style={{ margin: "8px 0 0" }}>
+          {(buildMode === "manual" || buildMode === "auto") && startChoice && (
+            <p className="sources start-status" style={{ margin: "0 0 12px" }}>
+              Start:{" "}
+              <strong>
                 {startChoice === "gps"
-                  ? origin
-                    ? `Start: ${start && !COORD_QUERY.test(start) ? start : "jouw locatie"}`
-                    : "Je locatie wordt opgehaald…"
-                  : origin
-                    ? `Start: ${start && !COORD_QUERY.test(start) ? start : "positie op de kaart"}`
-                    : "Klik op de kaart (of een knooppunt) om te starten."}
-              </p>
-            )}
-          </div>
-          {geoError && <div className="error">{geoError}</div>}
-
-          </>
+                  ? start && !COORD_QUERY.test(start)
+                    ? start
+                    : "mijn locatie"
+                  : start && !COORD_QUERY.test(start)
+                    ? start
+                    : "positie op de kaart"}
+              </strong>
+              {" · "}
+              {buildMode === "manual" ? "Van A naar B" : mode === "lus" ? "Lus" : "Van A naar B"}
+              {" · "}
+              <button type="button" className="ghost-link" onClick={() => setStartPickerOpen(true)}>
+                Wijzig startpunt
+              </button>
+            </p>
           )}
 
-          {geoError && buildMode === "suggest" && <div className="error">{geoError}</div>}
+          {(buildMode === "manual" || buildMode === "auto") && !startChoice && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              <button type="button" className="ghost-link" onClick={() => setStartPickerOpen(true)}>
+                Kies startpunt
+              </button>
+            </p>
+          )}
 
           {buildMode === "suggest" && (
             <div className="editor suggest-routes">
@@ -1119,10 +848,16 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             <strong>Route via knooppunten</strong>
             <p className="sources" style={{ margin: "6px 0 8px" }}>
               {!startChoice
-                ? "Kies eerst je startmethode hierboven."
+                ? "Kies eerst je startpunt."
                 : nodesBusy
                   ? "Knooppunten worden geladen..."
-                  : nodes.length
+                  : selectedNodes.length
+                    ? `${routeNodes.length} knooppunten in volgorde${
+                        routeNodes.length > selectedNodes.length
+                          ? ` (${selectedNodes.length} gekozen, rest via netwerk)`
+                          : ""
+                      }`
+                    : nodes.length
                     ? startChoice === "gps"
                       ? mode === "punt"
                         ? "Klik knooppunt A, daarna B. Tussenliggende knooppunten komen automatisch mee."
@@ -1150,12 +885,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                           knoopMatches(selectedNodes[selectedNodes.length - 1], node, 80) && (
                             <small> · B</small>
                           )}
-                        {!picked && draft?.knooppunten?.length > selectedNodes.length && (
-                          <small> · via netwerk</small>
-                        )}
-                        {picked && index < routeNodes.length - 1 && (
-                          <small> gekozen</small>
-                        )}
+                        {picked ? <small> gekozen</small> : <small> · via netwerk</small>}
                       </span>
                       {picked && (
                         <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
@@ -1197,8 +927,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             )}
           </div>
           )}
-
-          {buildMode === "manual" && renderInterestSuggestions()}
 
           {buildMode === "auto" && mode === "lus" && (
             <>
@@ -1272,8 +1000,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               )}
             </>
           )}
-
-          {buildMode === "auto" && renderInterestSuggestions()}
 
           {buildMode === "auto" && (
           <label>
@@ -1351,23 +1077,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               onToggle={toggleNode}
             />
           )}
-          {(buildMode === "manual" || buildMode === "auto") &&
-            (poiSuggestions.length > 0 || routePois.length > 0 || focusedPoi) && (
-            <PlannerPoiMarkers
-              pois={[
-                ...poiSuggestions,
-                ...routePois.filter((poi) => !poiSuggestions.some((item) => poiId(item) === poiId(poi))),
-                ...(focusedPoi &&
-                !poiSuggestions.some((item) => poiId(item) === poiId(focusedPoi)) &&
-                !routePois.some((item) => poiId(item) === poiId(focusedPoi))
-                  ? [focusedPoi]
-                  : []),
-              ]}
-              routePoiIds={routePoiIds}
-              focusedPoi={focusedPoi}
-              onSelect={openPoiPicker}
-            />
-          )}
           {origin && origin.source === "map" && buildMode !== "suggest" && (
             <Marker position={[origin.lat, origin.lng]} icon={startIcon} zIndexOffset={1100}>
               <Popup>Zoekgebied / startpositie</Popup>
@@ -1382,19 +1091,16 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             trigger={locateTick}
             zoom={buildMode === "suggest" ? 12 : 14}
           />
-          <PoiMapFocus target={poiFocusTarget} />
           <Recenter
             center={center}
             zoom={zoom}
             locked={
-              poiPickerOpen ||
-              Boolean(focusedPoi) ||
               Boolean(origin) ||
               (buildMode === "manual" && selectedNodes.length > 0) ||
               (buildMode === "suggest" && !!selectedSuggestion)
             }
           />
-          {buildMode === "manual" && lastSelectedNode && !poiPickerOpen && !focusedPoi && (
+          {buildMode === "manual" && lastSelectedNode && (
             <FocusLastSelected node={lastSelectedNode} trigger={selectedIds.join("|")} />
           )}
           {buildMode === "manual" &&
@@ -1407,11 +1113,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           {(buildMode === "suggest" || buildMode === "auto") && (
             <FitPreview
               geometry={routePreview?.geometry}
-              active={
-                !poiPickerOpen &&
-                !focusedPoi &&
-                (buildMode === "suggest" ? !!selectedSuggestion : !!origin)
-              }
+              active={buildMode === "suggest" ? !!selectedSuggestion : !!origin}
             />
           )}
           </MapZoomScale>
@@ -1427,7 +1129,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <div className="map-hint">
           {buildMode === "manual"
             ? !startChoice
-              ? "Kies links: startpositie op de kaart, of gebruik mijn locatie"
+              ? "Kies je startpunt in het venster"
               : mode === "punt"
                 ? selectedNodes.length >= 2
                   ? `${routeNodes.length} knooppunten · A→B · ${formatKm(liveKm)}`
@@ -1450,7 +1152,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                   : `${selectedSuggestion.title} · ${distance} km`
                 : "Kies een route uit de Top 10"
               : !startChoice
-                ? "Kies links: startpositie op de kaart, of gebruik mijn locatie"
+                ? "Kies je startpunt in het venster"
                 : startChoice === "gps"
                   ? origin
                     ? "Start klaar. Stel afstand/tijd in en plan je tocht."
@@ -1462,54 +1164,48 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         </div>
       </section>
 
-      {poiPickerOpen &&
-        focusedPoi &&
+      {startPickerOpen &&
+        (buildMode === "manual" || buildMode === "auto") &&
         createPortal(
-          <div className="mode-picker-backdrop" onClick={closePoiPicker}>
+          <div className="mode-picker-backdrop" onClick={cancelStartPicker}>
             <div
-              className="mode-picker poi-picker"
+              className="mode-picker"
               role="dialog"
               aria-modal="true"
-              aria-labelledby="poi-picker-title"
+              aria-labelledby="start-picker-title"
               onClick={(event) => event.stopPropagation()}
             >
-              <h2 id="poi-picker-title" className="mode-picker-title">
-                {focusedPoi.name}
+              <h2 id="start-picker-title" className="mode-picker-title">
+                Startpunt
               </h2>
               <p className="sources" style={{ margin: "8px 0 0" }}>
-                {focusedPoi.kind_label || focusedPoi.kind}
+                Hoe wil je je route beginnen?
               </p>
-              <p className="sources" style={{ margin: "10px 0 0" }}>
-                Wil je deze plek toevoegen aan je route? Je fietsroute wordt hierdoor aangepast.
-              </p>
-              <div className="poi-picker-actions">
-                {routePoiIds.includes(poiId(focusedPoi)) ? (
-                  <>
-                    <button type="button" className="ghost" onClick={removeFocusedPoiFromRoute}>
-                      Verwijderen van route
-                    </button>
-                    <button type="button" className="ghost mode-picker-cancel" onClick={closePoiPicker}>
-                      Sluiten
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button type="button" className="submit" onClick={addFocusedPoiToRoute}>
-                      Ja, toevoegen aan route
-                    </button>
-                    <button type="button" className="ghost mode-picker-cancel" onClick={closePoiPicker}>
-                      Nee, overslaan
-                    </button>
-                  </>
-                )}
+              <div className="mode-picker-options">
+                <button type="button" className="choice-card mode-picker-card" onClick={requestMapStart}>
+                  <strong>Kies startpositie op de kaart</strong>
+                  <span>Klik op de kaart of op een knooppunt als startpunt.</span>
+                </button>
+                <button
+                  type="button"
+                  className="choice-card mode-picker-card"
+                  onClick={requestMyLocation}
+                  disabled={geoBusy}
+                >
+                  <strong>{geoBusy ? "GPS wordt opgehaald…" : "Gebruik mijn locatie"}</strong>
+                  <span>Start vanaf waar je nu bent.</span>
+                </button>
               </div>
+              <button type="button" className="ghost mode-picker-cancel" onClick={cancelStartPicker}>
+                Annuleren
+              </button>
             </div>
           </div>,
           document.body,
         )}
 
       {modePickerOpen &&
-        (buildMode === "manual" || buildMode === "auto") &&
+        buildMode === "auto" &&
         createPortal(
           <div className="mode-picker-backdrop" onClick={cancelRouteModePicker}>
             <div
@@ -1542,11 +1238,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                   onClick={() => confirmRouteMode("punt")}
                 >
                   <strong>Van A naar B</strong>
-                  <span>
-                    {buildMode === "manual"
-                      ? "Eerste knooppunt is A, laatste knooppunt is B."
-                      : "Je fietst van start naar een andere bestemming."}
-                  </span>
+                  <span>Je fietst van start naar een andere bestemming.</span>
                 </button>
               </div>
               <button type="button" className="ghost mode-picker-cancel" onClick={cancelRouteModePicker}>
@@ -1560,72 +1252,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   );
 }
 
-function PoiMapFocus({ target }) {
-  const map = useMap();
-  const lastKey = useRef(0);
-
-  useEffect(() => {
-    if (!target?.key || target.key === lastKey.current) return;
-    lastKey.current = target.key;
-    const lat = Number(target.lat);
-    const lng = Number(target.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-    map.flyTo([lat, lng], 15, { duration: 0.75, ...MAP_FLY_PADDING });
-  }, [map, target]);
-
-  return null;
-}
-
-function PlannerPoiMarker({ poi, selected, focused, onSelect }) {
-  const id = poiId(poi);
-
-  return (
-    <Marker
-      key={id}
-      position={[Number(poi.lat), Number(poi.lng)]}
-      icon={poiIcon({ selected, focused })}
-      zIndexOffset={focused ? 2000 : selected ? 1500 : 900}
-      eventHandlers={{
-        click: (event) => {
-          if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
-          onSelect(poi);
-        },
-      }}
-    >
-      <Popup>
-        <strong>{poi.name}</strong>
-        <p>{poi.kind_label || poi.kind}</p>
-      </Popup>
-    </Marker>
-  );
-}
-
-function PlannerPoiMarkers({ pois, routePoiIds, focusedPoi, onSelect }) {
-  if (!pois?.length) return null;
-  const unique = [];
-  const seen = new Set();
-  for (const poi of pois) {
-    const id = poiId(poi);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    unique.push(poi);
-  }
-  return unique.map((poi) => {
-    const id = poiId(poi);
-    const selected = routePoiIds.includes(id);
-    const focused = focusedPoi && poiId(focusedPoi) === id;
-    return (
-      <PlannerPoiMarker
-        key={id}
-        poi={poi}
-        selected={selected}
-        focused={focused}
-        onSelect={onSelect}
-      />
-    );
-  });
-}
-
 function PlannerKnoopMarkers({ nodes, buildMode, startChoice, selectedIds, origin, nodeVariant, onToggle }) {
   const { scale, showKnoopMarkers } = useMapZoom();
   if (!showKnoopMarkers) return null;
@@ -1636,7 +1262,7 @@ function PlannerKnoopMarkers({ nodes, buildMode, startChoice, selectedIds, origi
         key={nodeId(node)}
         position={[node.lat, node.lng]}
         icon={nodeIcon(node.number, variant, scale)}
-        zIndexOffset={variant === "picked" || variant === "start" ? 1200 : 1000}
+        zIndexOffset={variant === "picked" || variant === "start" || variant === "end" ? 1200 : 1000}
         eventHandlers={{
           click: (event) => {
             if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);

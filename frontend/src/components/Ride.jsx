@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
-import { askAbout, reroute } from "../api.js";
+import { askAbout, fetchStopSummary, fetchSurroundings, reroute } from "../api.js";
 import {
   bearingDeg,
   compassLabel,
@@ -12,6 +13,7 @@ import {
   getBrowserLocation,
   haversine,
   interpolate,
+  ID_JOIN,
   knoopMatches,
   knoopOnRoute,
   listenOnce,
@@ -24,6 +26,7 @@ import {
 } from "../geo.js";
 import { nodeIcon } from "../icons.js";
 import { useDebounced } from "../hooks.js";
+import { interestLabels } from "../profile.js";
 import HereMarker from "./HereMarker.jsx";
 import MapChrome from "./MapChrome.jsx";
 import MapFlyTo from "./MapFlyTo.jsx";
@@ -57,6 +60,14 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [gps, setGps] = useState(null);
   const [followGps, setFollowGps] = useState(false);
   const [locateTick, setLocateTick] = useState(0);
+  const [focusTarget, setFocusTarget] = useState(null);
+  const [focusedStop, setFocusedStop] = useState(null);
+  const [stopPickerOpen, setStopPickerOpen] = useState(false);
+  const [stopBlurbs, setStopBlurbs] = useState({});
+  const [stopBlurbBusy, setStopBlurbBusy] = useState(false);
+  const [routePoiIds, setRoutePoiIds] = useState([]);
+  const stopPickerTimerRef = useRef(null);
+  const fetchedBlurbIds = useRef(new Set());
   const [locateBusy, setLocateBusy] = useState(false);
   const [activeId, setActiveId] = useState(plan.stops[0]?.id || null);
   const [phase, setPhase] = useState("intro");
@@ -72,6 +83,10 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [listening, setListening] = useState(false);
   const [chats, setChats] = useState({});
   const [heading, setHeading] = useState(null);
+  const [surroundingsOn, setSurroundingsOn] = useState(() => plan.interaction !== "passief");
+  const [surroundings, setSurroundings] = useState(null);
+  const [surroundingsBusy, setSurroundingsBusy] = useState(false);
+  const [surroundingsError, setSurroundingsError] = useState("");
   const [weatherOffer, setWeatherOffer] = useState(() => Boolean(plan.weather?.suggest_shorter));
   const [guideOpen, setGuideOpen] = useState(true);
   const guideOpenRef = useRef(true);
@@ -85,6 +100,13 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const planRef = useRef(plan);
   const watchRef = useRef(null);
   const demoRef = useRef(null);
+  const surroundingsFetchRef = useRef({ lat: 0, lng: 0, at: 0 });
+  const surroundingsCellsRef = useRef(new Set());
+  const surroundingsBusyRef = useRef(false);
+  const surroundingsOnRef = useRef(surroundingsOn);
+  const modeRef = useRef(mode);
+  surroundingsOnRef.current = surroundingsOn;
+  modeRef.current = mode;
   planRef.current = plan;
 
   const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
@@ -95,9 +117,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     for (const node of plan.knooppunten || []) map.set(nodeId(node), node);
     return map;
   }, [allNodes, plan.knooppunten]);
-  const originalIds = useMemo(() => uniqueChainIds(plan.knooppunten).join("|"), [plan.knooppunten]);
-  const dirty = customIds.join("|") !== originalIds;
-  const previewKey = useDebounced(customIds.join("|"), 450);
+  const originalIds = useMemo(() => uniqueChainIds(plan.knooppunten).join(ID_JOIN), [plan.knooppunten]);
+  const dirty = customIds.join(ID_JOIN) !== originalIds;
+  const previewKey = useDebounced(customIds.join(ID_JOIN), 450);
   const selectedNodes = useMemo(
     () => customIds.map((id) => nodeLookup.get(id)).filter(Boolean),
     [customIds, nodeLookup],
@@ -202,6 +224,10 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     setStepIndex(0);
     stepIndexRef.current = 0;
     spokenNav.current = new Set();
+    surroundingsCellsRef.current = new Set();
+    surroundingsFetchRef.current = { lat: 0, lng: 0, at: 0 };
+    setSurroundings(null);
+    setSurroundingsError("");
     setPosition({ lat: plan.start.lat, lng: plan.start.lng });
     setDraft(null);
     setGuideOpen(true);
@@ -215,7 +241,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       return undefined;
     }
     const picked = previewKey
-      .split("|")
+      .split(ID_JOIN)
       .filter(Boolean)
       .map((id) => nodeLookup.get(id))
       .filter(Boolean);
@@ -238,6 +264,10 @@ export default function Ride({ plan, onPlanChange, onBack }) {
         on_route: true,
       })),
       close_loop: plan.mode !== "punt",
+      poi_picks: routePoiIds
+        .map((id) => plan.stops.find((item) => item.id === id))
+        .filter(Boolean)
+        .map(stopToPoiPick),
     })
       .then((next) => {
         if (!cancelled) setDraft(next);
@@ -251,14 +281,148 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     return () => {
       cancelled = true;
     };
-  }, [dirty, nodeLookup, plan.mode, plan.start.lat, plan.start.lng, previewKey]);
+  }, [dirty, nodeLookup, plan.mode, plan.start.lat, plan.start.lng, plan.stops, previewKey, routePoiIds]);
 
   useEffect(() => {
     return () => {
       stopTracking();
       stopSpeaking();
+      clearTimeout(stopPickerTimerRef.current);
     };
   }, []);
+
+  function closeStopPicker() {
+    clearTimeout(stopPickerTimerRef.current);
+    setStopPickerOpen(false);
+    setFocusedStop(null);
+  }
+
+  function openStopSuggestion(stop) {
+    if (!stop) return;
+    clearTimeout(stopPickerTimerRef.current);
+    setStopPickerOpen(false);
+    setActiveId(stop.id);
+    setPhase("arrived");
+    setFollowGps(false);
+    setFocusedStop(stop);
+    setFocusTarget({ lat: stop.lat, lng: stop.lng, key: Date.now() });
+    guideSpeak(`${stop.arrived} ${stop.why || ""}`.trim());
+    stopPickerTimerRef.current = setTimeout(() => {
+      setStopPickerOpen(true);
+    }, 2200);
+  }
+
+  useEffect(() => {
+    if (!focusedStop?.id) return undefined;
+    if (fetchedBlurbIds.current.has(focusedStop.id)) return undefined;
+    const inline = stopInlineDescription(focusedStop);
+    if (inline && !isGenericStopBlurb(inline, focusedStop)) {
+      fetchedBlurbIds.current.add(focusedStop.id);
+      return undefined;
+    }
+    fetchedBlurbIds.current.add(focusedStop.id);
+
+    let cancelled = false;
+    setStopBlurbBusy(true);
+    fetchStopSummary({
+      name: focusedStop.name,
+      lat: focusedStop.lat,
+      lng: focusedStop.lng,
+      wikipedia_url: focusedStop.wikipedia_url,
+      wikipedia: focusedStop.wikipedia,
+      wikidata: focusedStop.wikidata,
+      description: focusedStop.description,
+      kind: focusedStop.kind,
+    })
+      .then((data) => {
+        if (cancelled || !data?.summary?.trim()) return;
+        setStopBlurbs((current) => ({ ...current, [focusedStop.id]: data.summary.trim() }));
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setStopBlurbBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [focusedStop?.id, focusedStop?.name, focusedStop?.lat, focusedStop?.lng, focusedStop?.wikipedia_url, focusedStop?.wikipedia, focusedStop?.wikidata, focusedStop?.description, focusedStop?.kind]);
+
+  function stopToPoiPick(stop) {
+    return {
+      id: stop.id,
+      name: stop.name,
+      lat: stop.lat,
+      lng: stop.lng,
+      kind: stop.kind || "plek",
+      kind_label: stop.kind || null,
+      interest: stop.interest || plan.interests?.[0] || "geschiedenis",
+    };
+  }
+
+  async function includeFocusedStopInRoute() {
+    if (!focusedStop) return;
+    const stop = focusedStop;
+    const selected = customIds.map((id) => nodeLookup.get(id)).filter(Boolean);
+    const spine =
+      selected.length > 0
+        ? selected
+        : (plan.knooppunten || []).filter((node, index, arr) => {
+            if (!node) return false;
+            if (index > 0 && nodeId(node) === nodeId(arr[0]) && index === arr.length - 1) return false;
+            return true;
+          });
+    if (!spine.length) {
+      setRerouteError("Geen knooppunten om de route langs deze plek te leggen.");
+      closeStopPicker();
+      return;
+    }
+    const nextPoiIds = routePoiIds.includes(stop.id) ? routePoiIds : [...routePoiIds, stop.id];
+    const poiPicks = nextPoiIds
+      .map((id) => plan.stops.find((item) => item.id === id) || (id === stop.id ? stop : null))
+      .filter(Boolean)
+      .map(stopToPoiPick);
+    setRerouteBusy(true);
+    setRerouteError("");
+    try {
+      const next = await reroute({
+        start_lat: plan.start.lat,
+        start_lng: plan.start.lng,
+        nodes: spine.map((node) => ({
+          id: node.id || "",
+          number: node.number,
+          lat: node.lat,
+          lng: node.lng,
+          network: node.network || null,
+          geoid: node.geoid ?? null,
+          on_route: true,
+        })),
+        close_loop: plan.mode !== "punt",
+        poi_picks: poiPicks,
+      });
+      setRoutePoiIds(nextPoiIds);
+      const routeIds = new Set((next.knooppunten || []).map((node) => nodeId(node)));
+      onPlanChange({
+        ...plan,
+        ...next,
+        knooppunten: next.knooppunten,
+        all_knooppunten: (plan.all_knooppunten?.length ? plan.all_knooppunten : allNodes).map((node) => ({
+          ...node,
+          on_route: routeIds.has(nodeId(node)),
+        })),
+        route_reason: `Route via ${stop.name}`,
+      });
+      guideSpeak(`Oké, de route gaat langs ${stop.name}.`);
+      closeStopPicker();
+      // Na herberekening even wachten tot FitRoute klaar is, daarna terug inzoomen op de plek.
+      setTimeout(() => {
+        setFocusTarget({ lat: stop.lat, lng: stop.lng, key: Date.now() });
+      }, 120);
+    } catch (err) {
+      setRerouteError(err.message);
+    } finally {
+      setRerouteBusy(false);
+    }
+  }
 
   function stopTracking() {
     if (watchRef.current != null) {
@@ -286,6 +450,47 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     maybeAnnounce(here);
     advanceNav(here);
     announceGeoContext(here);
+    maybeFetchSurroundings(here);
+  }
+
+  function surroundingsCellKey(here) {
+    return `${here.lat.toFixed(3)}|${here.lng.toFixed(3)}`;
+  }
+
+  async function maybeFetchSurroundings(here) {
+    if (!surroundingsOnRef.current || planRef.current.interaction === "passief") return;
+    if (modeRef.current !== "live" && modeRef.current !== "demo") return;
+    const cellKey = surroundingsCellKey(here);
+    if (surroundingsCellsRef.current.has(cellKey) || surroundingsBusyRef.current) return;
+
+    const last = surroundingsFetchRef.current;
+    const moved = last.lat ? haversine(last, here) : Infinity;
+    const elapsed = Date.now() - (last.at || 0);
+    if (moved < 280 && elapsed < 90000) return;
+
+    surroundingsBusyRef.current = true;
+    setSurroundingsBusy(true);
+    setSurroundingsError("");
+    try {
+      const data = await fetchSurroundings({
+        lat: here.lat,
+        lng: here.lng,
+        interests: planRef.current.interests || [],
+        explanation_level: planRef.current.explanation_level || "normaal",
+        heading,
+      });
+      surroundingsFetchRef.current = { lat: here.lat, lng: here.lng, at: Date.now() };
+      surroundingsCellsRef.current.add(cellKey);
+      setSurroundings(data);
+      if (data.summary) {
+        guideSpeak(data.summary);
+      }
+    } catch (err) {
+      setSurroundingsError(err.message);
+    } finally {
+      surroundingsBusyRef.current = false;
+      setSurroundingsBusy(false);
+    }
   }
 
   async function showMyLocation() {
@@ -435,6 +640,10 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           on_route: true,
         })),
         close_loop: plan.mode !== "punt",
+        poi_picks: routePoiIds
+          .map((id) => plan.stops.find((item) => item.id === id))
+          .filter(Boolean)
+          .map(stopToPoiPick),
       });
       const routeIds = new Set((next.knooppunten || []).map((node) => nodeId(node)));
       const mergedAll = [...allNodes];
@@ -597,11 +806,14 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   function nodeVariant(node) {
     const id = nodeId(node);
-    const onExpandedRoute = knoopOnRoute(node, routeNodes);
-    if (customIds.includes(id) || selectedNodes.some((picked) => knoopMatches(picked, node, 80))) {
+    if (
+      customIds.includes(id) ||
+      selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
+      node.on_route ||
+      knoopOnRoute(node, routeNodes)
+    ) {
       return "picked";
     }
-    if (onExpandedRoute || node.on_route) return "picked";
     return "route";
   }
 
@@ -661,23 +873,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           </div>
         )}
         {plan.route_reason && <p className="sources">{plan.route_reason}</p>}
-        {plan.knoop_chain && (
-          <>
-            <p className="sources" style={{ margin: "8px 0 6px" }}>
-              Te volgen knooppunten ({plan.knooppunten.length})
-            </p>
-            <ol className="picked-list route-knoop-list">
-              {plan.knooppunten.map((node, index) => (
-                <li key={`${nodeId(node)}-${index}`}>
-                  <span className="num">{index + 1}</span>
-                  <span>
-                    <strong>Knooppunt {node.number}</strong>
-                  </span>
-                </li>
-              ))}
-            </ol>
-          </>
-        )}
         <div className="stats">
           <div className="stat">
             <span>{dirty ? "Voorlopige afstand" : "Afstand"}</span>
@@ -696,6 +891,15 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           <button type="button" onClick={startLive}>
             Start route
           </button>
+          {plan.interaction !== "passief" && (
+            <button
+              type="button"
+              className={surroundingsOn ? "submit" : "ghost"}
+              onClick={() => setSurroundingsOn((current) => !current)}
+            >
+              {surroundingsOn ? "Omgeving aan" : "Omgeving uit"}
+            </button>
+          )}
           <button type="button" className="ghost" onClick={showMyLocation}>
             Mijn locatie
           </button>
@@ -713,11 +917,47 @@ export default function Ride({ plan, onPlanChange, onBack }) {
         </div>
         <p className="sources">
           {mode === "live"
-            ? "GPS-navigatie aan: afslagen en uitleg worden voorgelezen."
+            ? surroundingsOn
+              ? "GPS-navigatie aan: afslagen, uitleg en omgevingsinfo binnen 350 m worden voorgelezen."
+              : "GPS-navigatie aan: afslagen en uitleg worden voorgelezen."
             : mode === "demo"
               ? "Demo: de fiets rijdt de route af met navigatie en uitleg."
               : "Start route voor GPS-begeleiding. De blauwe punt is jouw locatie."}
         </p>
+        {plan.interaction !== "passief" && surroundingsOn && (
+          <div className="context-card surroundings-card">
+            <div className="kicker">Omgeving · 350 m</div>
+            {surroundingsBusy && !surroundings?.summary ? (
+              <p className="sources" style={{ margin: 0 }}>
+                Omgeving wordt opgezocht…
+              </p>
+            ) : surroundings?.summary ? (
+              <>
+                {surroundings.place_name ? <strong>{surroundings.place_name}</strong> : null}
+                <p>{surroundings.summary}</p>
+                {surroundings.highlights?.length > 0 && (
+                  <ul className="surroundings-highlights">
+                    {surroundings.highlights.map((item) => (
+                      <li key={`${item.name}-${item.distance_m}`}>
+                        {item.name}
+                        <small>
+                          {" "}
+                          · {interestLabels([item.interest])[0] || item.interest}
+                          {typeof item.distance_m === "number" ? ` · ${item.distance_m} m` : ""}
+                        </small>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            ) : (
+              <p className="sources" style={{ margin: 0 }}>
+                Start de route om live omgevingsinfo te krijgen.
+              </p>
+            )}
+            {surroundingsError && <div className="error">{surroundingsError}</div>}
+          </div>
+        )}
         <div className="editor">
           <strong>Eigen route</strong>
           <p className="sources" style={{ margin: "6px 0 8px" }}>
@@ -727,13 +967,15 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           {routeNodes.length ? (
             <ol className="picked-list route-knoop-list">
               {routeNodes.map((node, index) => {
-                const picked = customIds.includes(nodeId(node));
+                const picked =
+                  customIds.includes(nodeId(node)) ||
+                  selectedNodes.some((item) => knoopMatches(item, node, 80));
                 return (
                   <li key={`${nodeId(node)}-${index}`} className={picked ? "picked-stop" : "via-stop"}>
                     <span className="num">{index + 1}</span>
                     <span>
                       <strong>Knooppunt {node.number}</strong>
-                      {!picked && <small> · via netwerk</small>}
+                      {picked ? <small> gekozen</small> : <small> · via netwerk</small>}
                     </span>
                     {picked && (
                       <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
@@ -757,29 +999,31 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           )}
         </div>
         {rerouteError && <div className="error">{rerouteError}</div>}
-        <div className="stop-list">
-          {plan.stops.map((stop, index) => (
-            <button
-              key={stop.id}
-              type="button"
-              className={`stop ${stop.id === activeId ? "active" : ""}`}
-              onClick={() => {
-                setActiveId(stop.id);
-                setPhase("arrived");
-                guideSpeak(`${stop.arrived} ${stop.why || ""}`.trim());
-              }}
-            >
-              <span className="num">{index + 1}</span>
-              <span>
-                <strong>{stop.name}</strong>
-                <br />
-                <small>
-                  {stop.kind} · {stop.source}
-                </small>
-              </span>
-            </button>
-          ))}
-        </div>
+        {plan.stops.length > 0 && (
+          <div className="poi-suggest-section">
+            <strong>Suggesties</strong>
+            <div className="stop-list">
+              {plan.stops.map((stop, index) => (
+                <button
+                  key={stop.id}
+                  type="button"
+                  className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""}`}
+                  onClick={() => openStopSuggestion(stop)}
+                >
+                  <span className="num">{index + 1}</span>
+                  <span>
+                    <strong>{stop.name}</strong>
+                    <br />
+                    <small>
+                      {interestLabels([stop.interest])[0] || stop.interest} · {stop.kind}
+                      {stop.source ? ` · ${stop.source}` : ""}
+                    </small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {plan.interaction !== "passief" && (
           <form className="ask" onSubmit={submitQuestion}>
             <strong>Live vraag aan de gids</strong>
@@ -838,7 +1082,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           {mode === "demo" && <Marker position={[position.lat, position.lng]} icon={bikeIcon} />}
           <HereMarker position={gps} accuracy={gps?.accuracy} />
           <MapFlyTo position={gps} trigger={locateTick} zoom={16} />
-          <FitRoute geometry={plan.geometry} nodes={allNodes} />
+          <MapFlyTo
+            position={focusTarget}
+            trigger={focusTarget?.key || 0}
+            zoom={15}
+          />
+          <FitRoute geometry={plan.geometry} nodes={plan.knooppunten} />
           <Follow position={mode === "demo" ? position : gps || position} enabled={mode === "demo" || followGps} />
           </MapZoomScale>
         </MapContainer>
@@ -898,8 +1147,99 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           </button>
         )}
       </section>
+
+      {stopPickerOpen &&
+        focusedStop &&
+        createPortal(
+          <div className="mode-picker-backdrop" onClick={closeStopPicker}>
+            <div
+              className="mode-picker poi-picker"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="ride-stop-picker-title"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="ride-stop-picker-title" className="mode-picker-title">
+                {focusedStop.name}
+              </h2>
+              <p className="stop-picker-blurb">
+                {getStopPickerBlurb(focusedStop, stopBlurbs, stopBlurbBusy)}
+              </p>
+              <p className="sources" style={{ margin: "10px 0 0" }}>
+                {routePoiIds.includes(focusedStop.id)
+                  ? "Deze plek zit al in je aangepaste route."
+                  : "Wil je deze suggestie meenemen in je route? De fietsroute wordt dan automatisch aangepast."}
+              </p>
+              <div className="poi-picker-actions">
+                {routePoiIds.includes(focusedStop.id) ? (
+                  <button type="button" className="ghost mode-picker-cancel" onClick={closeStopPicker}>
+                    Sluiten
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="submit"
+                      onClick={includeFocusedStopInRoute}
+                      disabled={rerouteBusy}
+                    >
+                      {rerouteBusy ? "Route wordt aangepast..." : "Ja, opnemen in de route"}
+                    </button>
+                    <button type="button" className="ghost mode-picker-cancel" onClick={closeStopPicker}>
+                      Nee, overslaan
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
+}
+
+function stopInlineDescription(stop) {
+  const raw =
+    stop?.summary?.trim() ||
+    stop?.description?.trim() ||
+    stop?.local_fact?.trim() ||
+    "";
+  if (!raw) return "";
+  const parts = raw.match(/[^.!?]+[.!?]+/g) || [raw];
+  const clipped = parts.slice(0, 2).join(" ").trim();
+  return clipped.length > 280 ? `${clipped.slice(0, 277).trim()}…` : clipped;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isGenericStopBlurb(text, stop) {
+  if (!text?.trim()) return true;
+  const name = escapeRegExp((stop?.name || "").trim());
+  const kind = escapeRegExp((stop?.kind || "plek").trim());
+  const patterns = [
+    name ? new RegExp(`^${name} is een ${kind} langs je (fiets)?route\\.?$`, "i") : null,
+    /past bij je interesse in/i,
+    /langs je fietsroute/i,
+    /langs je route/i,
+    /bekend via OpenStreetMap/i,
+    /Je nadert .+, een plek met een verhaal/i,
+    /is een plek met een verhaal in Belgi/i,
+  ].filter(Boolean);
+  return patterns.some((pattern) => pattern.test(text.trim()));
+}
+
+function getStopPickerBlurb(stop, stopBlurbs, stopBlurbBusy) {
+  const lookedUp = stopBlurbs[stop?.id];
+  if (lookedUp) return lookedUp;
+  const inline = stopInlineDescription(stop);
+  if (inline && !isGenericStopBlurb(inline, stop)) return inline;
+  if (stopBlurbBusy) return "Beschrijving wordt opgehaald…";
+  if (inline) return inline;
+  const kind = (stop?.kind || "plek").toLowerCase();
+  return `${stop.name} is een ${kind} langs je route.`;
 }
 
 function RideKnoopMarkers({ nodes, nodeVariant, onToggle, customIds }) {
@@ -927,10 +1267,19 @@ function RideKnoopMarkers({ nodes, nodeVariant, onToggle, customIds }) {
 function FitRoute({ geometry, nodes }) {
   const map = useMap();
   useEffect(() => {
-    const points = [...(geometry || [])];
-    for (const node of nodes || []) points.push([node.lat, node.lng]);
-    if (!points.length) return;
-    map.fitBounds(points, { padding: [36, 36] });
+    const points = [];
+    for (const point of geometry || []) {
+      if (Array.isArray(point) && point.length >= 2) points.push([point[0], point[1]]);
+    }
+    if (points.length < 2) {
+      for (const node of nodes || []) {
+        if (Number.isFinite(node?.lat) && Number.isFinite(node?.lng)) {
+          points.push([node.lat, node.lng]);
+        }
+      }
+    }
+    if (points.length < 2) return;
+    map.fitBounds(points, { padding: [48, 48], maxZoom: 14 });
   }, [geometry, nodes, map]);
   return null;
 }

@@ -199,6 +199,55 @@ async def answer_about_stop(
     return (answer or fallback or f"Ik heb geen extra info over {name or 'deze plek'}.").strip()
 
 
+async def describe_surroundings(
+    place_ctx: dict[str, Any],
+    pois: list[dict[str, Any]],
+    landscape: list[str],
+    interests: list[str],
+    explanation_level: str = "normaal",
+    heading: float | None = None,
+) -> str | None:
+    if not has_ai():
+        return None
+    length = {
+        "kort": "Eén zin over de omgeving.",
+        "normaal": "Twee tot drie zinnen over landschap en wat opvalt in de buurt.",
+        "uitgebreid": "Drie tot vijf zinnen met landschap, streek en opvallende plekken.",
+    }.get(explanation_level, "Twee tot drie zinnen.")
+    direction = ""
+    if heading is not None:
+        dirs = ["noord", "noordoost", "oost", "zuidoost", "zuid", "zuidwest", "west", "noordwest"]
+        direction = dirs[int((heading + 22.5) % 360 // 45)]
+    parsed = await _generate_json(
+        "Je bent een fietsgids in Vlaanderen die live meefietst. "
+        f"Beschrijf proactief de omgeving binnen 350 meter. {length} Nederlands. "
+        "Focus op landschap, streek en plekken die passen bij de interesses van de fietser. "
+        "Gebruik alleen de gegeven context. Verzin geen feiten of plekken. "
+        "JSON: {summary: string}.",
+        json.dumps(
+            {
+                "dorp": place_ctx.get("place_name") or "",
+                "gemeente": place_ctx.get("municipality") or "",
+                "streekfeit": (place_ctx.get("local_fact") or "")[:400],
+                "landschap": landscape,
+                "interesses": interests,
+                "rijrichting": direction,
+                "plekken_in_buurt": [
+                    {
+                        "name": p.get("name"),
+                        "kind": p.get("kind_label") or p.get("kind"),
+                        "interest": p.get("interest"),
+                    }
+                    for p in pois
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    summary = (parsed or {}).get("summary") if isinstance(parsed, dict) else None
+    return summary.strip() if summary else None
+
+
 async def _generate_json(system: str, user: str) -> dict[str, Any] | None:
     if settings.gemini_api_key:
         result = await _gemini_json(system, user)

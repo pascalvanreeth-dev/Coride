@@ -29,6 +29,17 @@ def _clean_waypoints(waypoints: list[tuple[float, float]]) -> list[tuple[float, 
     return cleaned
 
 
+def _merge_geometries(parts: list[list[list[float]]]) -> list[list[float]]:
+    geometry: list[list[float]] = []
+    for part in parts:
+        if not part:
+            continue
+        if geometry and haversine_m(geometry[-1][0], geometry[-1][1], part[0][0], part[0][1]) < 12:
+            part = part[1:]
+        geometry.extend(part)
+    return geometry
+
+
 async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> dict[str, Any]:
     if len(points) < 2:
         raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
@@ -46,6 +57,7 @@ async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> 
                         "steps": "true",
                         "annotations": "false",
                         "alternatives": "false",
+                        "continue_straight": "false",
                     },
                 )
                 response.raise_for_status()
@@ -69,10 +81,64 @@ async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> 
 
 
 async def bike_route_via_waypoints(waypoints: list[tuple[float, float]]) -> dict[str, Any]:
+    """Route that visits every waypoint in order (no shortcuts past knooppunten)."""
     cleaned = _clean_waypoints(waypoints)
     if len(cleaned) < 2:
         raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
-    return await bike_route(cleaned, retries=1)
+    if len(cleaned) <= 8:
+        try:
+            return await bike_route(cleaned, retries=1)
+        except Exception:
+            if len(cleaned) == 2:
+                raise
+
+    # Chunked stitching: every knooppunt remains a via-point; OSRM cannot skip chunks' endpoints.
+    geometries: list[list[list[float]]] = []
+    distance_m = 0.0
+    duration_s = 0.0
+    steps: list[Step] = []
+    chunk_size = 6
+    index = 0
+    while index < len(cleaned) - 1:
+        chunk = cleaned[index : index + chunk_size]
+        if len(chunk) < 2:
+            break
+        try:
+            segment = await bike_route(chunk, retries=1)
+        except Exception:
+            segment = None
+            for pair_i in range(len(chunk) - 1):
+                pair = [chunk[pair_i], chunk[pair_i + 1]]
+                try:
+                    piece = await bike_route(pair, retries=0)
+                except Exception:
+                    piece = {
+                        "geometry": [[pair[0][0], pair[0][1]], [pair[1][0], pair[1][1]]],
+                        "distance_m": haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]),
+                        "duration_s": 60.0,
+                        "steps": [],
+                    }
+                geometries.append(piece["geometry"])
+                distance_m += float(piece["distance_m"])
+                duration_s += float(piece["duration_s"])
+                steps.extend(piece.get("steps") or [])
+            index += max(1, len(chunk) - 1)
+            continue
+        geometries.append(segment["geometry"])
+        distance_m += float(segment["distance_m"])
+        duration_s += float(segment["duration_s"])
+        steps.extend(segment.get("steps") or [])
+        index += max(1, len(chunk) - 1)
+
+    geometry = _merge_geometries(geometries)
+    if len(geometry) < 2:
+        raise RuntimeError("Geen fietsroute gevonden tussen deze knooppunten.")
+    return {
+        "geometry": geometry,
+        "distance_m": distance_m,
+        "duration_s": max(60.0, duration_s),
+        "steps": steps,
+    }
 
 
 def _parse_steps(legs: list[dict[str, Any]]) -> list[Step]:
