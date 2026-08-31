@@ -6,6 +6,7 @@ import { askAbout, fetchStopSummary, fetchSurroundings, reroute } from "../api.j
 import {
   bearingDeg,
   compassLabel,
+  displayLoopNodes,
   estimateRouteKm,
   formatDistance,
   formatDuration,
@@ -16,6 +17,7 @@ import {
   ID_JOIN,
   knoopMatches,
   knoopOnRoute,
+  knoopOnGeometry,
   listenOnce,
   mergeMapKnooppunten,
   nodeId,
@@ -24,7 +26,7 @@ import {
   stopSpeaking,
   uniqueChainIds,
 } from "../geo.js";
-import { nodeIcon } from "../icons.js";
+import { nodeIcon, wishPoiIcon } from "../icons.js";
 import { useDebounced } from "../hooks.js";
 import { interestLabels } from "../profile.js";
 import HereMarker from "./HereMarker.jsx";
@@ -65,6 +67,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [stopPickerOpen, setStopPickerOpen] = useState(false);
   const [stopBlurbs, setStopBlurbs] = useState({});
   const [stopBlurbBusy, setStopBlurbBusy] = useState(false);
+  const [stopBlurbOpen, setStopBlurbOpen] = useState(false);
+  const [localityFactOpen, setLocalityFactOpen] = useState(false);
+  const [guideExpanded, setGuideExpanded] = useState(false);
   const [routePoiIds, setRoutePoiIds] = useState([]);
   const stopPickerTimerRef = useRef(null);
   const fetchedBlurbIds = useRef(new Set());
@@ -110,6 +115,26 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   planRef.current = plan;
 
   const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
+  const suggestionStops = useMemo(() => {
+    const wishOff = [];
+    const rest = [];
+    for (const stop of plan.stops || []) {
+      if (stop.matches_wish) {
+        if (!stop.on_route) wishOff.push(stop);
+      } else {
+        rest.push(stop);
+      }
+    }
+    return [...wishOff, ...rest];
+  }, [plan.stops]);
+  const wishStopsOnRoute = useMemo(
+    () => (plan.stops || []).filter((stop) => stop.matches_wish && stop.on_route),
+    [plan.stops],
+  );
+  const mapStops = useMemo(
+    () => (plan.stops || []).filter((stop) => !stop.matches_wish || !stop.on_route),
+    [plan.stops],
+  );
   const allNodes = plan.all_knooppunten?.length ? plan.all_knooppunten : plan.knooppunten || [];
   const nodeLookup = useMemo(() => {
     const map = new Map();
@@ -124,11 +149,21 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     () => customIds.map((id) => nodeLookup.get(id)).filter(Boolean),
     [customIds, nodeLookup],
   );
-  const routeNodes = useMemo(
-    () => (dirty && draft?.knooppunten?.length ? draft.knooppunten : plan.knooppunten || selectedNodes),
-    [dirty, draft, plan.knooppunten, selectedNodes],
+  const routeNodes = useMemo(() => {
+    const base =
+      dirty && draft?.knooppunten?.length ? draft.knooppunten : plan.knooppunten || selectedNodes;
+    return displayLoopNodes(base, plan.mode !== "punt");
+  }, [dirty, draft, plan.knooppunten, plan.mode, selectedNodes]);
+  const mapNodes = useMemo(
+    () =>
+      mergeMapKnooppunten(
+        allNodes,
+        routeNodes,
+        [],
+        dirty && draft?.geometry?.length ? draft.geometry : plan.geometry,
+      ),
+    [allNodes, routeNodes, dirty, draft?.geometry, plan.geometry],
   );
-  const mapNodes = useMemo(() => mergeMapKnooppunten(allNodes, routeNodes), [allNodes, routeNodes]);
   const liveKm = dirty
     ? draft?.distance_km ?? estimateRouteKm(plan.start, selectedNodes, plan.mode !== "punt")
     : plan.distance_km;
@@ -137,7 +172,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const stepDistance = currentStep
     ? haversine(position, { lat: currentStep.lat, lng: currentStep.lng })
     : 0;
-  const chat = chats[active?.id || "live"] || [];
+  const chat = chats.live || [];
   const nextKnoop = useMemo(() => {
     const chain = plan.knooppunten || [];
     if (!chain.length) return null;
@@ -187,6 +222,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     if (phase === "why") return active.why;
     return [active.arrived, active.why].filter(Boolean).join(" ");
   }, [active, phase, plan.intro]);
+  const guidePreview = useMemo(() => previewAndRest(guideText), [guideText]);
 
   function guideSpeak(text) {
     if (guideOpenRef.current) speak(text);
@@ -206,6 +242,18 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   useEffect(() => {
     guideSpeak(plan.intro);
   }, [plan.intro]);
+
+  useEffect(() => {
+    setGuideExpanded(false);
+  }, [activeId, phase, guideText]);
+
+  useEffect(() => {
+    setStopBlurbOpen(false);
+  }, [focusedStop?.id]);
+
+  useEffect(() => {
+    setLocalityFactOpen(false);
+  }, [currentLocality?.name, currentLocality?.fact]);
 
   useEffect(() => {
     let cancelled = false;
@@ -230,6 +278,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     setSurroundingsError("");
     setPosition({ lat: plan.start.lat, lng: plan.start.lng });
     setDraft(null);
+    setChats({});
     setGuideOpen(true);
     guideOpenRef.current = true;
   }, [plan.knoop_chain]);
@@ -314,12 +363,15 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   useEffect(() => {
     if (!focusedStop?.id) return undefined;
-    if (fetchedBlurbIds.current.has(focusedStop.id)) return undefined;
-    const inline = stopInlineDescription(focusedStop);
-    if (inline && !isGenericStopBlurb(inline, focusedStop)) {
-      fetchedBlurbIds.current.add(focusedStop.id);
-      return undefined;
+    const existingFull = stopFullDescription(focusedStop);
+    if (existingFull && !isGenericStopBlurb(existingFull, focusedStop)) {
+      setStopBlurbs((current) =>
+        current[focusedStop.id]
+          ? current
+          : { ...current, [focusedStop.id]: { text: existingFull, url: focusedStop.wikipedia_url || "" } },
+      );
     }
+    if (fetchedBlurbIds.current.has(focusedStop.id)) return undefined;
     fetchedBlurbIds.current.add(focusedStop.id);
 
     let cancelled = false;
@@ -335,8 +387,20 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       kind: focusedStop.kind,
     })
       .then((data) => {
-        if (cancelled || !data?.summary?.trim()) return;
-        setStopBlurbs((current) => ({ ...current, [focusedStop.id]: data.summary.trim() }));
+        const text = (data?.summary || "").trim();
+        if (cancelled || !text) return;
+        setStopBlurbs((current) => {
+          const prev = current[focusedStop.id];
+          const prevText = typeof prev === "string" ? prev : prev?.text || "";
+          const nextText = text.length >= prevText.length ? text : prevText;
+          return {
+            ...current,
+            [focusedStop.id]: {
+              text: nextText,
+              url: data.url || (typeof prev === "object" ? prev?.url : "") || focusedStop.wikipedia_url || "",
+            },
+          };
+        });
       })
       .catch(() => {})
       .finally(() => {
@@ -733,49 +797,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     }
   }
 
-  async function submitQuestion(event) {
-    event.preventDefault();
-    if (plan.interaction === "passief") return;
-    if (question.trim().length < 2) return;
+  async function runAsk(asked) {
+    const text = asked.trim();
+    if (text.length < 2) return;
     setAskBusy(true);
     setAskError("");
     try {
-      const data = await askAbout({
-        question: question.trim(),
-        name: active?.name || "",
-        kind: active?.kind || "",
-        summary: active?.summary || "",
-        arrived: active?.arrived || "",
-        explanation_level: plan.explanation_level || "normaal",
-        lat: position.lat,
-        lng: position.lng,
-        heading,
-        place_name: currentLocality?.name || active?.place_name || "",
-        interests: plan.interests || [],
-      });
-      const key = active?.id || "live";
-      setChats((current) => ({
-        ...current,
-        [key]: [...(current[key] || []), { q: question.trim(), a: data.answer }],
-      }));
-      setQuestion("");
-      speak(data.answer);
-    } catch (err) {
-      setAskError(err.message);
-    } finally {
-      setAskBusy(false);
-    }
-  }
-
-  async function askByVoice() {
-    if (plan.interaction === "passief") return;
-    setAskError("");
-    setListening(true);
-    try {
-      const text = await listenOnce("nl-BE");
-      setQuestion(text);
-      setListening(false);
-      setAskBusy(true);
       const data = await askAbout({
         question: text,
         name: active?.name || "",
@@ -788,29 +815,51 @@ export default function Ride({ plan, onPlanChange, onBack }) {
         heading,
         place_name: currentLocality?.name || active?.place_name || "",
         interests: plan.interests || [],
+        history: chat.slice(-6),
       });
-      const key = active?.id || "live";
       setChats((current) => ({
         ...current,
-        [key]: [...(current[key] || []), { q: text, a: data.answer }],
+        live: [...(current.live || []), { q: text, a: data.answer }],
       }));
       setQuestion("");
       speak(data.answer);
     } catch (err) {
       setAskError(err.message);
     } finally {
-      setListening(false);
       setAskBusy(false);
+    }
+  }
+
+  async function submitQuestion(event) {
+    event.preventDefault();
+    if (plan.interaction === "passief") return;
+    await runAsk(question);
+  }
+
+  async function askByVoice() {
+    if (plan.interaction === "passief") return;
+    setAskError("");
+    setListening(true);
+    try {
+      const text = await listenOnce("nl-BE");
+      setQuestion(text);
+      setListening(false);
+      await runAsk(text);
+    } catch (err) {
+      setAskError(err.message);
+      setListening(false);
     }
   }
 
   function nodeVariant(node) {
     const id = nodeId(node);
+    const geometry = dirty && draft?.geometry?.length ? draft.geometry : plan.geometry;
     if (
       customIds.includes(id) ||
       selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
       node.on_route ||
-      knoopOnRoute(node, routeNodes)
+      knoopOnRoute(node, routeNodes) ||
+      knoopOnGeometry(node, geometry)
     ) {
       return "picked";
     }
@@ -864,11 +913,21 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               {nextKnoop.number} · {formatDistance(nextKnoop.distance)} · {compassLabel(nextKnoop.course)}
             </strong>
             {currentLocality && (
-              <p>
-                Je bent in {currentLocality.name}
-                {currentLocality.population ? ` (${currentLocality.population} inwoners)` : ""}.
-                {currentLocality.fact ? ` ${currentLocality.fact}` : ""}
-              </p>
+              <>
+                <p>
+                  Je bent in {currentLocality.name}
+                  {currentLocality.population ? ` (${currentLocality.population} inwoners)` : ""}.
+                </p>
+                {currentLocality.fact ? (
+                  <ExpandableText
+                    text={currentLocality.fact}
+                    expanded={localityFactOpen}
+                    onToggle={() => setLocalityFactOpen((open) => !open)}
+                    className="locality-fact"
+                    sentenceCount={2}
+                  />
+                ) : null}
+              </>
             )}
           </div>
         )}
@@ -976,6 +1035,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                     <span>
                       <strong>Knooppunt {node.number}</strong>
                       {picked ? <small> gekozen</small> : <small> · via netwerk</small>}
+                      {plan.mode !== "punt" &&
+                        index > 0 &&
+                        index === routeNodes.length - 1 &&
+                        knoopMatches(node, routeNodes[0], 80) && (
+                          <small> · start</small>
+                        )}
                     </span>
                     {picked && (
                       <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
@@ -999,15 +1064,20 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           )}
         </div>
         {rerouteError && <div className="error">{rerouteError}</div>}
-        {plan.stops.length > 0 && (
+        {suggestionStops.length > 0 && (
           <div className="poi-suggest-section">
             <strong>Suggesties</strong>
+            {plan.notes?.trim() ? (
+              <p className="sources" style={{ margin: "6px 0 10px" }}>
+                Op basis van je wens: {plan.notes.trim()}
+              </p>
+            ) : null}
             <div className="stop-list">
-              {plan.stops.map((stop, index) => (
+              {suggestionStops.map((stop, index) => (
                 <button
                   key={stop.id}
                   type="button"
-                  className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""}`}
+                  className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""} ${stop.matches_wish ? "wish" : ""} ${stop.matches_wish && !stop.on_route ? "wish-off-route" : ""}`}
                   onClick={() => openStopSuggestion(stop)}
                 >
                   <span className="num">{index + 1}</span>
@@ -1015,6 +1085,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                     <strong>{stop.name}</strong>
                     <br />
                     <small>
+                      {stop.matches_wish ? "Suggestie voor je wens · " : ""}
                       {interestLabels([stop.interest])[0] || stop.interest} · {stop.kind}
                       {stop.source ? ` · ${stop.source}` : ""}
                     </small>
@@ -1023,6 +1094,11 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               ))}
             </div>
           </div>
+        )}
+        {plan.notes?.trim() && wishStopsOnRoute.length > 0 && suggestionStops.length === 0 && (
+          <p className="sources" style={{ margin: "0 0 12px" }}>
+            Je wens ligt op de route — zie het pictogram op de kaart.
+          </p>
         )}
         {plan.interaction !== "passief" && (
           <form className="ask" onSubmit={submitQuestion}>
@@ -1066,8 +1142,13 @@ export default function Ride({ plan, onPlanChange, onBack }) {
             <RouteLine positions={draft.geometry} color="#4f8f43" dashed />
           )}
           <RideKnoopMarkers nodes={mapNodes} nodeVariant={nodeVariant} onToggle={toggleNode} customIds={customIds} />
-          {plan.stops.map((stop, index) => (
-            <Marker key={stop.id} position={[stop.lat, stop.lng]} icon={stopIcon(index + 1)}>
+          {mapStops.map((stop, index) => (
+            <Marker
+              key={stop.id}
+              position={[stop.lat, stop.lng]}
+              icon={stopIcon(index + 1)}
+              zIndexOffset={1000}
+            >
               <Popup>
                 <strong>{stop.name}</strong>
                 <p>{stop.arrived}</p>
@@ -1076,6 +1157,22 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                     Wikipedia
                   </a>
                 )}
+              </Popup>
+            </Marker>
+          ))}
+          {wishStopsOnRoute.map((stop) => (
+            <Marker
+              key={`wish-${stop.id}`}
+              position={[stop.lat, stop.lng]}
+              icon={wishPoiIcon({ interest: stop.interest, kind: stop.kind })}
+              zIndexOffset={1500}
+            >
+              <Popup>
+                <strong>{stop.name}</strong>
+                <p style={{ margin: "6px 0 0" }}>
+                  Past bij je wens · op je route
+                  {stop.kind ? ` · ${stop.kind}` : ""}
+                </p>
               </Popup>
             </Marker>
           ))}
@@ -1139,7 +1236,13 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                 ×
               </button>
             </div>
-            <p>{guideText}</p>
+            <ExpandableText
+              text={guideText}
+              preview={guidePreview}
+              expanded={guideExpanded}
+              onToggle={() => setGuideExpanded((open) => !open)}
+              className="guide-blurb"
+            />
           </div>
         ) : (
           <button type="button" className="guide-reopen" onClick={openGuide}>
@@ -1162,9 +1265,17 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               <h2 id="ride-stop-picker-title" className="mode-picker-title">
                 {focusedStop.name}
               </h2>
-              <p className="stop-picker-blurb">
-                {getStopPickerBlurb(focusedStop, stopBlurbs, stopBlurbBusy)}
-              </p>
+              <ExpandableText
+                text={getStopPickerBlurb(focusedStop, stopBlurbs, stopBlurbBusy)}
+                expanded={stopBlurbOpen}
+                onToggle={() => setStopBlurbOpen((open) => !open)}
+                className="stop-picker-blurb"
+              />
+              {focusedStop.matches_wish && plan.notes?.trim() ? (
+                <p className="sources" style={{ margin: "10px 0 0" }}>
+                  Past bij je wens: {plan.notes.trim()}
+                </p>
+              ) : null}
               <p className="sources" style={{ margin: "10px 0 0" }}>
                 {routePoiIds.includes(focusedStop.id)
                   ? "Deze plek zit al in je aangepaste route."
@@ -1199,16 +1310,82 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   );
 }
 
-function stopInlineDescription(stop) {
-  const raw =
+function stopFullDescription(stop) {
+  return (
     stop?.summary?.trim() ||
     stop?.description?.trim() ||
+    stop?.arrived?.trim() ||
     stop?.local_fact?.trim() ||
-    "";
-  if (!raw) return "";
-  const parts = raw.match(/[^.!?]+[.!?]+/g) || [raw];
-  const clipped = parts.slice(0, 2).join(" ").trim();
-  return clipped.length > 280 ? `${clipped.slice(0, 277).trim()}…` : clipped;
+    ""
+  );
+}
+
+function truncateAtWord(text, maxChars) {
+  const raw = (text || "").trim();
+  if (raw.length <= maxChars) return raw;
+  const cut = raw.slice(0, maxChars);
+  const at = cut.lastIndexOf(" ");
+  return `${(at > 40 ? cut.slice(0, at) : cut).trim()}…`;
+}
+
+function previewSentences(text, count = 2, maxChars = 240) {
+  const raw = (text || "").trim();
+  if (!raw) return { preview: "", rest: "" };
+  if (raw.length <= maxChars) {
+    const sentences = raw.match(/[^.!?]+[.!?]+/g) || [];
+    if (sentences.length > count) {
+      const preview = sentences.slice(0, count).join(" ").trim();
+      return { preview, rest: raw.slice(preview.length).trim() };
+    }
+    return { preview: raw, rest: "" };
+  }
+
+  const sentences = raw.match(/[^.!?]+[.!?]+/g) || [];
+  let preview = sentences.length ? sentences.slice(0, count).join(" ").trim() : raw;
+  if (preview.length > maxChars || preview.length >= raw.length) {
+    preview = truncateAtWord(raw, maxChars);
+  } else if (sentences.length <= 1) {
+    preview = truncateAtWord(raw, maxChars);
+  }
+
+  const plainLen = preview.replace(/…$/, "").trim().length;
+  if (plainLen >= raw.length) return { preview: raw, rest: "" };
+  return { preview, rest: raw };
+}
+
+function previewAndRest(text, limit = 160) {
+  const raw = (text || "").trim();
+  if (!raw) return { preview: "", rest: "" };
+  if (raw.length <= limit) return { preview: raw, rest: "" };
+  const sentences = raw.match(/[^.!?]+[.!?]+/g);
+  const first = sentences?.[0]?.trim() || raw;
+  if (first.length <= limit + 50 && first.length < raw.length) {
+    return { preview: first, rest: raw.slice(first.length).trim() };
+  }
+  const cut = raw.slice(0, limit);
+  const at = cut.lastIndexOf(" ");
+  const preview = `${(at > 80 ? cut.slice(0, at) : cut).trim()}…`;
+  return { preview, rest: raw };
+}
+
+function ExpandableText({ text, preview, expanded, onToggle, className, sentenceCount }) {
+  const raw = (text || "").trim();
+  const parts =
+    preview ||
+    (sentenceCount ? previewSentences(raw, sentenceCount) : previewAndRest(raw));
+  const shown = expanded ? raw : parts.preview;
+  const previewLen = (parts.preview || "").replace(/…$/, "").trim().length;
+  const canExpand = raw.length > previewLen;
+  return (
+    <div className={className}>
+      <p className={expanded ? "blurb-expanded" : undefined}>{shown || raw}</p>
+      {canExpand && (
+        <button type="button" className="ghost-link lees-meer" onClick={onToggle}>
+          {expanded ? "Toon minder" : "Lees meer"}
+        </button>
+      )}
+    </div>
+  );
 }
 
 function escapeRegExp(value) {
@@ -1232,12 +1409,13 @@ function isGenericStopBlurb(text, stop) {
 }
 
 function getStopPickerBlurb(stop, stopBlurbs, stopBlurbBusy) {
-  const lookedUp = stopBlurbs[stop?.id];
+  const stored = stopBlurbs[stop?.id];
+  const lookedUp = typeof stored === "string" ? stored : stored?.text;
   if (lookedUp) return lookedUp;
-  const inline = stopInlineDescription(stop);
-  if (inline && !isGenericStopBlurb(inline, stop)) return inline;
+  const full = stopFullDescription(stop);
+  if (full && !isGenericStopBlurb(full, stop)) return full;
   if (stopBlurbBusy) return "Beschrijving wordt opgehaald…";
-  if (inline) return inline;
+  if (full) return full;
   const kind = (stop?.kind || "plek").toLowerCase();
   return `${stop.name} is een ${kind} langs je route.`;
 }

@@ -66,6 +66,52 @@ export const startIcon = L.divIcon({
   iconAnchor: [28, 28],
 });
 
+export function wishPoiGlyph(interest, kind) {
+  const i = String(interest || "").toLowerCase();
+  const k = String(kind || "").toLowerCase();
+  if (i === "horeca" || /cafe|café|restaurant|pub|bar|eten|lunch|bakker|brouwer/.test(k)) {
+    return "🍴";
+  }
+  if (i === "geschiedenis" || /museum|kasteel|monument|kerk/.test(k)) {
+    return "🏛";
+  }
+  if (i === "natuur" || /park|bos|natuur|uitzicht/.test(k)) {
+    return "🌿";
+  }
+  if (i === "landbouw" || /hoeve|wijn|boerderij/.test(k)) {
+    return "🌾";
+  }
+  if (i === "oorlog" || /memorial|fort|bunker/.test(k)) {
+    return "⚑";
+  }
+  return "★";
+}
+
+export function wishPoiIcon({ interest, kind, focused = false } = {}) {
+  const size = focused ? 34 : 28;
+  const ring = focused ? "0 0 0 4px rgba(199, 0, 104, 0.35)" : "0 0 0 3px rgba(199, 0, 104, 0.28)";
+  const glyph = wishPoiGlyph(interest, kind);
+  const fontSize = glyph.length > 1 ? Math.round(size * 0.52) : Math.round(size * 0.55);
+  return L.divIcon({
+    className: "wish-poi-marker",
+    html: `<div class="wish-poi-marker-inner" style="
+      width:${size}px;
+      height:${size}px;
+      border-radius:50%;
+      background:#c70068;
+      color:#fff;
+      border:3px solid #fff;
+      box-shadow:${ring}, 0 4px 12px rgba(40,32,28,0.28);
+      display:grid;
+      place-items:center;
+      font:${fontSize}px/1 'IBM Plex Sans', sans-serif;
+      line-height:1;
+    ">${glyph}</div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
 export function poiIcon({ selected = false, focused = false } = {}) {
   const bg = focused ? "#2563eb" : selected ? "#4f8f43" : "#c70068";
   const size = focused ? 28 : selected ? 18 : 16;

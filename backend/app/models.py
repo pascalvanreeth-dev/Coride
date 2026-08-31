@@ -59,6 +59,7 @@ class PoiHit(BaseModel):
     kind: str
     kind_label: str | None = None
     interest: Interest
+    on_route: bool = False
 
 
 class PlanRequest(BaseModel):
@@ -108,6 +109,8 @@ class Stop(BaseModel):
     population: int | None = None
     local_fact: str | None = None
     side: str | None = None
+    matches_wish: bool = False
+    on_route: bool = False
 
 
 class Knooppunt(BaseModel):
@@ -156,6 +159,7 @@ class RoutePlan(BaseModel):
     intro: str
     mode: RouteMode
     interests: list[Interest]
+    notes: str = ""
     start: Place
     end: Place
     distance_km: float
@@ -177,6 +181,11 @@ class RoutePlan(BaseModel):
     ai_used: bool
 
 
+class AskTurn(BaseModel):
+    q: str = Field(min_length=1, max_length=400)
+    a: str = Field(default="", max_length=2000)
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=400)
     name: str = ""
@@ -189,6 +198,7 @@ class AskRequest(BaseModel):
     heading: float | None = None
     place_name: str | None = None
     interests: list[Interest] = Field(default_factory=list)
+    history: list[AskTurn] = Field(default_factory=list, max_length=8)
 
 
 class AskResponse(BaseModel):
@@ -264,6 +274,7 @@ class RoutePreviewResponse(BaseModel):
     duration_min: int
     knooppunten: list[Knooppunt] = Field(default_factory=list)
     knoop_chain: str = ""
+    suggestions: list[PoiHit] = Field(default_factory=list)
 
 
 class GeocodeHit(BaseModel):

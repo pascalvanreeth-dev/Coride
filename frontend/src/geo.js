@@ -10,12 +10,16 @@ export function haversine(a, b) {
 }
 
 export function stopSpeaking() {
+  if (typeof window !== "undefined") window.clearTimeout(speakTimer);
   window.speechSynthesis?.cancel();
 }
+
+let speakTimer = 0;
 
 export function speak(text) {
   if (!window.speechSynthesis || !text) return;
   stopSpeaking();
+  window.clearTimeout(speakTimer);
   const utterance = new SpeechSynthesisUtterance(text);
   const voices = window.speechSynthesis.getVoices();
   const dutch =
@@ -24,7 +28,9 @@ export function speak(text) {
   if (dutch) utterance.voice = dutch;
   utterance.lang = dutch?.lang || "nl-NL";
   utterance.rate = 0.96;
-  window.speechSynthesis.speak(utterance);
+  speakTimer = window.setTimeout(() => {
+    window.speechSynthesis.speak(utterance);
+  }, 60);
 }
 
 export function interpolate(geometry, distanceM) {
@@ -144,6 +150,15 @@ export function uniqueChainIds(nodes) {
   return ids;
 }
 
+/** Toon lus als A → B → A in overzichten (routing gebruikt spine zonder dubbele start). */
+export function displayLoopNodes(nodes, isLoop) {
+  if (!isLoop || !nodes?.length) return nodes || [];
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (knoopMatches(first, last, 80)) return nodes;
+  return [...nodes, first];
+}
+
 export function dedupeNearbyPoints(points, minM = 700) {
   const kept = [];
   for (const point of points || []) {
@@ -172,7 +187,34 @@ export function knoopOnRoute(node, routeNodes) {
   return (routeNodes || []).some((routeNode) => knoopMatches(node, routeNode));
 }
 
-export function mergeMapKnooppunten(nearby, routeNodes, pinned = []) {
+export function pointToSegmentM(px, py, ax, ay, bx, by) {
+  const latScale = 111_000;
+  const lngScale = 111_000 * Math.cos(((ay + by) / 2) * (Math.PI / 180));
+  const x = (px - ax) * latScale;
+  const y = (py - ay) * lngScale;
+  const dx = (bx - ax) * latScale;
+  const dy = (by - ay) * lngScale;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(x, y);
+  const t = Math.max(0, Math.min(1, (x * dx + y * dy) / len2));
+  return Math.hypot(x - t * dx, y - t * dy);
+}
+
+export function knoopOnGeometry(node, geometry, maxM = 650) {
+  if (!node || !geometry?.length || geometry.length < 2) return false;
+  const lat = Number(node.lat);
+  const lng = Number(node.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  const step = Math.max(1, Math.floor(geometry.length / 48));
+  for (let index = 0; index < geometry.length - 1; index += step) {
+    const a = geometry[index];
+    const b = geometry[index + 1];
+    if (pointToSegmentM(lat, lng, a[0], a[1], b[0], b[1]) <= maxM) return true;
+  }
+  return false;
+}
+
+export function mergeMapKnooppunten(nearby, routeNodes, pinned = [], geometry = null) {
   const byId = new Map();
   for (const node of nearby || []) byId.set(nodeId(node), node);
   for (const node of routeNodes || []) {
@@ -186,7 +228,7 @@ export function mergeMapKnooppunten(nearby, routeNodes, pinned = []) {
   // Zelfde knoop met andere id (OSM/WFS) ook als on_route markeren, zodat die groen blijft.
   for (const [id, node] of [...byId.entries()]) {
     if (node.on_route) continue;
-    if (knoopOnRoute(node, routeNodes)) {
+    if (knoopOnRoute(node, routeNodes) || knoopOnGeometry(node, geometry)) {
       byId.set(id, { ...node, on_route: true });
     }
   }

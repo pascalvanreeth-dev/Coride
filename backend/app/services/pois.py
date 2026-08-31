@@ -187,6 +187,54 @@ def _unique_interests(interests: list[str] | None) -> list[str]:
     return result
 
 
+NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
+    (
+        "horeca",
+        (
+            "cafe", "café", "koffie", "koffi", "coffee", "pub", "bar", "bier",
+            "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs",
+            "bakker", "brouwerij", "taart",
+        ),
+    ),
+    (
+        "architectuur",
+        ("kasteel", "kastelen", "burcht", "castle", "molen", "kerk", "kathedraal", "abdij", "toren"),
+    ),
+    (
+        "natuur",
+        ("park", "bos", "natuur", "water", "rivier", "leie", "schelde", "kanaal", "duin", "polder", "meer", "vijver"),
+    ),
+    ("geschiedenis", ("museum", "geschiedenis", "erfgoed", "historisch", "middeleeuw")),
+    ("oorlog", ("oorlog", "memorial", "gedenkteken", "fort", "slagveld", "bunker")),
+    ("landbouw", ("hoeve", "boerderij", "wijn", "fruit", "hop", "streekproduct", "boer")),
+    ("activiteiten", ("uitzicht", "attractie", "zwem", "speeltuin", "wandel")),
+    ("evenementen", ("markt", "festival", "evenement", "theater", "concert")),
+]
+
+
+def interests_from_notes(notes: str) -> list[str]:
+    text = (notes or "").lower()
+    if not text.strip():
+        return []
+    found: list[str] = []
+    for interest, keys in NOTE_INTEREST_KEYS:
+        if any(key in text for key in keys):
+            found.append(interest)
+    return found
+
+
+def matches_notes(poi: dict[str, Any], notes: str) -> bool:
+    text = (notes or "").strip().lower()
+    if not text:
+        return False
+    blob = f"{poi.get('name', '')} {poi.get('kind', '')} {poi.get('kind_label', '')} {poi.get('interest', '')}".lower()
+    from app.services import knooppunten as knoop_service
+
+    if any(needle in blob for needle in knoop_service._note_needles(notes)):
+        return True
+    return poi.get("interest") in set(interests_from_notes(notes))
+
+
 async def _fetch_pois_for_interest(
     lat: float,
     lng: float,
@@ -414,6 +462,23 @@ def notes_want_horeca(notes: str, interests: list[str] | None = None, prefs: lis
     return any(key in text for key in keys)
 
 
+def _horeca_query(
+    points: list[tuple[float, float]],
+    radius_m: int,
+    filters: list[str],
+    *,
+    require_name: bool = True,
+) -> str:
+    name_filter = '["name"]' if require_name else ""
+    clauses: list[str] = []
+    for plat, plng in points:
+        around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
+        for filt in filters:
+            clauses.append(f"nwr{filt}{name_filter}({around});")
+    limit = 80 if require_name else 120
+    return f"[out:json][timeout:20];({''.join(clauses)});out center {limit};"
+
+
 async def fetch_horeca(
     lat: float,
     lng: float,
@@ -430,14 +495,10 @@ async def fetch_horeca(
         filters.extend(HORECA_PREF_FILTERS.get(pref, []))
     if not filters:
         filters = [HORECA_FILTER]
-    clauses: list[str] = []
-    for plat, plng in points:
-        around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
-        for filt in filters:
-            clauses.append(f'nwr{filt}["name"]({around});')
-    query = f"[out:json][timeout:15];({''.join(clauses)});out center 80;"
     try:
-        data = await _overpass(query)
+        data = await _overpass(_horeca_query(points, radius_m, filters, require_name=True))
+        if not data.get("elements"):
+            data = await _overpass(_horeca_query(points, min(radius_m + 1500, 16000), filters, require_name=False))
     except Exception:
         return []
     seen: set[str] = set()
@@ -526,7 +587,7 @@ async def fetch_poi_at(lat: float, lng: float, *, name: str | None = None, radiu
 
 async def _overpass(query: str) -> dict[str, Any]:
     errors: list[str] = []
-    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()][:2]
+    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()]
     async with client() as http:
         for url in mirrors:
             try:
@@ -534,20 +595,17 @@ async def _overpass(query: str) -> dict[str, Any]:
                     url,
                     content=query.encode("utf-8"),
                     headers={"Content-Type": "text/plain; charset=utf-8"},
-                    timeout=httpx.Timeout(12.0, connect=5.0),
+                    timeout=httpx.Timeout(20.0, connect=6.0),
                 )
                 if response.status_code >= 400:
                     errors.append(f"{url} -> HTTP {response.status_code}")
                     continue
                 payload = response.json()
                 remark = str(payload.get("remark") or "")
-                elements = payload.get("elements") or []
                 if "error" in remark.lower() or "runtime error" in remark.lower():
                     errors.append(f"{url} -> {remark[:120]}")
                     continue
-                if elements:
-                    return payload
-                errors.append(f"{url} -> 0 resultaten")
+                return payload
             except Exception as exc:  # noqa: BLE001 - try next mirror
                 errors.append(f"{url} -> {type(exc).__name__}: {exc or 'geen bericht'}")
     raise RuntimeError("Overpass API reageerde niet: " + "; ".join(errors))

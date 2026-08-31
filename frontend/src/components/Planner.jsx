@@ -3,9 +3,9 @@ import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
 import { fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, reverseGeocode, reroute } from "../api.js";
-import { estimateRouteKm, formatDuration, formatKm, getBrowserLocation, ID_JOIN, knoopMatches, knoopOnRoute, mergeMapKnooppunten, nodeId } from "../geo.js";
+import { estimateRouteKm, formatDuration, formatKm, getBrowserLocation, displayLoopNodes, ID_JOIN, knoopMatches, knoopOnRoute, knoopOnGeometry, mergeMapKnooppunten, nodeId } from "../geo.js";
 import { useDebounced } from "../hooks.js";
-import { nodeIcon, startIcon } from "../icons.js";
+import { nodeIcon, startIcon, wishPoiIcon } from "../icons.js";
 import { profileSummary, suggestedDistance, suggestedMinutes, toApiProfile, mergeInterests, interestLabels } from "../profile.js";
 import { MAP_SOURCES, MAP_TILE } from "../mapTiles.js";
 import { getUsedRouteIds } from "../routeHistory.js";
@@ -96,16 +96,22 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     [nodeLookup, selectedIds],
   );
 
-  const routeNodes = useMemo(
-    () => (draft?.knooppunten?.length ? draft.knooppunten : selectedNodes),
-    [draft, selectedNodes],
-  );
+  const routeNodes = useMemo(() => {
+    const base = draft?.knooppunten?.length ? draft.knooppunten : selectedNodes;
+    return displayLoopNodes(base, mode !== "punt");
+  }, [draft, selectedNodes, mode]);
 
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   const mapNodes = useMemo(
-    () => mergeMapKnooppunten(nodes, routeNodes, selectedNodes),
-    [nodes, routeNodes, selectedNodes],
+    () =>
+      mergeMapKnooppunten(
+        nodes,
+        routeNodes,
+        selectedNodes,
+        draft?.geometry || suggestionPreview?.geometry,
+      ),
+    [nodes, routeNodes, selectedNodes, draft?.geometry, suggestionPreview?.geometry],
   );
 
   const estimateKm = estimateRouteKm(origin, selectedNodes, mode !== "punt");
@@ -297,6 +303,38 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     () => suggestions.find((item) => item.id === selectedSuggestionId) || null,
     [suggestions, selectedSuggestionId],
   );
+
+  const previewKnooppunten = useMemo(
+    () => displayLoopNodes(routePreview?.knooppunten || [], mode !== "punt"),
+    [routePreview?.knooppunten, mode],
+  );
+  const suggestPreviewKnooppunten = useMemo(
+    () =>
+      displayLoopNodes(
+        suggestionPreview?.knooppunten || [],
+        (selectedSuggestion?.mode || mode) !== "punt",
+      ),
+    [suggestionPreview?.knooppunten, selectedSuggestion?.mode, mode],
+  );
+
+  const wishSuggestions = useMemo(() => {
+    if (!notes.trim() || (buildMode !== "auto" && buildMode !== "suggest")) return [];
+    return routePreview?.suggestions || [];
+  }, [buildMode, notes, routePreview?.suggestions]);
+
+  const wishOnRoute = useMemo(
+    () => wishSuggestions.filter((item) => item.on_route),
+    [wishSuggestions],
+  );
+  const wishOffRoute = useMemo(
+    () => wishSuggestions.filter((item) => !item.on_route),
+    [wishSuggestions],
+  );
+  const [focusedWishId, setFocusedWishId] = useState("");
+
+  useEffect(() => {
+    setFocusedWishId("");
+  }, [notes, routePreview?.suggestions]);
 
   const suggestInterests = useMemo(
     () =>
@@ -567,7 +605,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       selectedIdSet.has(id) ||
       selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
       node.on_route ||
-      knoopOnRoute(node, routeNodes)
+      knoopOnRoute(node, routeNodes) ||
+      knoopOnGeometry(node, draft?.geometry || routePreview?.geometry)
     ) {
       return "picked";
     }
@@ -828,14 +867,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               <p className="sources" style={{ margin: "6px 0 8px" }}>
                 {suggestionPreviewBusy
                   ? "Knooppuntenroute wordt berekend..."
-                  : `${suggestionPreview.knooppunten.length} knooppunten in volgorde`}
+                  : `${suggestPreviewKnooppunten.length} knooppunten in volgorde`}
               </p>
               <ol className="picked-list route-knoop-list">
-                {suggestionPreview.knooppunten.map((node, index) => (
+                {suggestPreviewKnooppunten.map((node, index) => (
                   <li key={`${node.id || node.number}-${index}`}>
                     <span className="num">{index + 1}</span>
                     <span>
                       <strong>Knooppunt {node.number}</strong>
+                      {index > 0 &&
+                        index === suggestPreviewKnooppunten.length - 1 &&
+                        knoopMatches(node, suggestPreviewKnooppunten[0], 80) && (
+                          <small> · start</small>
+                        )}
                     </span>
                   </li>
                 ))}
@@ -886,6 +930,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                             <small> · B</small>
                           )}
                         {picked ? <small> gekozen</small> : <small> · via netwerk</small>}
+                        {index > 0 &&
+                          mode !== "punt" &&
+                          index === routeNodes.length - 1 &&
+                          knoopMatches(node, routeNodes[0], 80) && (
+                            <small> · start</small>
+                          )}
                       </span>
                       {picked && (
                         <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
@@ -984,14 +1034,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                   <p className="sources" style={{ margin: "6px 0 8px" }}>
                     {routePreviewBusy
                       ? "Knooppuntenroute wordt berekend..."
-                      : `${routePreview.knooppunten.length} knooppunten · voorbeeld ${routePreview.distance_km} km`}
+                      : `${previewKnooppunten.length} knooppunten · voorbeeld ${routePreview.distance_km} km`}
                   </p>
                   <ol className="picked-list route-knoop-list">
-                    {routePreview.knooppunten.map((node, index) => (
+                    {previewKnooppunten.map((node, index) => (
                       <li key={`${node.id || node.number}-${index}`}>
                         <span className="num">{index + 1}</span>
                         <span>
                           <strong>Knooppunt {node.number}</strong>
+                          {index > 0 &&
+                            index === previewKnooppunten.length - 1 &&
+                            knoopMatches(node, previewKnooppunten[0], 80) && (
+                              <small> · start</small>
+                            )}
                         </span>
                       </li>
                     ))}
@@ -1011,6 +1066,76 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               onChange={(event) => setNotes(event.target.value)}
             />
           </label>
+          )}
+
+          {buildMode === "auto" && notes.trim() && (wishOnRoute.length > 0 || wishOffRoute.length > 0) && (
+            <div className="poi-suggest-section">
+              {wishOnRoute.length > 0 && (
+                <>
+                  <strong>Op je route</strong>
+                  <p className="sources" style={{ margin: "6px 0 8px" }}>
+                    Deze plekken liggen langs je voorgestelde traject.
+                  </p>
+                  <div className="wish-on-route-list">
+                    {wishOnRoute.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={`wish-on-route ${focusedWishId === item.id ? "focus" : ""}`}
+                        onClick={() => {
+                          setFocusedWishId(item.id);
+                          onPreview({ lat: item.lat, lng: item.lng, zoom: 15 });
+                        }}
+                      >
+                        <span className="wish-on-route-dot" aria-hidden="true" />
+                        <span>
+                          <strong>{item.name}</strong>
+                          <small>{item.kind_label || item.kind}</small>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+              {wishOffRoute.length > 0 && (
+                <>
+                  <strong style={{ display: "block", marginTop: wishOnRoute.length ? 14 : 0 }}>
+                    Suggesties voor je wens
+                  </strong>
+                  <p className="sources" style={{ margin: "6px 0 8px" }}>
+                    Niet direct op het traject, maar wel in de buurt.
+                  </p>
+                  <div className="poi-suggest-grid">
+                    {wishOffRoute.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={`poi-suggest-tile ${focusedWishId === item.id ? "focus" : ""}`}
+                        onClick={() => {
+                          setFocusedWishId(item.id);
+                          onPreview({ lat: item.lat, lng: item.lng, zoom: 14 });
+                        }}
+                      >
+                        <span className="poi-suggest-kind">{item.kind_label || item.kind}</span>
+                        <strong>{item.name}</strong>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {buildMode === "auto" && notes.trim() && routePreviewBusy && !wishSuggestions.length && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              Plekken voor je wens worden gezocht...
+            </p>
+          )}
+
+          {buildMode === "auto" && notes.trim() && !routePreviewBusy && !wishSuggestions.length && routePreview?.geometry?.length > 1 && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              Geen passende plekken gevonden voor je wens. Probeer een andere formulering.
+            </p>
           )}
 
           {buildMode === "suggest" && selectedSuggestion && (
@@ -1065,6 +1190,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           )}
           {(buildMode === "suggest" || buildMode === "auto") && routePreview?.geometry?.length > 1 && (
             <RouteLine positions={routePreview.geometry} />
+          )}
+          {(buildMode === "auto" || buildMode === "suggest") && routePreview?.knooppunten?.length > 0 && (
+            <RoutePreviewKnoopMarkers nodes={routePreview.knooppunten} />
+          )}
+          {wishOnRoute.length > 0 && (
+            <WishRouteMarkers items={wishOnRoute} focusedId={focusedWishId} onFocus={setFocusedWishId} />
           )}
           {(buildMode === "manual" || (buildMode === "auto" && startChoice === "map")) && (
             <PlannerKnoopMarkers
@@ -1250,6 +1381,49 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         )}
     </div>
   );
+}
+
+function WishRouteMarkers({ items, focusedId, onFocus }) {
+  return items.map((item) => (
+    <Marker
+      key={item.id}
+      position={[item.lat, item.lng]}
+      icon={wishPoiIcon({
+        interest: item.interest,
+        kind: item.kind_label || item.kind,
+        focused: focusedId === item.id,
+      })}
+      zIndexOffset={1400}
+      eventHandlers={{
+        click: (event) => {
+          if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+          onFocus(item.id);
+        },
+      }}
+    >
+      <Popup>
+        <strong>{item.name}</strong>
+        <p style={{ margin: "6px 0 0" }}>
+          {item.kind_label || item.kind} · op je route
+        </p>
+      </Popup>
+    </Marker>
+  ));
+}
+
+function RoutePreviewKnoopMarkers({ nodes }) {
+  const { scale } = useMapZoom();
+  if (!nodes?.length) return null;
+  return nodes.map((node, index) => (
+    <Marker
+      key={`${nodeId(node)}-${index}`}
+      position={[node.lat, node.lng]}
+      icon={nodeIcon(node.number, "picked", scale)}
+      zIndexOffset={1300}
+    >
+      <Popup>Knooppunt {node.number}</Popup>
+    </Marker>
+  ));
 }
 
 function PlannerKnoopMarkers({ nodes, buildMode, startChoice, selectedIds, origin, nodeVariant, onToggle }) {

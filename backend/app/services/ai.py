@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any
 
 from app.config import settings
@@ -128,6 +129,86 @@ async def polish_scripts(stops: list[dict[str, Any]], explanation_level: str = "
     return stops
 
 
+def _normalize_answer(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+_STOPWORDS = {
+    "aan", "als", "bij", "dan", "dat", "de", "dit", "een", "en", "er", "het", "hier",
+    "hoe", "in", "is", "je", "met", "mijn", "nog", "of", "om", "ook", "op", "over",
+    "te", "tot", "van", "voor", "wat", "wel", "wie", "zijn", "daar", "die", "deze",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[a-zà-ÿ0-9]+", (text or "").lower())
+        if word not in _STOPWORDS and len(word) > 2
+    }
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+
+
+def _grounded_answer(
+    question: str,
+    summary: str,
+    arrived: str,
+    name: str,
+    last_answer: str,
+    nearby: list[dict[str, Any]],
+    explanation_level: str,
+) -> str:
+    wanted = SENTENCE_COUNTS.get(explanation_level, 2)
+    used = _normalize_answer(last_answer)
+    q_tokens = _tokens(question)
+    pool: list[str] = []
+    pool.extend(_split_sentences(summary or ""))
+    pool.extend(_split_sentences(arrived or ""))
+    for poi in nearby:
+        label = poi.get("kind_label") or poi.get("kind") or "plek"
+        poi_name = poi.get("name") or ""
+        desc = poi.get("description") or poi.get("summary") or ""
+        if poi_name:
+            pool.append(f"{poi_name} is een {label} in de buurt.")
+        pool.extend(_split_sentences(desc))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for sentence in pool:
+        key = _normalize_answer(sentence)
+        if len(key) < 12 or key in seen:
+            continue
+        if key.startswith("je staat ") or key.startswith("je nadert "):
+            continue
+        seen.add(key)
+        unique.append(sentence)
+
+    unused = [s for s in unique if _normalize_answer(s) not in used]
+    candidates = unused or unique
+
+    def score(sentence: str) -> int:
+        return len(q_tokens & _tokens(sentence))
+
+    matched_unused = [s for s in unused if score(s) > 0]
+    matched_all = [s for s in unique if score(s) > 0]
+    if q_tokens and matched_unused:
+        picked = sorted(matched_unused, key=score, reverse=True)[:wanted]
+    elif q_tokens and matched_all:
+        picked = sorted(matched_all, key=score, reverse=True)[:wanted]
+    else:
+        picked = candidates[:wanted]
+
+    text = " ".join(picked).strip()
+    if last_answer and _normalize_answer(text) == _normalize_answer(last_answer):
+        return "Ik heb daar geen extra details over in mijn bronnen."
+    if text:
+        return text
+    return f"Over {name or 'deze plek'} heb ik nu geen extra details."
+
+
 async def answer_about_stop(
     name: str,
     kind: str,
@@ -140,16 +221,20 @@ async def answer_about_stop(
     heading: float | None = None,
     place_name: str | None = None,
     interests: list[str] | None = None,
+    history: list[Any] | None = None,
 ) -> str:
     length = {
         "kort": "Antwoord in 1 tot 2 zinnen.",
         "normaal": "Antwoord in 3 tot 5 zinnen.",
         "uitgebreid": "Antwoord in een kort, duidelijk alineaatje van 6 tot 10 zinnen.",
     }.get(explanation_level, "Antwoord in 3 tot 5 zinnen.")
-    fallback = first_sentences(summary or arrived or "", SENTENCE_COUNTS.get(explanation_level, 2))
-    if not has_ai():
-        return fallback or f"Over {name or 'deze plek'} heb ik nu geen extra details."
-
+    turns = []
+    for item in history or []:
+        q = getattr(item, "q", None) or (item.get("q") if isinstance(item, dict) else "")
+        a = getattr(item, "a", None) or (item.get("a") if isinstance(item, dict) else "")
+        if q and a:
+            turns.append({"q": str(q)[:400], "a": str(a)[:800]})
+    last_answer = turns[-1]["a"] if turns else ""
     nearby = []
     if lat is not None and lng is not None:
         try:
@@ -159,44 +244,68 @@ async def answer_about_stop(
             nearby = nearby[:6]
         except Exception:
             nearby = []
+    grounded = _grounded_answer(
+        question, summary, arrived, name, last_answer, nearby, explanation_level
+    )
+    if not has_ai():
+        return grounded
 
     direction = ""
     if heading is not None:
         dirs = ["noord", "noordoost", "oost", "zuidoost", "zuid", "zuidwest", "west", "noordwest"]
         direction = dirs[int((heading + 22.5) % 360 // 45)]
 
-    parsed = await _generate_json(
-        "Je bent een fietsgids in Vlaanderen die live meefietst. "
-        "Beantwoord een gesproken vraag van de fietser. "
-        f"{length} Nederlands. Gebruik alleen de gegeven context en nabije plekken. "
-        "Als de vraag over 'rechts/links/dat gebouw' gaat, kies de meest waarschijnlijke nabije plek. "
-        "Verzin geen feiten; zeg het als je het niet zeker weet. JSON: {answer: string}.",
-        json.dumps(
+    payload = {
+        "huidige_vraag": question,
+        "eerder_gesprek": turns,
+        "actieve_plek": name,
+        "soort": kind,
+        "dorp": place_name or "",
+        "rijrichting": direction,
+        "positie": {"lat": lat, "lng": lng} if lat is not None else None,
+        "samenvatting": (summary or "")[:900],
+        "gids_tekst": (arrived or "")[:500],
+        "interesses": interests or [],
+        "nabije_plekken": [
             {
-                "vraag": question,
-                "actieve_plek": name,
-                "soort": kind,
-                "dorp": place_name or "",
-                "rijrichting": direction,
-                "positie": {"lat": lat, "lng": lng} if lat is not None else None,
-                "samenvatting": (summary or "")[:900],
-                "gids_tekst": (arrived or "")[:500],
-                "interesses": interests or [],
-                "nabije_plekken": [
-                    {
-                        "name": p.get("name"),
-                        "kind": p.get("kind_label") or p.get("kind"),
-                        "lat": p.get("lat"),
-                        "lng": p.get("lng"),
-                    }
-                    for p in nearby
-                ],
-            },
-            ensure_ascii=False,
-        ),
+                "name": p.get("name"),
+                "kind": p.get("kind_label") or p.get("kind"),
+                "lat": p.get("lat"),
+                "lng": p.get("lng"),
+            }
+            for p in nearby
+        ],
+    }
+    system = (
+        "Je bent een fietsgids in Vlaanderen die live meefietst. "
+        "Beantwoord ALLEEN de huidige_vraag. "
+        f"{length} Nederlands. Gebruik de context en nabije plekken. "
+        "Als er een eerder_gesprek is, geef nieuwe informatie; herhaal dat vorige antwoord niet. "
+        "Als de vraag over 'rechts/links/dat gebouw' gaat, kies de meest waarschijnlijke nabije plek. "
+        "Verzin geen feiten; zeg het als je het niet zeker weet. JSON: {answer: string}."
     )
-    answer = (parsed or {}).get("answer") if isinstance(parsed, dict) else None
-    return (answer or fallback or f"Ik heb geen extra info over {name or 'deze plek'}.").strip()
+
+    async def _ask(extra: str = "") -> str:
+        prompt = (
+            f"verzoek {uuid.uuid4().hex[:8]}\n"
+            f"Huidige vraag: {question}\n"
+            f"{extra}"
+            f"{json.dumps(payload, ensure_ascii=False)}"
+        )
+        parsed = await _generate_json(system, prompt, temperature=0.7)
+        answer = (parsed or {}).get("answer") if isinstance(parsed, dict) else None
+        return (answer or "").strip()
+
+    answer = await _ask()
+    if last_answer and answer and _normalize_answer(answer) == _normalize_answer(last_answer):
+        answer = await _ask(
+            "BELANGRIJK: je vorige antwoord was identiek. Geef nu een ander antwoord op de nieuwe vraag.\n"
+        )
+    if last_answer and answer and _normalize_answer(answer) == _normalize_answer(last_answer):
+        return grounded
+    if answer:
+        return answer
+    return grounded
 
 
 async def describe_surroundings(
@@ -248,15 +357,15 @@ async def describe_surroundings(
     return summary.strip() if summary else None
 
 
-async def _generate_json(system: str, user: str) -> dict[str, Any] | None:
+async def _generate_json(system: str, user: str, temperature: float = 0.4) -> dict[str, Any] | None:
     if settings.gemini_api_key:
-        result = await _gemini_json(system, user)
+        result = await _gemini_json(system, user, temperature=temperature)
         if result:
             return result
     return None
 
 
-async def _gemini_json(system: str, user: str) -> dict[str, Any] | None:
+async def _gemini_json(system: str, user: str, temperature: float = 0.4) -> dict[str, Any] | None:
     try:
         from google import genai
         from google.genai import types
@@ -274,7 +383,7 @@ async def _gemini_json(system: str, user: str) -> dict[str, Any] | None:
             config_kwargs: dict[str, Any] = {
                 "system_instruction": system,
                 "response_mime_type": "application/json",
-                "temperature": 0.4,
+                "temperature": temperature,
             }
             try:
                 config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)

@@ -39,6 +39,9 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     if catalog_route:
         request.interests = suggestion_service.merge_interests(catalog_route, request.interests)
         request.notes = suggestion_service.merge_notes(catalog_route, request.notes)
+    wish_interests = pois_service.interests_from_notes(request.notes)
+    if wish_interests:
+        request.interests = list(dict.fromkeys([*request.interests, *wish_interests]))
 
     start = await geocoding.geocode_one(request.start)
     if request.mode == "punt":
@@ -113,6 +116,11 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
 
     ranked_all = _rank(candidates, start, end, request)
     wiki_targets = pois_service.build_stop_pool(ranked_all, request.interests, limit=20)
+    if request.notes.strip():
+        for poi in ranked_all:
+            if pois_service.matches_notes(poi, request.notes) and poi not in wiki_targets:
+                wiki_targets.append(poi)
+        wiki_targets = wiki_targets[:24]
     if wiki_targets:
         wiki_results = await asyncio.gather(*(wikipedia.summary_for_poi(poi) for poi in wiki_targets))
         for poi, wiki in zip(wiki_targets, wiki_results, strict=True):
@@ -146,13 +154,17 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
 
     knoop_label = knoop_service.chain_label(chain) if chain else ""
     if chain:
-        candidates = _near_chain(candidates, chain)
+        candidates = _near_chain(candidates, chain, request.notes)
     ranked = _rank(candidates, start, end, request)
     if not ranked and not chain:
         raise ValueError(
             "Geen plekken of knooppunten gevonden. Probeer een andere startlocatie in Vlaanderen."
         )
     stop_pool = pois_service.build_stop_pool(ranked, request.interests)
+    wished = [poi for poi in ranked if pois_service.matches_notes(poi, request.notes)]
+    if wished:
+        seen = {str(poi.get("id")) for poi in stop_pool}
+        stop_pool = [poi for poi in wished if str(poi.get("id")) not in seen] + stop_pool
     selected = _pick(stop_pool, ai_choice, request) if stop_pool else []
     selected = _merge_user_pois(selected, request.poi_picks)
 
@@ -167,7 +179,11 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             end_lng=end.lng if request.mode == "punt" else None,
         )
         chain = expanded
-        knoop_label = knoop_service.chain_label(chain)
+        if request.notes.strip() and route.get("geometry"):
+            chain = knoop_service.supplement_chain_on_geometry(chain, nodes, route["geometry"])
+        knoop_label = knoop_service.chain_label(
+            knoop_service.close_chain_for_loop(chain) if request.mode == "lus" else chain
+        )
         selected = _along_geometry(selected, route["geometry"])
     elif request.mode == "lus":
         order = await routing.round_trip_order((start.lat, start.lng), [(s["lat"], s["lng"]) for s in selected])
@@ -204,8 +220,20 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
                 "description": poi.get("description") or "",
                 "kind_label": poi.get("kind_label"),
                 "index": index,
+                "matches_wish": pois_service.matches_notes(poi, request.notes),
+                "on_route": False,
             }
         )
+
+    if request.notes.strip() and route.get("geometry"):
+        wish_pois = await _wish_pois_for_geometry(
+            request.notes,
+            candidates,
+            ranked,
+            chain or [],
+            route["geometry"],
+        )
+        _merge_wish_into_stops(stops, wish_pois, request, route["geometry"])
 
     stops = await polish_scripts(stops, request.explanation_level)
     stops = await places_service.enrich_stops_with_places(stops, request.interests)
@@ -261,9 +289,16 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             population=s.get("population"),
             local_fact=s.get("local_fact"),
             side=s.get("side"),
+            matches_wish=bool(s.get("matches_wish")),
+            on_route=bool(s.get("on_route")),
         )
         for s in stops
     ]
+    knoop_chain_display = (
+        knoop_service.close_chain_for_loop(chain)
+        if request.mode == "lus" and chain
+        else (chain or [])
+    )
     knoop_models = [
         Knooppunt(
             id=n.get("id") or "",
@@ -274,7 +309,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
             on_route=True,
             geoid=n.get("geoid"),
         )
-        for n in chain
+        for n in knoop_chain_display
     ]
     chain_ids = {n.get("id") for n in chain if n.get("id")}
     all_knoop = _unique_knooppunten(nodes, chain_ids)
@@ -295,6 +330,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         intro=intro,
         mode=request.mode,
         interests=request.interests,
+        notes=(request.notes or "").strip(),
         start=start,
         end=end,
         distance_km=round(route["distance_m"] / 1000, 1),
@@ -372,6 +408,9 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
         end_lng=request.end_lng,
         poi_picks=request.poi_picks,
     )
+    knoop_chain_display = (
+        knoop_service.close_chain_for_loop(expanded) if request.close_loop else expanded
+    )
     knoop_models = [
         Knooppunt(
             id=n.get("id") or "",
@@ -382,14 +421,14 @@ async def reroute(request: RerouteRequest) -> RerouteResponse:
             on_route=True,
             geoid=n.get("geoid"),
         )
-        for n in expanded
+        for n in knoop_chain_display
     ]
     return RerouteResponse(
         geometry=route["geometry"],
         distance_km=round(route["distance_m"] / 1000, 1),
         duration_min=max(1, round(route["duration_s"] / 60)),
         knooppunten=knoop_models,
-        knoop_chain=" → ".join(n.number for n in knoop_models),
+        knoop_chain=knoop_service.chain_label(knoop_chain_display),
         steps=route.get("steps") or [],
         reason=reason,
         weather=weather,
@@ -412,7 +451,27 @@ async def preview_route(
     else:
         radius = int(min(16000, max(5000, distance_km * 1000 / 2.2)))
 
-    nodes = await knoop_service.fetch_nodes(lat, lng, radius, extra)
+    wish_interests = pois_service.interests_from_notes(notes)
+    nodes_task = knoop_service.fetch_nodes(lat, lng, radius, extra)
+    pois_task = (
+        pois_service.fetch_pois(lat, lng, radius, wish_interests or ["geschiedenis"], extra)
+        if notes.strip()
+        else asyncio.sleep(0, result=[])
+    )
+    horeca_task = (
+        pois_service.fetch_horeca(lat, lng, radius, extra)
+        if notes.strip() and ("horeca" in wish_interests or pois_service.notes_want_horeca(notes))
+        else asyncio.sleep(0, result=[])
+    )
+    nodes, osm_pois, horeca = await asyncio.gather(
+        _optional(nodes_task, [], 16),
+        _optional(pois_task, [], 24),
+        _optional(horeca_task, [], 24),
+    )
+    candidates = _merge(osm_pois, horeca)
+    if candidates:
+        knoop_service.attach_nearby(nodes, candidates)
+        knoop_service.score_nodes_for_notes(nodes, notes)
     geometric = knoop_service.plan_node_chain(nodes, lat, lng, distance_km, extra)
     noted = (
         knoop_service.chain_from_notes(nodes, lat, lng, distance_km, extra)
@@ -431,6 +490,32 @@ async def preview_route(
         end_lat=end_lat if mode == "punt" else None,
         end_lng=end_lng if mode == "punt" else None,
     )
+    geometry = route["geometry"]
+    wish_pois = await _wish_pois_for_geometry(notes, candidates, [], expanded, geometry)
+    suggestions = []
+    for poi in wish_pois:
+        try:
+            suggestions.append(
+                {
+                    "id": str(poi["id"]),
+                    "name": poi["name"],
+                    "lat": float(poi["lat"]),
+                    "lng": float(poi["lng"]),
+                    "kind": str(poi.get("kind") or "plek"),
+                    "kind_label": poi.get("kind_label"),
+                    "interest": poi.get("interest") or (
+                        pois_service.interests_from_notes(notes)[0]
+                        if pois_service.interests_from_notes(notes)
+                        else "geschiedenis"
+                    ),
+                    "on_route": bool(poi.get("on_route")),
+                }
+            )
+        except Exception:
+            continue
+    knoop_chain_display = (
+        knoop_service.close_chain_for_loop(expanded) if mode == "lus" else expanded
+    )
     return {
         "geometry": route["geometry"],
         "distance_km": round(route["distance_m"] / 1000, 1),
@@ -444,9 +529,10 @@ async def preview_route(
                 network=n.get("network"),
                 on_route=True,
             )
-            for n in expanded
+            for n in knoop_chain_display
         ],
-        "knoop_chain": knoop_service.chain_label(expanded),
+        "knoop_chain": knoop_service.chain_label(knoop_chain_display),
+        "suggestions": suggestions,
     }
 
 
@@ -517,7 +603,10 @@ async def _build_knoop_route(
     network_nodes, trajects = await knoop_service.fetch_network_for_chain(spine)
     spine_geo = knoop_service.enrich_chain_geoids(spine, network_nodes)
     expanded = knoop_service.expand_chain(spine_geo, network_nodes, trajects)
+    expanded = knoop_service.dedupe_revisited_numbers(expanded)
     must_visit = knoop_service._ensure_picks_in_chain(expanded, spine_geo) if spine_geo else list(expanded)
+    must_visit = knoop_service.dedupe_revisited_numbers(must_visit)
+    route_chain = expanded if expanded else must_visit
 
     # Waypoints altijd op de echte pick-coördinaten van de gebruiker.
     waypoints = knoop_service.waypoints_for_chain(
@@ -534,7 +623,7 @@ async def _build_knoop_route(
     route = await _route_along_must_visit(
         start_lat,
         start_lng,
-        must_visit,
+        route_chain,
         network_nodes,
         trajects,
         close_loop=close_loop,
@@ -548,7 +637,13 @@ async def _build_knoop_route(
     if not _route_covers_nodes(route.get("geometry") or [], spine_geo, max_m=50):
         route["geometry"] = _pin_nodes_on_geometry(route.get("geometry") or [], must_visit + spine_geo)
 
-    return must_visit, route
+    display_chain = knoop_service.chain_for_display(expanded, spine_geo) if expanded else list(must_visit)
+    display_chain = knoop_service.supplement_chain_on_geometry(
+        display_chain,
+        network_nodes,
+        route.get("geometry") or [],
+    )
+    return display_chain, route
 
 
 async def _route_along_must_visit(
@@ -580,6 +675,12 @@ async def _route_along_must_visit(
     distance_m = 0.0
     duration_s = 0.0
     steps: list[Any] = []
+    visited_geoids: set[int] = set()
+
+    def mark_visited(node: dict[str, Any]) -> None:
+        geo = knoop_service._resolve_geoid(node, by_geoid)
+        if geo is not None:
+            visited_geoids.add(int(geo))
 
     async def add_osrm_segment(a: tuple[float, float], b: tuple[float, float]) -> None:
         nonlocal distance_m, duration_s
@@ -603,11 +704,13 @@ async def _route_along_must_visit(
     if must_visit:
         first = must_visit[0]
         await add_osrm_segment((start_lat, start_lng), (float(first["lat"]), float(first["lng"])))
+        mark_visited(first)
 
     for index in range(len(must_visit) - 1):
         left = must_visit[index]
         right = must_visit[index + 1]
         if knoop_service._same_knoop(left, right):
+            mark_visited(right)
             continue
         segment, known_length = knoop_service.geometry_between_nodes(
             left, right, by_edge, edge_length, adj, by_geoid
@@ -620,16 +723,71 @@ async def _route_along_must_visit(
                 for i in range(1, len(segment)):
                     distance_m += haversine_m(segment[i - 1][0], segment[i - 1][1], segment[i][0], segment[i][1])
             duration_s += max(30.0, (known_length or 0) / 3.9)
+            mark_visited(right)
+            continue
+        segment, known_length = knoop_service.geometry_through_network(
+            left,
+            right,
+            by_edge,
+            edge_length,
+            adj,
+            by_geoid,
+            avoid_geoids=visited_geoids,
+        )
+        if segment and len(segment) >= 2:
+            geometries.append(segment)
+            if known_length > 0:
+                distance_m += known_length
+            else:
+                for i in range(1, len(segment)):
+                    distance_m += haversine_m(segment[i - 1][0], segment[i - 1][1], segment[i][0], segment[i][1])
+            duration_s += max(30.0, (known_length or 0) / 3.9)
+            mark_visited(right)
             continue
         await add_osrm_segment(
             (float(left["lat"]), float(left["lng"])),
             (float(right["lat"]), float(right["lng"])),
         )
+        mark_visited(right)
 
     if must_visit:
         last = must_visit[-1]
+        first = must_visit[0]
         if close_loop:
-            await add_osrm_segment((float(last["lat"]), float(last["lng"])), (start_lat, start_lng))
+            if not knoop_service._same_knoop(first, last):
+                segment, known_length = knoop_service.geometry_between_nodes(
+                    last, first, by_edge, edge_length, adj, by_geoid
+                )
+                if not segment or len(segment) < 2:
+                    segment, known_length = knoop_service.geometry_through_network(
+                        last,
+                        first,
+                        by_edge,
+                        edge_length,
+                        adj,
+                        by_geoid,
+                        avoid_geoids=visited_geoids,
+                    )
+                if segment and len(segment) >= 2:
+                    geometries.append(segment)
+                    if known_length > 0:
+                        distance_m += known_length
+                    else:
+                        for i in range(1, len(segment)):
+                            distance_m += haversine_m(
+                                segment[i - 1][0], segment[i - 1][1], segment[i][0], segment[i][1]
+                            )
+                    duration_s += max(30.0, (known_length or 0) / 3.9)
+                else:
+                    await add_osrm_segment(
+                        (float(last["lat"]), float(last["lng"])),
+                        (float(first["lat"]), float(first["lng"])),
+                    )
+            if haversine_m(start_lat, start_lng, float(first["lat"]), float(first["lng"])) > 20:
+                await add_osrm_segment(
+                    (float(first["lat"]), float(first["lng"])),
+                    (start_lat, start_lng),
+                )
         elif end_lat is not None and end_lng is not None:
             await add_osrm_segment((float(last["lat"]), float(last["lng"])), (end_lat, end_lng))
 
@@ -835,12 +993,159 @@ def _merge(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
-def _near_chain(pois: list[dict[str, Any]], chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _near_chain(pois: list[dict[str, Any]], chain: list[dict[str, Any]], notes: str = "") -> list[dict[str, Any]]:
     kept = []
     for poi in pois:
-        if any(haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < 1200 for n in chain):
+        wish = pois_service.matches_notes(poi, notes)
+        limit = 2800 if wish else 1200
+        if any(haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < limit for n in chain):
             kept.append(poi)
+    if notes.strip():
+        wished = [poi for poi in pois if pois_service.matches_notes(poi, notes)]
+        seen = {unique_key(p["name"], p["lat"], p["lng"]) for p in kept}
+        for poi in wished:
+            key = unique_key(poi["name"], poi["lat"], poi["lng"])
+            if key not in seen:
+                kept.append(poi)
+                seen.add(key)
     return kept or pois
+
+
+def _on_route_geometry(poi: dict[str, Any], geometry: list[list[float]], max_m: float = 650) -> bool:
+    if not geometry or len(geometry) < 2:
+        return False
+    step = max(1, len(geometry) // 48)
+    for index in range(0, len(geometry) - 1, step):
+        a = geometry[index]
+        b = geometry[index + 1]
+        if point_to_segment_m(poi["lat"], poi["lng"], a[0], a[1], b[0], b[1]) <= max_m:
+            return True
+    return False
+
+
+def _sample_route_points(geometry: list[list[float]], count: int = 6) -> list[tuple[float, float]]:
+    if not geometry:
+        return []
+    if len(geometry) <= count:
+        return [(float(point[0]), float(point[1])) for point in geometry]
+    step = max(1, len(geometry) // count)
+    return [(float(geometry[index][0]), float(geometry[index][1])) for index in range(0, len(geometry), step)][:count]
+
+
+def _route_midpoint(geometry: list[list[float]]) -> tuple[float, float] | None:
+    if not geometry:
+        return None
+    mid = geometry[len(geometry) // 2]
+    return float(mid[0]), float(mid[1])
+
+
+def _notes_want_halfway(notes: str) -> bool:
+    text = (notes or "").lower()
+    return any(key in text for key in ("halverwege", "halfway", " halve ", "midden", "tussendoor", " onderweg"))
+
+
+async def _wish_pois_for_geometry(
+    notes: str,
+    candidates: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+    chain: list[dict[str, Any]],
+    geometry: list[list[float]],
+) -> list[dict[str, Any]]:
+    if not notes.strip() or not geometry:
+        return []
+    wish_interests = pois_service.interests_from_notes(notes)
+    route_candidates = _merge(candidates, ranked)
+    sample_points = _sample_route_points(geometry, 6)
+    if _notes_want_halfway(notes):
+        midpoint = _route_midpoint(geometry)
+        if midpoint:
+            sample_points.append(midpoint)
+    if wish_interests:
+        along = await _optional(
+            pois_service.fetch_pois_along_points(sample_points, 2800, wish_interests),
+            [],
+            28,
+        )
+        route_candidates = _merge(route_candidates, along)
+    if pois_service.notes_want_horeca(notes):
+        horeca_parts = await asyncio.gather(
+            *[
+                _optional(pois_service.fetch_horeca(plat, plng, 3500), [], 22)
+                for plat, plng in sample_points[:5]
+            ],
+            return_exceptions=True,
+        )
+        for part in horeca_parts:
+            if isinstance(part, list):
+                route_candidates = _merge(route_candidates, part)
+    near = _near_chain(route_candidates, chain, notes) if route_candidates else []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ordered = sorted(
+        near,
+        key=lambda poi: (0 if pois_service.matches_notes(poi, notes) else 1, poi.get("name") or ""),
+    )
+    for poi in ordered:
+        if not pois_service.matches_notes(poi, notes):
+            continue
+        pid = str(poi.get("id") or "")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        tagged = dict(poi)
+        tagged["on_route"] = _on_route_geometry(poi, geometry)
+        result.append(tagged)
+        if len(result) >= 12:
+            break
+    result.sort(key=lambda item: (0 if item.get("on_route") else 1, (item.get("name") or "").lower()))
+    return result
+
+
+def _merge_wish_into_stops(
+    stops: list[dict[str, Any]],
+    wish_pois: list[dict[str, Any]],
+    request: PlanRequest,
+    geometry: list[list[float]],
+) -> None:
+    by_id = {str(s["id"]): s for s in stops}
+    for poi in wish_pois:
+        pid = str(poi.get("id") or "")
+        if not pid:
+            continue
+        on_route = bool(poi.get("on_route")) or _on_route_geometry(poi, geometry)
+        if pid in by_id:
+            by_id[pid]["matches_wish"] = True
+            by_id[pid]["on_route"] = on_route
+            continue
+        wiki = poi.get("wiki") or {}
+        scripts = fallback_scripts(poi, wiki, request.explanation_level)
+        stops.append(
+            {
+                "id": pid,
+                "name": poi["name"],
+                "lat": poi["lat"],
+                "lng": poi["lng"],
+                "kind": poi.get("kind_label") or poi.get("kind") or "plek",
+                "interest": poi["interest"],
+                "source": poi.get("source") or "OpenStreetMap",
+                "summary": poi.get("summary") or scripts["summary"],
+                "approaching": scripts["approaching"],
+                "arrived": scripts["arrived"],
+                "why": scripts["why"],
+                "wikipedia_url": wiki.get("url") or None,
+                "image_url": wiki.get("image") or None,
+                "wikipedia": poi.get("wikipedia"),
+                "wikidata": poi.get("wikidata"),
+                "description": poi.get("description") or "",
+                "kind_label": poi.get("kind_label"),
+                "matches_wish": True,
+                "on_route": on_route,
+            }
+        )
+    for stop in stops:
+        if pois_service.matches_notes(stop, request.notes):
+            stop["matches_wish"] = True
+            stop["on_route"] = _on_route_geometry(stop, geometry)
 
 
 def _along_geometry(stops: list[dict[str, Any]], geometry: list[list[float]]) -> list[dict[str, Any]]:
@@ -868,11 +1173,8 @@ def _rank(candidates: list[dict[str, Any]], start: Place, end: Place, request: P
             score += 4
         if poi.get("wikipedia") or poi.get("wikidata"):
             score += 3
-        name = (poi.get("name") or "").lower()
-        if request.notes:
-            blob = f"{name} {poi.get('kind', '')} {poi.get('kind_label', '')}".lower()
-            if any(needle in blob for needle in knoop_service._note_needles(request.notes)):
-                score += 10
+        if request.notes and pois_service.matches_notes(poi, request.notes):
+            score += 10
         dist = haversine_m(start.lat, start.lng, poi["lat"], poi["lng"])
         if request.mode == "lus":
             target = request.distance_km * 1000 / 3
@@ -889,10 +1191,20 @@ def _rank(candidates: list[dict[str, Any]], start: Place, end: Place, request: P
 
 def _pick(ranked: list[dict[str, Any]], ai_choice: dict[str, Any] | None, request: PlanRequest) -> list[dict[str, Any]]:
     interests = list(dict.fromkeys(request.interests or ["geschiedenis"]))
-    wanted = min(16, max(len(interests), len(interests) + 2))
+    wanted = min(16, max(len(interests) + 2, len(interests) + (4 if request.notes.strip() else 2)))
     by_id = {poi["id"]: poi for poi in ranked}
     chosen: list[dict[str, Any]] = []
     chosen_ids: set[str] = set()
+    if request.notes.strip():
+        for poi in ranked:
+            if not pois_service.matches_notes(poi, request.notes):
+                continue
+            if poi["id"] in chosen_ids:
+                continue
+            chosen.append(poi)
+            chosen_ids.add(poi["id"])
+            if len(chosen) >= min(8, wanted):
+                break
     if ai_choice and ai_choice.get("stop_ids"):
         for stop_id in ai_choice["stop_ids"]:
             if stop_id in by_id and stop_id not in chosen_ids:

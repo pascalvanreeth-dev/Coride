@@ -259,6 +259,50 @@ button, input, textarea { font: inherit; color: inherit; }
   color: var(--muted);
 }
 
+.wish-on-route-list {
+  display: grid;
+  gap: 8px;
+}
+
+.wish-on-route {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid rgba(199, 0, 104, 0.35);
+  border-radius: 12px;
+  background: rgba(199, 0, 104, 0.08);
+  text-align: left;
+  cursor: pointer;
+}
+
+.wish-on-route.focus {
+  border-color: #c70068;
+  box-shadow: 0 0 0 2px rgba(199, 0, 104, 0.18);
+}
+
+.wish-on-route strong {
+  display: block;
+  font-size: 0.92rem;
+}
+
+.wish-on-route small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+.wish-on-route-dot {
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #c70068;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 2px rgba(199, 0, 104, 0.25);
+}
+
 .poi-picker-actions {
   display: grid;
   gap: 8px;
@@ -269,6 +313,32 @@ button, input, textarea { font: inherit; color: inherit; }
   margin: 8px 0 0;
   line-height: 1.45;
   color: var(--ink);
+}
+
+.stop-picker-blurb p,
+.guide-blurb p,
+.locality-fact p {
+  margin: 8px 0 0;
+}
+
+.context-card .locality-fact {
+  margin-top: 4px;
+}
+
+.stop-picker-blurb .blurb-expanded,
+.guide-blurb .blurb-expanded,
+.locality-fact .blurb-expanded {
+  max-height: 28vh;
+  overflow-y: auto;
+}
+
+.lees-meer {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
 }
 
 .profile-bar {
@@ -1149,6 +1219,8 @@ input, textarea {
 
 .stop.active { border-color: var(--accent); }
 .stop.on-route { border-color: var(--green, #4f8f43); background: color-mix(in srgb, var(--green, #4f8f43) 12%, var(--panel-2)); }
+.stop.wish { border-color: #9a7355; background: color-mix(in srgb, #9a7355 10%, var(--panel-2)); }
+.stop.wish-off-route { border-style: dashed; }
 
 .num {
   width: 34px;

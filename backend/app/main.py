@@ -245,6 +245,7 @@ async def ask_endpoint(request: AskRequest) -> AskResponse:
             request.heading,
             request.place_name,
             request.interests,
+            request.history,
         )
         return AskResponse(answer=answer)
     except Exception as exc:  # noqa: BLE001

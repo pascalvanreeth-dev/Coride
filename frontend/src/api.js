@@ -43,6 +43,7 @@ export async function askAbout(payload) {
   const response = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));

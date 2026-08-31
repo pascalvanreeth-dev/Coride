@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from app.http import client
-from app.services.geo import bearing, haversine_m
+from app.services.geo import bearing, haversine_m, point_to_segment_m
 from app.services.pois import _overpass
 
 WFS_URL = "https://geodata.toerismevlaanderen.be/geoserver/wfs"
@@ -174,7 +174,6 @@ def plan_node_chain(
         if best:
             picked.append(best)
     others = [n for n in picked if n["id"] != start_node["id"]]
-    others.sort(key=lambda n: bearing(start_node["lat"], start_node["lng"], n["lat"], n["lng"]))
     if len(others) < 3:
         extras = sorted(
             (n for n in nodes if n["id"] != start_node["id"]),
@@ -183,11 +182,13 @@ def plan_node_chain(
             ),
         )
         for node in extras:
+            if any(node["id"] == o["id"] for o in others):
+                continue
             if all(haversine_m(node["lat"], node["lng"], p["lat"], p["lng"]) > 900 for p in others + [start_node]):
                 others.append(node)
             if len(others) >= 4:
                 break
-        others.sort(key=lambda n: bearing(start_node["lat"], start_node["lng"], n["lat"], n["lng"]))
+    others = _order_loop_nodes(start_node, others)
     chain = [start_node, *others, start_node]
     return _dedupe_adjacent(chain)
 
@@ -213,6 +214,31 @@ def chain_from_user(selected: list[dict[str, Any]], loop: bool) -> list[dict[str
 
 def chain_label(nodes: list[dict[str, Any]]) -> str:
     return " → ".join(n["number"] for n in nodes)
+
+
+def dedupe_revisited_numbers(chain: list[dict[str, Any]], allow_close: bool = False) -> list[dict[str, Any]]:
+    """Eén bezoek per knoopnummer; voor lus mag het startknooppunt nog eens als sluiting."""
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for index, node in enumerate(chain):
+        number = str(node.get("number") or "")
+        if allow_close and index == len(chain) - 1 and result and number == str(result[0].get("number")):
+            result.append(dict(node))
+            continue
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        result.append(dict(node))
+    return result
+
+
+def close_chain_for_loop(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lus tonen als A → B → C → A in overzichten."""
+    if not chain:
+        return []
+    if _same_knoop(chain[0], chain[-1]):
+        return list(chain)
+    return [*chain, dict(chain[0])]
 
 
 async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 3500) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -340,6 +366,54 @@ def geometry_between_nodes(
     return piece, length
 
 
+def _merge_geometry_parts(parts: list[list[list[float]]]) -> list[list[float]]:
+    geometry: list[list[float]] = []
+    for part in parts:
+        if not part:
+            continue
+        if geometry and haversine_m(geometry[-1][0], geometry[-1][1], part[0][0], part[0][1]) < 12:
+            part = part[1:]
+        geometry.extend(part)
+    return geometry
+
+
+def geometry_through_network(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    by_edge: dict[tuple[int, int], list[list[float]]],
+    edge_length: dict[tuple[int, int], float],
+    adj: dict[int, list[tuple[int, float]]],
+    by_geoid: dict[int, dict[str, Any]],
+    avoid_geoids: set[int] | None = None,
+) -> tuple[list[list[float]] | None, float]:
+    """Traject-geometrie langs het knooppuntennetwerk, met vermijding van herbezoek."""
+    segment = _segment_through_network(left, right, by_geoid, adj, avoid_geoids=avoid_geoids or set())
+    if len(segment) < 2:
+        return None, 0.0
+    pieces: list[list[list[float]]] = []
+    total = 0.0
+    for index in range(len(segment) - 1):
+        piece, length = geometry_between_nodes(
+            segment[index],
+            segment[index + 1],
+            by_edge,
+            edge_length,
+            adj,
+            by_geoid,
+        )
+        if not piece:
+            continue
+        pieces.append(piece)
+        if length > 0:
+            total += length
+        else:
+            for step in range(1, len(piece)):
+                total += haversine_m(piece[step - 1][0], piece[step - 1][1], piece[step][0], piece[step][1])
+    if not pieces:
+        return None, 0.0
+    return _merge_geometry_parts(pieces), total
+
+
 def expand_chain(
     chain: list[dict[str, Any]],
     network_nodes: list[dict[str, Any]],
@@ -359,6 +433,7 @@ def expand_chain(
     adj = build_adjacency(trajects)
     expanded: list[dict[str, Any]] = []
     visited_geoids: set[int] = set()
+    visited_numbers: set[str] = set()
     for index in range(len(chain) - 1):
         left = chain[index]
         right = chain[index + 1]
@@ -378,13 +453,18 @@ def expand_chain(
         for node in segment:
             if expanded and _same_knoop(expanded[-1], node):
                 continue
+            number = str(node.get("number") or "")
             geo = _resolve_geoid(node, by_geoid)
+            if number and number in visited_numbers and not _same_knoop(node, right):
+                continue
             if geo is not None and geo in visited_geoids and not _same_knoop(node, right):
                 continue
             expanded.append(node)
+            if number:
+                visited_numbers.add(number)
             if geo is not None:
                 visited_geoids.add(geo)
-    return _ensure_picks_in_chain(expanded, chain) if expanded else list(chain)
+    return expanded if expanded else list(chain)
 
 
 def enrich_chain_geoids(chain: list[dict[str, Any]], network_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -529,7 +609,7 @@ def _segment_through_network(
         if avoid_geoids:
             path = _shortest_path_avoid(adj, left_id, right_id, avoid_geoids)
         if not path or len(path) < 2:
-            path = _shortest_path(adj, left_id, right_id)
+            path = _shortest_path_penalty(adj, left_id, right_id, avoid_geoids or set(), penalty_m=4000.0)
         if len(path) >= 2:
             middle = [by_geoid[geoid] for geoid in path if geoid in by_geoid]
             return _segment_with_ends(left, right, middle)
@@ -568,6 +648,113 @@ def _segment_with_ends(
     return nodes
 
 
+def _index_of_pick_in_expanded(
+    pick: dict[str, Any],
+    expanded: list[dict[str, Any]],
+    by_geoid: dict[int, dict[str, Any]],
+) -> int:
+    index = next((i for i, node in enumerate(expanded) if _same_knoop(pick, node)), -1)
+    if index >= 0:
+        return index
+    pick_geo = _resolve_geoid(pick, by_geoid)
+    if pick_geo is not None:
+        index = next((i for i, node in enumerate(expanded) if _resolve_geoid(node, by_geoid) == pick_geo), -1)
+        if index >= 0:
+            return index
+    best_i = -1
+    best_d = float("inf")
+    for i, node in enumerate(expanded):
+        if str(node.get("number")) != str(pick.get("number")):
+            continue
+        dist = haversine_m(pick["lat"], pick["lng"], node["lat"], node["lng"])
+        if dist < best_d:
+            best_d = dist
+            best_i = i
+    return best_i if best_d <= 300 else -1
+
+
+def chain_for_display(expanded: list[dict[str, Any]], picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Volledige netwerkvolgorde voor overzicht; gebruikerspicks met hun coördinaten."""
+    if not expanded:
+        return [dict(p) for p in picks]
+    ensured = _ensure_picks_in_chain(expanded, picks)
+    if len(ensured) >= max(len(expanded) - 2, len(picks)):
+        return ensured
+    by_number = {str(p["number"]): p for p in picks}
+    result: list[dict[str, Any]] = []
+    for node in expanded:
+        pick = by_number.get(str(node.get("number")))
+        if pick is not None and haversine_m(pick["lat"], pick["lng"], node["lat"], node["lng"]) <= 200:
+            merged = dict(pick)
+            if node.get("geoid") is not None:
+                merged["geoid"] = node["geoid"]
+            node_out = merged
+        else:
+            node_out = dict(node)
+        if result and _same_knoop(result[-1], node_out):
+            continue
+        result.append(node_out)
+    return _dedupe_adjacent(result)
+
+
+def _near_geometry(lat: float, lng: float, geometry: list[list[float]], max_m: float = 650) -> bool:
+    if len(geometry) < 2:
+        return False
+    step = max(1, len(geometry) // 48)
+    for index in range(0, len(geometry) - 1, step):
+        a = geometry[index]
+        b = geometry[index + 1]
+        if point_to_segment_m(lat, lng, a[0], a[1], b[0], b[1]) <= max_m:
+            return True
+    return False
+
+
+def _geometry_progress_index(lat: float, lng: float, geometry: list[list[float]]) -> float:
+    best_i = 0
+    best_d = float("inf")
+    step = max(1, len(geometry) // 120)
+    for index in range(0, len(geometry) - 1, step):
+        a = geometry[index]
+        b = geometry[index + 1]
+        dist = point_to_segment_m(lat, lng, a[0], a[1], b[0], b[1])
+        if dist < best_d:
+            best_d = dist
+            best_i = index
+    return float(best_i)
+
+
+def supplement_chain_on_geometry(
+    chain: list[dict[str, Any]],
+    pool: list[dict[str, Any]],
+    geometry: list[list[float]],
+    max_m: float = 650,
+) -> list[dict[str, Any]]:
+    """Voeg ontbrekende knooppunten in volgorde langs het traject, zonder herhaling."""
+    if not chain or not geometry:
+        return list(chain)
+    result = [dict(node) for node in chain]
+    seen_numbers = {str(node.get("number") or "") for node in result if node.get("number")}
+    for node in pool:
+        number = str(node.get("number") or "")
+        if not number or number in seen_numbers:
+            continue
+        lat, lng = float(node["lat"]), float(node["lng"])
+        if not _near_geometry(lat, lng, geometry, max_m):
+            continue
+        if any(_same_knoop(node, existing) for existing in result):
+            continue
+        progress = _geometry_progress_index(lat, lng, geometry)
+        insert_at = len(result)
+        for index, existing in enumerate(result):
+            existing_progress = _geometry_progress_index(float(existing["lat"]), float(existing["lng"]), geometry)
+            if existing_progress > progress:
+                insert_at = index
+                break
+        result.insert(insert_at, dict(node))
+        seen_numbers.add(number)
+    return dedupe_revisited_numbers(result)
+
+
 def _ensure_picks_in_chain(expanded: list[dict[str, Any]], picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep user picks (original number/coords) in order; fill network nodes between them."""
     if not picks:
@@ -590,9 +777,8 @@ def _ensure_picks_in_chain(expanded: list[dict[str, Any]], picks: list[dict[str,
         if pick_index >= len(picks) - 1:
             break
         nxt = picks[pick_index + 1]
-        # Neem tussenliggende netwerkknooppunten tussen deze twee picks uit de expanded path.
-        start_i = next((i for i, node in enumerate(expanded) if _same_knoop(pick, node)), -1)
-        end_i = next((i for i, node in enumerate(expanded) if _same_knoop(nxt, node)), -1)
+        start_i = _index_of_pick_in_expanded(pick, expanded, by_geoid)
+        end_i = _index_of_pick_in_expanded(nxt, expanded, by_geoid)
         if start_i < 0 or end_i < 0 or end_i <= start_i:
             continue
         for node in expanded[start_i + 1 : end_i]:
@@ -661,6 +847,48 @@ def _shortest_path_avoid(
             if neighbor in blocked:
                 continue
             next_cost = cost + weight
+            if next_cost < dist.get(neighbor, float("inf")):
+                dist[neighbor] = next_cost
+                prev[neighbor] = node
+                heapq.heappush(heap, (next_cost, neighbor))
+    if goal not in prev and start != goal:
+        return None
+    path: list[int] = []
+    current = goal
+    while True:
+        path.append(current)
+        if current == start:
+            break
+        current = prev.get(current, start)
+        if current == goal:
+            break
+    path.reverse()
+    return path
+
+
+def _shortest_path_penalty(
+    adj: dict[int, list[tuple[int, float]]],
+    start: int,
+    goal: int,
+    discouraged: set[int],
+    *,
+    penalty_m: float = 2500.0,
+) -> list[int] | None:
+    """Prefer paths that avoid already visited knooppunten when a strict detour exists."""
+    if start == goal:
+        return [start]
+    dist: dict[int, float] = {start: 0.0}
+    prev: dict[int, int] = {}
+    heap: list[tuple[float, int]] = [(0.0, start)]
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if cost > dist.get(node, float("inf")):
+            continue
+        if node == goal:
+            break
+        for neighbor, weight in adj.get(node, []):
+            extra = penalty_m if neighbor in discouraged and neighbor not in {start, goal} else 0.0
+            next_cost = cost + weight + extra
             if next_cost < dist.get(neighbor, float("inf")):
                 dist[neighbor] = next_cost
                 prev[neighbor] = node
@@ -856,7 +1084,7 @@ def chain_from_notes(
         mid.sort(key=lambda n: haversine_m(start_node["lat"], start_node["lng"], n["lat"], n["lng"]))
         return _dedupe_adjacent([start_node, *mid, end_node])
     others = [n for n in picked if n["id"] != start_node["id"]]
-    others.sort(key=lambda n: bearing(start_node["lat"], start_node["lng"], n["lat"], n["lng"]))
+    others = _order_loop_nodes(start_node, others)
     return _dedupe_adjacent([start_node, *others, start_node])
 
 
@@ -926,6 +1154,59 @@ def _dedupe_adjacent(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         cleaned.append(node)
     return cleaned
+
+
+def _loop_tour_km(start: dict[str, Any], nodes: list[dict[str, Any]]) -> float:
+    if not nodes:
+        return 0.0
+    total = haversine_m(start["lat"], start["lng"], nodes[0]["lat"], nodes[0]["lng"])
+    for index in range(len(nodes) - 1):
+        left = nodes[index]
+        right = nodes[index + 1]
+        total += haversine_m(left["lat"], left["lng"], right["lat"], right["lng"])
+    last = nodes[-1]
+    total += haversine_m(last["lat"], last["lng"], start["lat"], start["lng"])
+    return total
+
+
+def _order_loop_nodes(start: dict[str, Any], nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order loop picks to reduce back-and-forth over the same corridors."""
+    if len(nodes) <= 1:
+        return list(nodes)
+
+    remaining = {node["id"]: node for node in nodes}
+    ordered: list[dict[str, Any]] = []
+    current = start
+    while remaining:
+        best = min(
+            remaining.values(),
+            key=lambda node: haversine_m(current["lat"], current["lng"], node["lat"], node["lng"]),
+        )
+        ordered.append(best)
+        del remaining[best["id"]]
+        current = best
+
+    return _improve_loop_order(start, ordered)
+
+
+def _improve_loop_order(start: dict[str, Any], nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """2-opt pass to uncross a loop and avoid obvious backtracking."""
+    if len(nodes) < 3:
+        return list(nodes)
+    best = list(nodes)
+    best_len = _loop_tour_km(start, best)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best)):
+                candidate = best[: i + 1] + list(reversed(best[i + 1 : j + 1])) + best[j + 1 :]
+                candidate_len = _loop_tour_km(start, candidate)
+                if candidate_len + 80 < best_len:
+                    best = candidate
+                    best_len = candidate_len
+                    improved = True
+    return best
 
 
 def _bbox(lat: float, lng: float, radius_m: int) -> tuple[float, float, float, float]:

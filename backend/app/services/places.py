@@ -8,6 +8,7 @@ import httpx
 
 from app.config import settings
 from app.http import client
+from app.services.wikipedia import first_sentences, search_wikipedia_title
 from app.services import nominatim
 from app.services.geocoding import in_belgium
 from app.services.geo import haversine_m
@@ -93,22 +94,71 @@ async def _wiki_place(name: str) -> dict[str, Any]:
     title = (name or "").strip()
     if len(title) < 2:
         return {}
-    async with client() as http:
-        response = await http.get(
-            f"https://nl.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}",
-            headers={**WIKI_HEADERS, "Accept": "application/json"},
-        )
-        if response.status_code != 200:
-            return {}
-        payload = response.json() or {}
-        extract = (payload.get("extract") or "").strip()
-        pop = _population_from_text(extract)
-        return {
-            "summary": _first_sentence(extract),
-            "url": payload.get("content_urls", {}).get("desktop", {}).get("page") or "",
-            "population": pop,
-            "known_for": [],
-        }
+
+    async def fetch_page(page_title: str) -> dict[str, Any]:
+        async with client() as http:
+            response = await http.get(
+                f"https://nl.wikipedia.org/api/rest_v1/page/summary/{page_title.replace(' ', '_')}",
+                headers={**WIKI_HEADERS, "Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                return {}
+            payload = response.json() or {}
+            extract = (payload.get("extract") or "").strip()
+            if not extract:
+                return {}
+            return {
+                "extract": extract,
+                "type": (payload.get("type") or "").lower(),
+                "url": payload.get("content_urls", {}).get("desktop", {}).get("page") or "",
+            }
+
+    data = await fetch_page(title)
+    extract = (data.get("extract") or "").strip()
+    if _is_disambiguation(extract, data.get("type", "")):
+        resolved = None
+        for candidate in (f"{title} (België)", f"{title} (stad)"):
+            alt = await fetch_page(candidate)
+            alt_extract = (alt.get("extract") or "").strip()
+            if alt_extract and not _is_disambiguation(alt_extract, alt.get("type", "")):
+                resolved = alt
+                break
+        if not resolved:
+            search_title = await search_wikipedia_title(title, "nl")
+            if search_title and search_title.lower() != title.lower():
+                alt = await fetch_page(search_title)
+                alt_extract = (alt.get("extract") or "").strip()
+                if alt_extract and not _is_disambiguation(alt_extract, alt.get("type", "")):
+                    resolved = alt
+        data = resolved or {}
+
+    extract = (data.get("extract") or "").strip()
+    if not extract or _is_disambiguation(extract, data.get("type", "")):
+        return {}
+
+    summary = _place_blurb(extract)
+    pop = _population_from_text(extract)
+    return {
+        "summary": summary,
+        "url": data.get("url") or "",
+        "population": pop,
+        "known_for": [],
+    }
+
+
+def _is_disambiguation(text: str, page_type: str = "") -> bool:
+    if page_type == "disambiguation":
+        return True
+    lowered = (text or "").lower()
+    return "kan verwijzen naar" in lowered or "may refer to" in lowered
+
+
+def _place_blurb(text: str, *, sentences: int = 2, max_chars: int = 280) -> str:
+    blurb = first_sentences((text or "").strip(), sentences)
+    if len(blurb) <= max_chars:
+        return blurb
+    cut = blurb[: max_chars - 1].rsplit(" ", 1)[0].strip()
+    return f"{cut}…" if cut else blurb[: max_chars - 1].strip() + "…"
 
 
 def _population_from_text(text: str) -> int | None:
@@ -117,13 +167,6 @@ def _population_from_text(text: str) -> int | None:
         return None
     digits = re.sub(r"[^\d]", "", match.group(1))
     return int(digits) if digits else None
-
-
-def _first_sentence(text: str) -> str:
-    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    return parts[0].strip() if parts else ""
-
-
 def _fact_for_interests(ctx: dict[str, Any], interests: list[str]) -> str:
     fact = (ctx.get("local_fact") or "").strip()
     place = ctx.get("place_name") or ctx.get("municipality") or "deze streek"
