@@ -60,6 +60,7 @@ class PoiHit(BaseModel):
     kind_label: str | None = None
     interest: Interest
     on_route: bool = False
+    hint: str | None = None
 
 
 class PlanRequest(BaseModel):
@@ -266,6 +267,8 @@ class RoutePreviewRequest(BaseModel):
     end_lat: float | None = Field(default=None, ge=49.0, le=52.0)
     end_lng: float | None = Field(default=None, ge=2.0, le=7.0)
     notes: str = ""
+    poi_picks: list[PoiPick] = Field(default_factory=list, max_length=20)
+    interests: list[Interest] = Field(default_factory=list)
 
 
 class RoutePreviewResponse(BaseModel):
@@ -275,6 +278,7 @@ class RoutePreviewResponse(BaseModel):
     knooppunten: list[Knooppunt] = Field(default_factory=list)
     knoop_chain: str = ""
     suggestions: list[PoiHit] = Field(default_factory=list)
+    wish_summary: str | None = None
 
 
 class GeocodeHit(BaseModel):

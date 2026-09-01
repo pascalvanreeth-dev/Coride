@@ -164,6 +164,8 @@ async def route_preview_endpoint(request: RoutePreviewRequest) -> RoutePreviewRe
             request.end_lat,
             request.end_lng,
             request.notes,
+            request.poi_picks,
+            list(request.interests),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

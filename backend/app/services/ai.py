@@ -43,6 +43,100 @@ def has_ai() -> bool:
     return bool(settings.gemini_api_key or settings.openai_api_key)
 
 
+VALID_INTERESTS = frozenset(
+    {
+        "geschiedenis",
+        "natuur",
+        "landbouw",
+        "horeca",
+        "oorlog",
+        "architectuur",
+        "activiteiten",
+        "evenementen",
+    }
+)
+
+
+async def interpret_wish_notes(
+    notes: str,
+    profile_interests: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Gebruik Gemini om vrije extra-wens-tekst te interpreteren."""
+    if not has_ai() or not (notes or "").strip():
+        return None
+    parsed = await _generate_json(
+        "Je bent een fietsroute-assistent in Vlaanderen. "
+        "Interpreteer de vrije extra_wens van een fietser voor een fietsroute. "
+        "Map naar interesses: geschiedenis, natuur, landbouw, horeca, oorlog, architectuur, activiteiten, evenementen. "
+        "JSON: {interests: [geldige keys], keywords: [1-6 zoektermen], summary: 1 korte zin in het Nederlands}. "
+        "Alleen interesses die echt passen. Nederlands.",
+        json.dumps(
+            {"extra_wens": notes.strip(), "profiel_interesses": list(profile_interests or [])},
+            ensure_ascii=False,
+        ),
+        temperature=0.25,
+    )
+    if not isinstance(parsed, dict):
+        return None
+    interests = [item for item in (parsed.get("interests") or []) if item in VALID_INTERESTS]
+    keywords = [str(item).strip() for item in (parsed.get("keywords") or []) if str(item).strip()]
+    summary = str(parsed.get("summary") or "").strip()
+    if not interests and not keywords and not summary:
+        return None
+    return {"interests": interests[:4], "keywords": keywords[:6], "summary": summary}
+
+
+async def rank_wish_poi_suggestions(
+    notes: str,
+    candidates: list[dict[str, Any]],
+    profile_interests: list[str] | None = None,
+    wish_interests: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Laat Gemini de beste plekken kiezen voor het suggestieoverzicht."""
+    if not has_ai() or not (notes or "").strip() or not candidates:
+        return None
+    compact = [
+        {
+            "id": str(c["id"]),
+            "name": c["name"],
+            "kind": c.get("kind_label") or c.get("kind"),
+            "interest": c.get("interest"),
+            "on_route": bool(c.get("on_route")),
+        }
+        for c in candidates[:56]
+        if c.get("id") and c.get("name")
+    ]
+    if not compact:
+        return None
+    parsed = await _generate_json(
+        "Je bent een fietsgids in Vlaanderen. "
+        "Kies uit de gegeven plekken de beste suggesties voor de extra_wens van de fietser. "
+        "Geef diversiteit (niet allemaal hetzelfde type). "
+        "Prefer plekken met on_route=true als die passen. "
+        "JSON: {pick_ids: [6-18 id strings, beste eerst], hints: {id: korte reden max 12 woorden}, summary: 1 zin}. "
+        "Alleen ids uit plekken. Nederlands. Verzin geen plekken.",
+        json.dumps(
+            {
+                "extra_wens": notes.strip(),
+                "profiel_interesses": list(profile_interests or []),
+                "route_interesses": list(wish_interests or []),
+                "plekken": compact,
+            },
+            ensure_ascii=False,
+        ),
+        temperature=0.35,
+    )
+    if not isinstance(parsed, dict):
+        return None
+    pick_ids = [str(item) for item in (parsed.get("pick_ids") or []) if str(item).strip()]
+    hints_raw = parsed.get("hints") if isinstance(parsed.get("hints"), dict) else {}
+    hints = {str(key): str(value).strip() for key, value in hints_raw.items() if str(value).strip()}
+    summary = str(parsed.get("summary") or "").strip()
+    if not pick_ids and not summary:
+        return None
+    return {"pick_ids": pick_ids[:18], "hints": hints, "summary": summary}
+
+
 async def enrich_with_ai(
     start_label: str,
     interests: list[str],

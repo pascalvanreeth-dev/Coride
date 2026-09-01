@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import httpx
@@ -191,25 +192,46 @@ NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
     (
         "horeca",
         (
-            "cafe", "café", "koffie", "koffi", "coffee", "pub", "bar", "bier",
-            "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs",
-            "bakker", "brouwerij", "taart",
+            "cafe", "café", "cafetje", "cafetjes", "koffie", "koffi", "coffee", "pub", "bar", "bier",
+            "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs", "drank",
+            "bakker", "brouwerij", "taart", "brasserie", "frituur", "snack",
         ),
     ),
     (
         "architectuur",
-        ("kasteel", "kastelen", "burcht", "castle", "molen", "kerk", "kathedraal", "abdij", "toren"),
+        (
+            "kasteel", "kastelen", "burcht", "castle", "molen", "molens", "kerk", "kerken",
+            "kathedraal", "abdij", "abdijen", "toren", "torens", "basiliek", "kapel",
+        ),
     ),
     (
         "natuur",
-        ("park", "bos", "natuur", "water", "rivier", "leie", "schelde", "kanaal", "duin", "polder", "meer", "vijver"),
+        (
+            "park", "parken", "bos", "bossen", "natuur", "water", "rivier", "leie", "schelde",
+            "kanaal", "gracht", "duin", "polder", "meer", "vijver", "reservaat", "wandeling",
+        ),
     ),
-    ("geschiedenis", ("museum", "geschiedenis", "erfgoed", "historisch", "middeleeuw")),
-    ("oorlog", ("oorlog", "memorial", "gedenkteken", "fort", "slagveld", "bunker")),
-    ("landbouw", ("hoeve", "boerderij", "wijn", "fruit", "hop", "streekproduct", "boer")),
-    ("activiteiten", ("uitzicht", "attractie", "zwem", "speeltuin", "wandel")),
-    ("evenementen", ("markt", "festival", "evenement", "theater", "concert")),
+    (
+        "geschiedenis",
+        ("museum", "musea", "geschiedenis", "erfgoed", "historisch", "middeleeuw", "monument", "monumenten"),
+    ),
+    ("oorlog", ("oorlog", "memorial", "gedenkteken", "fort", "slagveld", "bunker", "bevrijding")),
+    ("landbouw", ("hoeve", "hoeven", "boerderij", "wijn", "wijngaard", "fruit", "hop", "streekproduct", "boer")),
+    ("activiteiten", ("uitzicht", "uitkijk", "attractie", "zwem", "speeltuin", "wandel", "recreatie")),
+    ("evenementen", ("markt", "festival", "evenement", "theater", "concert", "optreden")),
 ]
+
+
+def wish_interests_for_notes(notes: str, fallback: list[str] | None = None) -> list[str]:
+    """Map vrije extra-wens-tekst naar zoekbare interesses."""
+    found = interests_from_notes(notes)
+    if found:
+        return _unique_interests(found)[:4]
+    if not (notes or "").strip():
+        return []
+    if fallback:
+        return _unique_interests(fallback)[:4]
+    return _unique_interests(["geschiedenis", "natuur", "architectuur", "horeca"])[:3]
 
 
 def interests_from_notes(notes: str) -> list[str]:
@@ -227,12 +249,18 @@ def matches_notes(poi: dict[str, Any], notes: str) -> bool:
     text = (notes or "").strip().lower()
     if not text:
         return False
-    blob = f"{poi.get('name', '')} {poi.get('kind', '')} {poi.get('kind_label', '')} {poi.get('interest', '')}".lower()
+    blob = f"{poi.get('name', '')} {poi.get('kind', '')} {poi.get('kind_label', '')} {poi.get('interest', '')} {poi.get('description', '')}".lower()
     from app.services import knooppunten as knoop_service
 
     if any(needle in blob for needle in knoop_service._note_needles(notes)):
         return True
-    return poi.get("interest") in set(interests_from_notes(notes))
+    wish_interests = set(interests_from_notes(notes))
+    if wish_interests and poi.get("interest") in wish_interests:
+        return True
+    for word in re.findall(r"[a-zà-ÿ]{4,}", text):
+        if word in blob:
+            return True
+    return False
 
 
 async def _fetch_pois_for_interest(
@@ -456,7 +484,7 @@ def notes_want_horeca(notes: str, interests: list[str] | None = None, prefs: lis
         return True
     text = (notes or "").lower()
     keys = (
-        "cafe", "café", "koffie", "koffi", "coffee", "pub", "bar", "bier",
+        "cafe", "café", "cafetje", "cafetjes", "koffie", "koffi", "coffee", "pub", "bar", "bier",
         "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs",
     )
     return any(key in text for key in keys)

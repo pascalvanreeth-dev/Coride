@@ -259,6 +259,12 @@ button, input, textarea { font: inherit; color: inherit; }
   color: var(--muted);
 }
 
+.poi-suggest-note {
+  font-size: 0.68rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
 .wish-on-route-list {
   display: grid;
   gap: 8px;
@@ -507,6 +513,7 @@ form { display: grid; gap: 14px; min-width: 0; }
 
 .editor, .ask, .draft-box {
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .sources { color: var(--muted); font-size: 0.78rem; line-height: 1.45; overflow-wrap: anywhere; }
@@ -979,6 +986,14 @@ input, textarea {
 
 .draft-box { margin-top: 2px; }
 
+.route-knoop-list {
+  flex-shrink: 0;
+  max-height: min(42vh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
 .route-knoop-list .via-stop .num {
   background: #4f8f43;
   color: #fff;
@@ -1011,6 +1026,11 @@ input, textarea {
   padding: 0;
   display: grid;
   gap: 6px;
+}
+
+.picked-list.route-knoop-list {
+  display: flex;
+  flex-direction: column;
 }
 
 .picked-list li {

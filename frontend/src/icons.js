@@ -87,9 +87,14 @@ export function wishPoiGlyph(interest, kind) {
   return "★";
 }
 
-export function wishPoiIcon({ interest, kind, focused = false } = {}) {
-  const size = focused ? 34 : 28;
-  const ring = focused ? "0 0 0 4px rgba(199, 0, 104, 0.35)" : "0 0 0 3px rgba(199, 0, 104, 0.28)";
+export function wishPoiIcon({ interest, kind, focused = false, selected = false } = {}) {
+  const size = focused ? 34 : selected ? 30 : 28;
+  const bg = selected ? "#4f8f43" : "#c70068";
+  const ring = focused
+    ? `0 0 0 4px rgba(79, 143, 67, 0.35)`
+    : selected
+      ? "0 0 0 3px rgba(79, 143, 67, 0.32)"
+      : "0 0 0 3px rgba(199, 0, 104, 0.28)";
   const glyph = wishPoiGlyph(interest, kind);
   const fontSize = glyph.length > 1 ? Math.round(size * 0.52) : Math.round(size * 0.55);
   return L.divIcon({
@@ -98,7 +103,7 @@ export function wishPoiIcon({ interest, kind, focused = false } = {}) {
       width:${size}px;
       height:${size}px;
       border-radius:50%;
-      background:#c70068;
+      background:${bg};
       color:#fff;
       border:3px solid #fff;
       box-shadow:${ring}, 0 4px 12px rgba(40,32,28,0.28);

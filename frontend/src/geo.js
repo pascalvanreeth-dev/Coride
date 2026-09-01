@@ -159,6 +159,69 @@ export function displayLoopNodes(nodes, isLoop) {
   return [...nodes, first];
 }
 
+export function dedupeRevisitedNumbers(chain) {
+  const seen = new Set();
+  const result = [];
+  for (const node of chain || []) {
+    const number = String(node?.number || "");
+    if (!number || seen.has(number)) continue;
+    seen.add(number);
+    result.push(node);
+  }
+  return result;
+}
+
+export function geometryProgressIndex(lat, lng, geometry) {
+  if (!geometry?.length || geometry.length < 2) return 0;
+  let bestI = 0;
+  let bestD = Infinity;
+  const step = Math.max(1, Math.floor(geometry.length / 80));
+  for (let index = 0; index < geometry.length - 1; index += step) {
+    const a = geometry[index];
+    const b = geometry[index + 1];
+    const dist = pointToSegmentM(lat, lng, a[0], a[1], b[0], b[1]);
+    if (dist < bestD) {
+      bestD = dist;
+      bestI = index;
+    }
+  }
+  return bestI;
+}
+
+/** Voeg knooppunten toe die op de route liggen maar ontbreken in de keten. */
+export function supplementChainOnGeometry(chain, pool, geometry, maxM = 650) {
+  if (!chain?.length || !geometry?.length) return chain || [];
+  const result = chain.map((node) => ({ ...node }));
+  const seenNumbers = new Set(
+    result.map((node) => String(node.number || "")).filter(Boolean),
+  );
+  for (const node of pool || []) {
+    const number = String(node?.number || "");
+    if (!number || seenNumbers.has(number)) continue;
+    const lat = Number(node.lat);
+    const lng = Number(node.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (!knoopOnGeometry(node, geometry, maxM)) continue;
+    if (result.some((existing) => knoopMatches(existing, node, 80))) continue;
+    const progress = geometryProgressIndex(lat, lng, geometry);
+    let insertAt = result.length;
+    for (let index = 0; index < result.length; index += 1) {
+      const existingProgress = geometryProgressIndex(
+        Number(result[index].lat),
+        Number(result[index].lng),
+        geometry,
+      );
+      if (existingProgress > progress) {
+        insertAt = index;
+        break;
+      }
+    }
+    result.splice(insertAt, 0, { ...node });
+    seenNumbers.add(number);
+  }
+  return dedupeRevisitedNumbers(result);
+}
+
 export function dedupeNearbyPoints(points, minM = 700) {
   const kept = [];
   for (const point of points || []) {
@@ -200,18 +263,105 @@ export function pointToSegmentM(px, py, ax, ay, bx, by) {
   return Math.hypot(x - t * dx, y - t * dy);
 }
 
+export function snapToSegment(lat, lng, ax, ay, bx, by) {
+  const latScale = 111_000;
+  const lngScale = 111_000 * Math.cos(((ay + by) / 2) * (Math.PI / 180));
+  const x = (lat - ax) * latScale;
+  const y = (lng - ay) * lngScale;
+  const dx = (bx - ax) * latScale;
+  const dy = (by - ay) * lngScale;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) {
+    return { lat: ax, lng: ay, dist: Math.hypot(x, y) };
+  }
+  const t = Math.max(0, Math.min(1, (x * dx + y * dy) / len2));
+  const snapLat = ax + t * (bx - ax);
+  const snapLng = ay + t * (by - ay);
+  const dist = Math.hypot((lat - snapLat) * latScale, (lng - snapLng) * lngScale);
+  return { lat: snapLat, lng: snapLng, dist };
+}
+
+export function snapNodeOnGeometry(node, geometry, maxM = 70) {
+  if (!node || !geometry?.length || geometry.length < 2) return null;
+  const lat = Number(node.lat);
+  const lng = Number(node.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  let best = { lat, lng, dist: Infinity };
+  const step = geometry.length <= 500 ? 1 : Math.max(1, Math.floor(geometry.length / 160));
+  for (let index = 0; index < geometry.length - 1; index += step) {
+    const a = geometry[index];
+    const b = geometry[index + 1];
+    const snapped = snapToSegment(lat, lng, a[0], a[1], b[0], b[1]);
+    if (snapped.dist < best.dist) best = snapped;
+  }
+  if (best.dist > maxM) return null;
+  return { ...node, lat: best.lat, lng: best.lng };
+}
+
 export function knoopOnGeometry(node, geometry, maxM = 650) {
   if (!node || !geometry?.length || geometry.length < 2) return false;
   const lat = Number(node.lat);
   const lng = Number(node.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
-  const step = Math.max(1, Math.floor(geometry.length / 48));
+  const step =
+    geometry.length <= 500 ? 1 : Math.max(1, Math.floor(geometry.length / 160));
   for (let index = 0; index < geometry.length - 1; index += step) {
     const a = geometry[index];
     const b = geometry[index + 1];
     if (pointToSegmentM(lat, lng, a[0], a[1], b[0], b[1]) <= maxM) return true;
   }
+  const last = geometry[geometry.length - 1];
+  if (pointToSegmentM(lat, lng, last[0], last[1], last[0], last[1]) <= maxM) return true;
   return false;
+}
+
+/** Markers op de kaart: keten + knooppunten die op de route-lijn liggen. */
+export function knooppuntenForMap(chain, pool, geometry) {
+  if (!chain?.length && !geometry?.length) return [];
+  const merged = mergeMapKnooppunten(pool, chain || [], chain || [], geometry);
+  const onRoute = merged.filter((node) => node.on_route);
+  const byNumber = new Map();
+  for (const node of onRoute) {
+    const number = String(node.number || "");
+    if (!number) continue;
+    const existing = byNumber.get(number);
+    if (!existing) {
+      byNumber.set(number, node);
+      continue;
+    }
+    if (
+      geometry?.length > 1 &&
+      knoopOnGeometry(node, geometry) &&
+      !knoopOnGeometry(existing, geometry)
+    ) {
+      byNumber.set(number, node);
+    }
+  }
+  return [...byNumber.values()];
+}
+
+export function geometryCenterRadius(geometry) {
+  if (!geometry?.length) return null;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+  for (const [lat, lng] of geometry) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+    minLng = Math.min(minLng, lng);
+    maxLng = Math.max(maxLng, lng);
+  }
+  if (!Number.isFinite(minLat)) return null;
+  const centerLat = (minLat + maxLat) / 2;
+  const centerLng = (minLng + maxLng) / 2;
+  const spanM = haversine(
+    { lat: minLat, lng: minLng },
+    { lat: maxLat, lng: maxLng },
+  );
+  const radius = Math.min(18000, Math.max(6000, Math.round(spanM / 2 + 3500)));
+  return { lat: centerLat, lng: centerLng, radius };
 }
 
 export function mergeMapKnooppunten(nearby, routeNodes, pinned = [], geometry = null) {

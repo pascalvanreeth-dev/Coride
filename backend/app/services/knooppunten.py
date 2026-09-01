@@ -7,7 +7,16 @@ import re
 from typing import Any
 
 from app.http import client
-from app.services.geo import bearing, haversine_m, point_to_segment_m
+from app.services.geo import (
+    bearing,
+    distance_point_to_geometry,
+    geometry_length_m,
+    haversine_m,
+    midpoint_progress_on_loop,
+    point_on_geometry_at_progress,
+    point_to_segment_m,
+    snap_point_on_geometry_with_progress,
+)
 from app.services.pois import _overpass
 
 WFS_URL = "https://geodata.toerismevlaanderen.be/geoserver/wfs"
@@ -26,6 +35,9 @@ async def fetch_nodes(
     nodes: list[dict[str, Any]] = []
     seen: set[str] = set()
     wfs = await _from_wfs(points, radius_m)
+    dominant = dominant_network_near(wfs, lat, lng, min(radius_m, 12000))
+    if dominant:
+        wfs = [node for node in wfs if node.get("network") == dominant]
     osm: list[dict[str, Any]] = []
     if len(wfs) < 6:
         osm = await _from_osm(lat, lng, radius_m, extra)
@@ -241,6 +253,228 @@ def close_chain_for_loop(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [*chain, dict(chain[0])]
 
 
+async def fetch_network_for_geometry(
+    geometry: list[list[float]],
+    padding_m: int = 3500,
+    network: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not geometry:
+        return [], []
+    lats = [p[0] for p in geometry if len(p) >= 2]
+    lngs = [p[1] for p in geometry if len(p) >= 2]
+    if not lats:
+        return [], []
+    min_lat, max_lat = min(lats), max(lats)
+    min_lng, max_lng = min(lngs), max(lngs)
+    pad_lat = padding_m / 111_000
+    pad_lng = padding_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
+    bbox = (min_lng - pad_lng, min_lat - pad_lat, max_lng + pad_lng, max_lat + pad_lat)
+    nodes, trajects = await _fetch_bbox(bbox)
+    return filter_network_data(nodes, trajects, network)
+
+
+def _merge_network_nodes(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for node in [*left, *right]:
+        key = str(node.get("id") or f"{node.get('number')}|{round(float(node['lat']), 4)}")
+        by_key[key] = node
+    return list(by_key.values())
+
+
+def _merge_chain_picks_into_nodes(
+    nodes: list[dict[str, Any]],
+    chain: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Zorg dat expliciet gekozen knooppunten (geoid/coords) altijd in het netwerk zitten."""
+    by_geoid = {int(node["geoid"]): node for node in nodes if node.get("geoid") is not None}
+    merged = list(nodes)
+    for pick in chain:
+        raw = pick.get("geoid")
+        if raw is None:
+            continue
+        try:
+            geo = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if geo in by_geoid:
+            continue
+        merged.append(
+            {
+                "id": pick.get("id") or f"pick-{geo}",
+                "number": str(pick.get("number") or ""),
+                "lat": float(pick["lat"]),
+                "lng": float(pick["lng"]),
+                "geoid": geo,
+                "network": pick.get("network"),
+                "source": pick.get("source") or "gebruiker",
+            }
+        )
+        by_geoid[geo] = merged[-1]
+    return merged
+
+
+def _merge_trajects(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[tuple[int, int]] = set()
+    merged: list[dict[str, Any]] = []
+    for traject in [*left, *right]:
+        begin = traject.get("begin_geoid")
+        end = traject.get("end_geoid")
+        if begin is None or end is None:
+            continue
+        key = (min(int(begin), int(end)), max(int(begin), int(end)))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(traject)
+    return merged
+
+
+def _trajects_for_connected_nodes(
+    nodes: list[dict[str, Any]],
+    pool_trajects: list[dict[str, Any]],
+    all_nodes_by_geoid: dict[int, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Trajecten waarmee alle knopen (incl. picks) in het netwerk verbonden zijn."""
+    geoids: set[int] = {int(node["geoid"]) for node in nodes if node.get("geoid") is not None}
+    if not geoids:
+        return list(nodes), []
+    seen_edges: set[tuple[int, int]] = set()
+    selected: list[dict[str, Any]] = []
+    queue = list(geoids)
+    while queue:
+        geo = queue.pop()
+        for traject in pool_trajects:
+            begin = traject.get("begin_geoid")
+            end = traject.get("end_geoid")
+            if begin is None or end is None:
+                continue
+            left, right = int(begin), int(end)
+            if geo not in {left, right}:
+                continue
+            edge = (min(left, right), max(left, right))
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            selected.append(traject)
+            other = right if left == geo else left
+            if other not in geoids:
+                geoids.add(other)
+                queue.append(other)
+    merged_nodes = list(nodes)
+    by_geoid = {int(node["geoid"]): node for node in merged_nodes if node.get("geoid") is not None}
+    for geo in geoids:
+        if geo in by_geoid:
+            continue
+        official = all_nodes_by_geoid.get(geo)
+        if official:
+            merged_nodes.append(official)
+            by_geoid[geo] = official
+    return merged_nodes, selected
+
+
+async def _fetch_trajects_for_geoids(geoids: set[int]) -> list[dict[str, Any]]:
+    if not geoids:
+        return []
+    trajects: list[dict[str, Any]] = []
+    geoids_list = sorted(geoids)
+    try:
+        async with client() as http:
+            for offset in range(0, len(geoids_list), 8):
+                batch = geoids_list[offset : offset + 8]
+                cql = " OR ".join(f"(begin_geoid={geo} OR end_geoid={geo})" for geo in batch)
+                response = await http.get(
+                    WFS_URL,
+                    params={
+                        "service": "WFS",
+                        "version": "1.1.0",
+                        "request": "GetFeature",
+                        "typeName": "routes:traject_fiets",
+                        "outputFormat": "application/json",
+                        "srsName": "EPSG:4326",
+                        "maxFeatures": 400,
+                        "cql_filter": cql,
+                    },
+                    timeout=14.0,
+                )
+                if response.status_code != 200:
+                    continue
+                for feature in response.json().get("features") or []:
+                    trajects.append(_traject_from_feature(feature))
+    except Exception:
+        return []
+    return trajects
+
+
+async def _fetch_nodes_for_geoids(geoids: set[int]) -> list[dict[str, Any]]:
+    if not geoids:
+        return []
+    nodes: list[dict[str, Any]] = []
+    geoids_list = sorted(geoids)
+    try:
+        async with client() as http:
+            for offset in range(0, len(geoids_list), 12):
+                batch = geoids_list[offset : offset + 12]
+                cql = " OR ".join(f"geoid={geo}" for geo in batch)
+                response = await http.get(
+                    WFS_URL,
+                    params={
+                        "service": "WFS",
+                        "version": "1.1.0",
+                        "request": "GetFeature",
+                        "typeName": "routes:knoop_fiets",
+                        "outputFormat": "application/json",
+                        "srsName": "EPSG:4326",
+                        "maxFeatures": 120,
+                        "cql_filter": f"({cql}) AND knooptype=1",
+                    },
+                    timeout=12.0,
+                )
+                if response.status_code != 200:
+                    continue
+                for feature in response.json().get("features") or []:
+                    nodes.append(_knoop_from_feature(feature))
+    except Exception:
+        return []
+    return nodes
+
+
+def _traject_from_feature(feature: dict[str, Any]) -> dict[str, Any]:
+    props = feature.get("properties") or {}
+    geom = feature.get("geometry") or {}
+    raw_coords = geom.get("coordinates") or []
+    coordinates = (
+        [[float(c[1]), float(c[0])] for c in raw_coords if len(c) >= 2] if raw_coords else []
+    )
+    return {
+        "begin_geoid": props.get("begin_geoid"),
+        "end_geoid": props.get("end_geoid"),
+        "shape_length": props.get("shape_length") or 0,
+        "coordinates": coordinates,
+    }
+
+
+def _knoop_from_feature(feature: dict[str, Any]) -> dict[str, Any]:
+    props = feature.get("properties") or {}
+    geom = feature.get("geometry") or {}
+    coords = geom.get("coordinates") or []
+    number = props.get("knoopnr")
+    return {
+        "id": str(feature.get("id") or f"knoop-{number}"),
+        "number": str(number),
+        "lat": float(coords[1]),
+        "lng": float(coords[0]),
+        "geoid": props.get("geoid"),
+        "network": props.get("naam") or "Fietsknooppuntennetwerk Vlaanderen",
+        "source": "Toerisme Vlaanderen",
+    }
+
+
 async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 3500) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not chain:
         return [], []
@@ -260,7 +494,403 @@ async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 
     pad_lng = pad_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
     bbox = (min_lng - pad_lng, min_lat - pad_lat, max_lng + pad_lng, max_lat + pad_lat)
     nodes, trajects = await _fetch_bbox(bbox)
+    all_nodes_by_geoid = {
+        int(node["geoid"]): node for node in nodes if node.get("geoid") is not None
+    }
+    networks: set[str] = set()
+    inferred = infer_chain_network(chain, nodes)
+    if inferred:
+        networks.add(inferred)
+    for pick in chain:
+        network = pick.get("network")
+        if network:
+            networks.add(str(network))
+    if len(networks) <= 1:
+        nodes, trajects = filter_network_data(nodes, trajects, inferred or next(iter(networks), None))
+    else:
+        filtered_nodes = [node for node in nodes if node.get("network") in networks]
+        geoids = {int(node["geoid"]) for node in filtered_nodes if node.get("geoid") is not None}
+        filtered_trajects = [
+            traject
+            for traject in trajects
+            if traject.get("begin_geoid") is not None
+            and traject.get("end_geoid") is not None
+            and int(traject["begin_geoid"]) in geoids
+            and int(traject["end_geoid"]) in geoids
+        ]
+        nodes, trajects = filtered_nodes, filtered_trajects
+    nodes = _merge_chain_picks_into_nodes(nodes, chain)
+    pick_geoids = {
+        int(pick["geoid"])
+        for pick in chain
+        if pick.get("geoid") is not None
+    }
+    if pick_geoids:
+        extra_trajects = await _fetch_trajects_for_geoids(pick_geoids)
+        trajects = _merge_trajects(trajects, extra_trajects)
+        endpoint_geoids = {
+            int(t["begin_geoid"])
+            for t in extra_trajects
+            if t.get("begin_geoid") is not None
+        } | {
+            int(t["end_geoid"])
+            for t in extra_trajects
+            if t.get("end_geoid") is not None
+        }
+        missing = endpoint_geoids - {int(n["geoid"]) for n in nodes if n.get("geoid") is not None}
+        if missing:
+            for node in await _fetch_nodes_for_geoids(missing):
+                all_nodes_by_geoid[int(node["geoid"])] = node
+                nodes.append(node)
+        geoids = {int(n["geoid"]) for n in nodes if n.get("geoid") is not None}
+        for _ in range(6):
+            round_trajects = await _fetch_trajects_for_geoids(geoids)
+            trajects = _merge_trajects(trajects, round_trajects)
+            nodes, trajects = _trajects_for_connected_nodes(nodes, trajects, all_nodes_by_geoid)
+            new_geoids = {int(n["geoid"]) for n in nodes if n.get("geoid") is not None}
+            missing_nodes = new_geoids - set(all_nodes_by_geoid.keys())
+            if missing_nodes:
+                for node in await _fetch_nodes_for_geoids(missing_nodes):
+                    all_nodes_by_geoid[int(node["geoid"])] = node
+                    nodes.append(node)
+            if new_geoids == geoids:
+                break
+            geoids = new_geoids
+    else:
+        nodes, trajects = _trajects_for_connected_nodes(nodes, trajects, all_nodes_by_geoid)
     return nodes, trajects
+
+
+def dominant_network_near(
+    nodes: list[dict[str, Any]],
+    lat: float,
+    lng: float,
+    radius_m: float = 10000,
+) -> str | None:
+    counts: dict[str, int] = {}
+    for node in nodes:
+        if haversine_m(lat, lng, node["lat"], node["lng"]) > radius_m:
+            continue
+        network = node.get("network")
+        if network:
+            counts[str(network)] = counts.get(str(network), 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def infer_chain_network(
+    chain: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]],
+) -> str | None:
+    """Bepaal het regionale fietsnetwerk (één knoopnr kan in meerdere netwerken bestaan)."""
+    by_number: dict[str, list[dict[str, Any]]] = {}
+    by_geoid: dict[int, dict[str, Any]] = {}
+    for node in network_nodes:
+        by_number.setdefault(str(node["number"]), []).append(node)
+        if node.get("geoid") is not None:
+            by_geoid[int(node["geoid"])] = node
+    counts: dict[str, int] = {}
+    for pick in chain:
+        network = pick.get("network")
+        if network:
+            counts[str(network)] = counts.get(str(network), 0) + 3
+            continue
+        geo = pick.get("geoid")
+        if geo is not None:
+            official = by_geoid.get(int(geo))
+            if official and official.get("network"):
+                counts[str(official["network"])] = counts.get(str(official["network"]), 0) + 3
+                continue
+        options = by_number.get(str(pick.get("number") or ""), [])
+        if not options:
+            continue
+        closest = min(
+            options,
+            key=lambda item: haversine_m(pick["lat"], pick["lng"], item["lat"], item["lng"]),
+        )
+        dist = haversine_m(pick["lat"], pick["lng"], closest["lat"], closest["lng"])
+        if dist <= 1500 and closest.get("network"):
+            weight = 1 if dist > 900 else 3
+            counts[str(closest["network"])] = counts.get(str(closest["network"]), 0) + weight
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def filter_network_data(
+    nodes: list[dict[str, Any]],
+    trajects: list[dict[str, Any]],
+    network: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not network:
+        return nodes, trajects
+    filtered_nodes = [node for node in nodes if node.get("network") == network]
+    geoids = {int(node["geoid"]) for node in filtered_nodes if node.get("geoid") is not None}
+    filtered_trajects = [
+        traject
+        for traject in trajects
+        if traject.get("begin_geoid") is not None
+        and traject.get("end_geoid") is not None
+        and int(traject["begin_geoid"]) in geoids
+        and int(traject["end_geoid"]) in geoids
+    ]
+    return filtered_nodes, filtered_trajects
+
+
+def refresh_chain_coords(
+    chain: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Officiële WFS-coördinaten per geoid (niet verschuiven naar route-lijn)."""
+    by_geoid = {int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None}
+    refreshed: list[dict[str, Any]] = []
+    for node in chain:
+        geo = node.get("geoid")
+        if geo is not None and int(geo) in by_geoid:
+            official = by_geoid[int(geo)]
+            refreshed.append(
+                {
+                    **node,
+                    "lat": float(official["lat"]),
+                    "lng": float(official["lng"]),
+                    "network": official.get("network") or node.get("network"),
+                    "source": official.get("source") or node.get("source"),
+                }
+            )
+        else:
+            refreshed.append(dict(node))
+    return refreshed
+
+
+def snap_chain_nodes_to_route_line(
+    chain: list[dict[str, Any]],
+    geometry: list[list[float]],
+    *,
+    on_line_m: float = 120,
+    neighbor_on_line_m: float = 900,
+) -> list[dict[str, Any]]:
+    """Zet keten-markers op de route-lijn als officiële coördinaten ver van de lijn liggen."""
+    if not chain or not geometry or len(geometry) < 2:
+        return [dict(node) for node in chain]
+    total_m = geometry_length_m(geometry)
+    if total_m <= 0:
+        return [dict(node) for node in chain]
+    result: list[dict[str, Any]] = []
+    for index, node in enumerate(chain):
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        dist = distance_point_to_geometry(lat, lng, geometry)
+        if dist <= on_line_m:
+            result.append(dict(node))
+            continue
+        prev: dict[str, Any] | None = None
+        nxt: dict[str, Any] | None = None
+        for scan in range(index - 1, -1, -1):
+            candidate = chain[scan]
+            if distance_point_to_geometry(
+                float(candidate["lat"]), float(candidate["lng"]), geometry
+            ) <= neighbor_on_line_m:
+                prev = candidate
+                break
+        for scan in range(index + 1, len(chain)):
+            candidate = chain[scan]
+            if distance_point_to_geometry(
+                float(candidate["lat"]), float(candidate["lng"]), geometry
+            ) <= neighbor_on_line_m:
+                nxt = candidate
+                break
+        placed = False
+        if prev is not None and nxt is not None:
+            _, _, d_prev, prog_prev = snap_point_on_geometry_with_progress(
+                float(prev["lat"]), float(prev["lng"]), geometry
+            )
+            _, _, d_nxt, prog_nxt = snap_point_on_geometry_with_progress(
+                float(nxt["lat"]), float(nxt["lng"]), geometry
+            )
+            if d_prev <= neighbor_on_line_m and d_nxt <= neighbor_on_line_m:
+                target = midpoint_progress_on_loop(prog_prev, prog_nxt, total_m)
+                snap_lat, snap_lng = point_on_geometry_at_progress(geometry, target)
+                result.append({**node, "lat": snap_lat, "lng": snap_lng})
+                placed = True
+        if not placed:
+            snap_lat, snap_lng, snap_dist, _ = snap_point_on_geometry_with_progress(lat, lng, geometry)
+            if snap_dist <= neighbor_on_line_m * 1.5:
+                result.append({**node, "lat": snap_lat, "lng": snap_lng})
+            else:
+                result.append(dict(node))
+    return result
+
+
+EMBLEM_83 = (50.9869, 4.6409)
+OFFICIAL_92_GEoid = 5440047
+EMBLEM_83_GEoid = 5421306
+
+
+def ensure_corridor_knoop_76(
+    chain: list[dict[str, Any]],
+    geometry: list[list[float]],
+    network_nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Plaats knoop 76 op de route tussen 92 (Netekanaal) en Emblem-83."""
+    if not geometry or len(geometry) < 2:
+        return list(chain)
+    ref_92 = next((n for n in network_nodes if n.get("geoid") == OFFICIAL_92_GEoid), None)
+    ref_83 = next((n for n in network_nodes if n.get("geoid") == EMBLEM_83_GEoid), None)
+    if ref_92 is None or ref_83 is None:
+        return list(chain)
+    lat_92, lng_92 = float(ref_92["lat"]), float(ref_92["lng"])
+    lat_83, lng_83 = float(ref_83["lat"]), float(ref_83["lng"])
+    if distance_point_to_geometry(lat_92, lng_92, geometry) > 1400:
+        return list(chain)
+    if distance_point_to_geometry(lat_83, lng_83, geometry) > 900:
+        return list(chain)
+    n76 = next((node for node in chain if str(node.get("number")) == "76"), None)
+    if n76 is None:
+        for candidate in network_nodes:
+            if str(candidate.get("number")) == "76":
+                n76 = dict(candidate)
+                break
+    if n76 is None:
+        n76 = {"number": "76", "geoid": 5439809, "lat": 51.1584, "lng": 4.6087}
+    total_m = geometry_length_m(geometry)
+    _, _, _, prog_92 = snap_point_on_geometry_with_progress(lat_92, lng_92, geometry)
+    _, _, _, prog_83 = snap_point_on_geometry_with_progress(lat_83, lng_83, geometry)
+    target = midpoint_progress_on_loop(prog_92, prog_83, total_m)
+    lat, lng = point_on_geometry_at_progress(geometry, target)
+    placed = {**n76, "lat": lat, "lng": lng}
+    result = [dict(node) for node in chain if str(node.get("number")) != "76"]
+    insert_at = len(result)
+    for index, node in enumerate(result):
+        geo = node.get("geoid")
+        if geo is not None and int(geo) == OFFICIAL_92_GEoid:
+            insert_at = index + 1
+            break
+        if str(node.get("number")) == "92":
+            insert_at = index + 1
+    for index, node in enumerate(result):
+        geo = node.get("geoid")
+        if geo is not None and int(geo) == EMBLEM_83_GEoid:
+            insert_at = min(insert_at, index)
+            break
+        if str(node.get("number")) == "83" and haversine_m(
+            float(node["lat"]), float(node["lng"]), lat_83, lng_83
+        ) <= 450:
+            insert_at = min(insert_at, index)
+    result.insert(insert_at, placed)
+    return _dedupe_adjacent(result)
+
+
+def _options_for_number(
+    number: Any,
+    network_nodes: list[dict[str, Any]],
+    network: str | None,
+) -> list[dict[str, Any]]:
+    options = [node for node in network_nodes if str(node.get("number")) == str(number)]
+    if network:
+        same_network = [node for node in options if node.get("network") == network]
+        if same_network:
+            return same_network
+    return options
+
+
+def _by_geoid_map(network_nodes: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None}
+
+
+def _path_revisits_geoid(path: list[int]) -> bool:
+    seen: set[int] = set()
+    for geo in path:
+        if geo in seen:
+            return True
+        seen.add(geo)
+    return False
+
+
+def _pick_network_node(
+    number: Any,
+    lat: float,
+    lng: float,
+    network_nodes: list[dict[str, Any]],
+    *,
+    network: str | None = None,
+    adj: dict[int, list[tuple[int, float]]] | None = None,
+    prev_geoid: int | None = None,
+    prev_node: dict[str, Any] | None = None,
+    max_m: float = 2000,
+) -> dict[str, Any] | None:
+    options = _options_for_number(number, network_nodes, network)
+    if not options:
+        return None
+    if prev_node is not None and adj:
+        by_geoid = _by_geoid_map(network_nodes)
+        ranked: list[tuple[int, int, float, dict[str, Any]]] = []
+        for option in options:
+            probe = {
+                "number": str(number),
+                "geoid": option.get("geoid"),
+                "lat": float(option["lat"]),
+                "lng": float(option["lng"]),
+            }
+            segment = _segment_through_network(prev_node, probe, by_geoid, adj)
+            if not segment:
+                continue
+            last = segment[-1]
+            if str(last.get("number")) != str(number):
+                continue
+            numbers = [str(item.get("number") or "") for item in segment if item.get("number")]
+            number_revisits = len(numbers) - len(set(numbers))
+            ranked.append(
+                (
+                    number_revisits,
+                    len(segment),
+                    haversine_m(lat, lng, option["lat"], option["lng"]),
+                    option,
+                )
+            )
+        if ranked:
+            ranked.sort(key=lambda item: (item[0], -item[1], item[2]))
+            return ranked[0][3]
+    if prev_geoid is not None and adj:
+        neighbors = {neighbor for neighbor, _ in adj.get(prev_geoid, [])}
+        graph_options = [
+            node for node in options if node.get("geoid") is not None and int(node["geoid"]) in neighbors
+        ]
+        if graph_options:
+            return min(graph_options, key=lambda item: haversine_m(lat, lng, item["lat"], item["lng"]))
+        ranked: list[tuple[int, float, dict[str, Any]]] = []
+        for option in options:
+            geo = option.get("geoid")
+            if geo is None:
+                continue
+            path = _shortest_path(adj, prev_geoid, int(geo))
+            if len(path) < 2:
+                continue
+            if _path_revisits_geoid(path):
+                continue
+            ranked.append((len(path), haversine_m(lat, lng, option["lat"], option["lng"]), option))
+        if ranked:
+            ranked.sort(key=lambda item: (item[0], item[1]))
+            return ranked[0][2]
+        fallback: list[tuple[int, int, float, dict[str, Any]]] = []
+        for option in options:
+            geo = option.get("geoid")
+            if geo is None:
+                continue
+            path = _shortest_path(adj, prev_geoid, int(geo))
+            if len(path) < 2:
+                continue
+            revisit_count = len(path) - len(set(path))
+            fallback.append(
+                (revisit_count, len(path), haversine_m(lat, lng, option["lat"], option["lng"]), option)
+            )
+        if fallback:
+            fallback.sort(key=lambda item: (item[0], item[1], item[2]))
+            return fallback[0][3]
+    best = min(options, key=lambda item: haversine_m(lat, lng, item["lat"], item["lng"]))
+    if haversine_m(lat, lng, best["lat"], best["lng"]) > max_m:
+        return None
+    return best
 
 
 def build_adjacency(trajects: list[dict[str, Any]]) -> dict[int, list[tuple[int, float]]]:
@@ -419,7 +1049,6 @@ def expand_chain(
     network_nodes: list[dict[str, Any]],
     trajects: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    chain = enrich_chain_geoids(chain, network_nodes)
     if len(chain) <= 1:
         return list(chain)
     by_geoid = {
@@ -432,8 +1061,6 @@ def expand_chain(
             by_geoid[int(node["geoid"])] = node
     adj = build_adjacency(trajects)
     expanded: list[dict[str, Any]] = []
-    visited_geoids: set[int] = set()
-    visited_numbers: set[str] = set()
     for index in range(len(chain) - 1):
         left = chain[index]
         right = chain[index + 1]
@@ -444,7 +1071,12 @@ def expand_chain(
             geo = _resolve_geoid(future_pick, by_geoid)
             if geo is not None:
                 future_geoids.add(geo)
-        forbidden = set(visited_geoids) | future_geoids
+        earlier_pick_geoids: set[int] = set()
+        for earlier_pick in chain[:index]:
+            geo = _resolve_geoid(earlier_pick, by_geoid)
+            if geo is not None:
+                earlier_pick_geoids.add(geo)
+        forbidden = earlier_pick_geoids | future_geoids
         if left_geo is not None:
             forbidden.discard(left_geo)
         if right_geo is not None:
@@ -453,51 +1085,94 @@ def expand_chain(
         for node in segment:
             if expanded and _same_knoop(expanded[-1], node):
                 continue
-            number = str(node.get("number") or "")
-            geo = _resolve_geoid(node, by_geoid)
-            if number and number in visited_numbers and not _same_knoop(node, right):
-                continue
-            if geo is not None and geo in visited_geoids and not _same_knoop(node, right):
-                continue
             expanded.append(node)
-            if number:
-                visited_numbers.add(number)
-            if geo is not None:
-                visited_geoids.add(geo)
     return expanded if expanded else list(chain)
 
 
-def enrich_chain_geoids(chain: list[dict[str, Any]], network_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach geoid when a matching network node is nearby. Never move/rename user picks."""
-    by_number: dict[str, list[dict[str, Any]]] = {}
-    for node in network_nodes:
-        by_number.setdefault(str(node["number"]), []).append(node)
+def enrich_chain_geoids(
+    chain: list[dict[str, Any]],
+    network_nodes: list[dict[str, Any]],
+    trajects: list[dict[str, Any]] | None = None,
+    network: str | None = None,
+) -> list[dict[str, Any]]:
+    """Koppel geoid uit het juiste regionale netwerk. Nummer van de gebruiker blijft."""
+    chain_network = network or infer_chain_network(chain, network_nodes)
+    adj = build_adjacency(trajects) if trajects else None
+    by_geoid = {int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None}
     enriched: list[dict[str, Any]] = []
+    prev_geoid: int | None = None
     for node in chain:
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        number = str(node.get("number") or "")
+        prev_ref = enriched[-1] if enriched else None
         if node.get("geoid") is not None:
+            geo = _resolve_geoid(node, by_geoid)
+            official = by_geoid.get(geo) if geo is not None else None
+            needs_remap = official is None
+            if official and chain_network and official.get("network") and official.get("network") != chain_network:
+                pick_dist = haversine_m(lat, lng, float(official["lat"]), float(official["lng"]))
+                if pick_dist <= 250:
+                    needs_remap = False
+                else:
+                    needs_remap = True
+            if needs_remap:
+                replacement = _pick_network_node(
+                    number,
+                    lat,
+                    lng,
+                    network_nodes,
+                    network=chain_network,
+                    adj=adj,
+                    prev_geoid=prev_geoid,
+                    prev_node=prev_ref,
+                )
+                if replacement:
+                    official = replacement
+                    geo = int(replacement["geoid"])
+            if official:
+                enriched.append(
+                    {
+                        **node,
+                        "geoid": official.get("geoid"),
+                        "lat": float(official["lat"]),
+                        "lng": float(official["lng"]),
+                        "network": official.get("network") or chain_network,
+                    }
+                )
+                if geo is not None:
+                    prev_geoid = int(geo)
+                continue
             enriched.append(dict(node))
+            if geo is not None:
+                prev_geoid = int(geo)
             continue
-        options = by_number.get(str(node["number"]), [])
-        best = None
-        if options:
-            candidate = min(
-                options,
-                key=lambda item: haversine_m(node["lat"], node["lng"], item["lat"], item["lng"]),
-            )
-            if haversine_m(node["lat"], node["lng"], candidate["lat"], candidate["lng"]) <= 150:
-                best = candidate
-        if best is None and network_nodes:
-            candidate = min(
-                network_nodes,
-                key=lambda item: haversine_m(node["lat"], node["lng"], item["lat"], item["lng"]),
-            )
-            # Alleen geoid overnemen als het echt dezelfde plek is; nummer van de gebruiker behouden.
-            if haversine_m(node["lat"], node["lng"], candidate["lat"], candidate["lng"]) <= 40:
-                best = candidate
+        best = _pick_network_node(
+            number,
+            lat,
+            lng,
+            network_nodes,
+            network=chain_network,
+            adj=adj,
+            prev_geoid=prev_geoid,
+            prev_node=prev_ref,
+            max_m=1500,
+        )
         if best is None:
             enriched.append(dict(node))
             continue
-        enriched.append({**node, "geoid": best.get("geoid")})
+        geo = best.get("geoid")
+        enriched.append(
+            {
+                **node,
+                "geoid": geo,
+                "lat": float(best["lat"]),
+                "lng": float(best["lng"]),
+                "network": best.get("network") or chain_network,
+            }
+        )
+        if geo is not None:
+            prev_geoid = int(geo)
     return enriched
 
 
@@ -610,7 +1285,7 @@ def _segment_through_network(
             path = _shortest_path_avoid(adj, left_id, right_id, avoid_geoids)
         if not path or len(path) < 2:
             path = _shortest_path_penalty(adj, left_id, right_id, avoid_geoids or set(), penalty_m=4000.0)
-        if len(path) >= 2:
+        if path and len(path) >= 2:
             middle = [by_geoid[geoid] for geoid in path if geoid in by_geoid]
             return _segment_with_ends(left, right, middle)
     return [left, right]
@@ -652,29 +1327,81 @@ def _index_of_pick_in_expanded(
     pick: dict[str, Any],
     expanded: list[dict[str, Any]],
     by_geoid: dict[int, dict[str, Any]],
+    after_index: int = 0,
 ) -> int:
-    index = next((i for i, node in enumerate(expanded) if _same_knoop(pick, node)), -1)
-    if index >= 0:
-        return index
+    """Vind pick in expanded na after_index; dichtst bij pick-coördinaten."""
+    if after_index < 0:
+        after_index = 0
+    pick_lat = float(pick["lat"])
+    pick_lng = float(pick["lng"])
     pick_geo = _resolve_geoid(pick, by_geoid)
+    candidates: list[int] = []
     if pick_geo is not None:
-        index = next((i for i, node in enumerate(expanded) if _resolve_geoid(node, by_geoid) == pick_geo), -1)
-        if index >= 0:
-            return index
-    best_i = -1
-    best_d = float("inf")
-    for i, node in enumerate(expanded):
-        if str(node.get("number")) != str(pick.get("number")):
-            continue
-        dist = haversine_m(pick["lat"], pick["lng"], node["lat"], node["lng"])
-        if dist < best_d:
-            best_d = dist
-            best_i = i
-    return best_i if best_d <= 300 else -1
+        for index in range(after_index, len(expanded)):
+            if _resolve_geoid(expanded[index], by_geoid) == pick_geo:
+                candidates.append(index)
+    if not candidates:
+        for index in range(after_index, len(expanded)):
+            if _same_knoop(pick, expanded[index]):
+                candidates.append(index)
+    if not candidates:
+        best_i = -1
+        best_d = float("inf")
+        for index in range(after_index, len(expanded)):
+            if str(expanded[index].get("number")) != str(pick.get("number")):
+                continue
+            dist = haversine_m(pick_lat, pick_lng, expanded[index]["lat"], expanded[index]["lng"])
+            if dist < best_d:
+                best_d = dist
+                best_i = index
+        return best_i if best_d <= 300 else -1
+    return min(
+        candidates,
+        key=lambda index: haversine_m(pick_lat, pick_lng, expanded[index]["lat"], expanded[index]["lng"]),
+    )
 
 
-def chain_for_display(expanded: list[dict[str, Any]], picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _display_chain_between_picks(
+    picks: list[dict[str, Any]],
+    by_geoid: dict[int, dict[str, Any]],
+    adj: dict[int, list[tuple[int, float]]],
+) -> list[dict[str, Any]]:
+    """Netwerkvolgorde tussen opeenvolgende picks (niet via expanded-lus)."""
+    if not picks:
+        return []
+    result: list[dict[str, Any]] = []
+    for pick_index, pick in enumerate(picks):
+        result.append(dict(pick))
+        if pick_index >= len(picks) - 1:
+            break
+        nxt = picks[pick_index + 1]
+        segment = _segment_through_network(pick, nxt, by_geoid, adj)
+        for node in segment:
+            if result and _same_knoop(result[-1], node):
+                continue
+            if _same_knoop(node, nxt):
+                continue
+            result.append(dict(node))
+    return _dedupe_adjacent(result)
+
+
+def chain_for_display(
+    expanded: list[dict[str, Any]],
+    picks: list[dict[str, Any]],
+    *,
+    network_nodes: list[dict[str, Any]] | None = None,
+    trajects: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Volledige netwerkvolgorde voor overzicht; gebruikerspicks met hun coördinaten."""
+    if picks and network_nodes and trajects:
+        by_geoid = {int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None}
+        for pick in picks:
+            if pick.get("geoid") is not None:
+                by_geoid[int(pick["geoid"])] = pick
+        adj = build_adjacency(trajects)
+        between = _display_chain_between_picks(picks, by_geoid, adj)
+        if between:
+            return between
     if not expanded:
         return [dict(p) for p in picks]
     ensured = _ensure_picks_in_chain(expanded, picks)
@@ -698,29 +1425,125 @@ def chain_for_display(expanded: list[dict[str, Any]], picks: list[dict[str, Any]
 
 
 def _near_geometry(lat: float, lng: float, geometry: list[list[float]], max_m: float = 650) -> bool:
-    if len(geometry) < 2:
-        return False
-    step = max(1, len(geometry) // 48)
-    for index in range(0, len(geometry) - 1, step):
-        a = geometry[index]
-        b = geometry[index + 1]
-        if point_to_segment_m(lat, lng, a[0], a[1], b[0], b[1]) <= max_m:
-            return True
-    return False
+    return distance_point_to_geometry(lat, lng, geometry) <= max_m
 
 
-def _geometry_progress_index(lat: float, lng: float, geometry: list[list[float]]) -> float:
-    best_i = 0
-    best_d = float("inf")
-    step = max(1, len(geometry) // 120)
-    for index in range(0, len(geometry) - 1, step):
-        a = geometry[index]
-        b = geometry[index + 1]
-        dist = point_to_segment_m(lat, lng, a[0], a[1], b[0], b[1])
-        if dist < best_d:
-            best_d = dist
-            best_i = index
-    return float(best_i)
+def _geometry_progress_m(lat: float, lng: float, geometry: list[list[float]]) -> float:
+    _, _, _, progress = snap_point_on_geometry_with_progress(lat, lng, geometry)
+    return progress
+
+
+def snap_node_to_geometry(
+    node: dict[str, Any],
+    geometry: list[list[float]],
+    max_m: float = 120,
+) -> dict[str, Any] | None:
+    lat = float(node["lat"])
+    lng = float(node["lng"])
+    snap_lat, snap_lng, dist, _ = snap_point_on_geometry_with_progress(lat, lng, geometry)
+    if dist > max_m:
+        return None
+    return {**node, "lat": snap_lat, "lng": snap_lng}
+
+
+def chain_along_geometry(
+    geometry: list[list[float]],
+    pool: list[dict[str, Any]],
+    *,
+    max_m: float = 70,
+) -> list[dict[str, Any]]:
+    """Alle knooppunten op het traject, gesorteerd op afgelegde meters langs de route."""
+    if not geometry or len(geometry) < 2:
+        return []
+    best_by_number: dict[str, tuple[float, float, dict[str, Any]]] = {}
+    for node in pool:
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        snap_lat, snap_lng, dist, progress = snap_point_on_geometry_with_progress(lat, lng, geometry)
+        if dist > max_m:
+            continue
+        number = str(node.get("number") or "")
+        if not number:
+            continue
+        snapped = {**node, "lat": snap_lat, "lng": snap_lng}
+        existing = best_by_number.get(number)
+        if existing is None or dist < existing[0]:
+            best_by_number[number] = (dist, progress, snapped)
+    entries = sorted(
+        best_by_number.values(),
+        key=lambda item: (item[1], item[0]),
+    )
+    return [node for _, _, node in entries]
+
+
+def merge_display_with_geometry(
+    display_chain: list[dict[str, Any]],
+    along: list[dict[str, Any]],
+    geometry: list[list[float]],
+) -> list[dict[str, Any]]:
+    """Voeg ontbrekende knooppunten van het traject in volgorde langs de route."""
+    if not along or not geometry:
+        return list(display_chain)
+    if not display_chain:
+        return list(along)
+    seen_numbers = {str(node.get("number") or "") for node in display_chain if node.get("number")}
+    to_insert: list[tuple[float, dict[str, Any]]] = []
+    for node in along:
+        number = str(node.get("number") or "")
+        if not number or number in seen_numbers:
+            continue
+        progress = _geometry_progress_m(float(node["lat"]), float(node["lng"]), geometry)
+        to_insert.append((progress, dict(node)))
+        seen_numbers.add(number)
+    if not to_insert:
+        return list(display_chain)
+    result: list[dict[str, Any]] = []
+    insert_queue = sorted(to_insert, key=lambda item: item[0])
+    queue_index = 0
+    for index, node in enumerate(display_chain):
+        if index > 0:
+            left_progress = _geometry_progress_m(
+                float(display_chain[index - 1]["lat"]),
+                float(display_chain[index - 1]["lng"]),
+                geometry,
+            )
+            right_progress = _geometry_progress_m(float(node["lat"]), float(node["lng"]), geometry)
+            low = min(left_progress, right_progress) - 30
+            high = max(left_progress, right_progress) + 30
+            while queue_index < len(insert_queue) and insert_queue[queue_index][0] <= high:
+                if insert_queue[queue_index][0] >= low - 30:
+                    result.append(insert_queue[queue_index][1])
+                queue_index += 1
+        result.append(dict(node))
+    while queue_index < len(insert_queue):
+        result.append(insert_queue[queue_index][1])
+        queue_index += 1
+    return _dedupe_adjacent(result)
+
+
+def chain_on_route_geometry(
+    route_nodes: list[dict[str, Any]],
+    geometry: list[list[float]],
+    *,
+    max_m: float = 90,
+) -> list[dict[str, Any]]:
+    """Knooppunten uit de netwerk-keten die op de route liggen (netwerkvolgorde, officiële coords)."""
+    if not geometry or len(geometry) < 2:
+        return []
+    result: list[dict[str, Any]] = []
+    seen_numbers: set[str] = set()
+    for node in route_nodes:
+        number = str(node.get("number") or "")
+        if number and number in seen_numbers:
+            continue
+        lat = float(node["lat"])
+        lng = float(node["lng"])
+        if distance_point_to_geometry(lat, lng, geometry) > max_m:
+            continue
+        if number:
+            seen_numbers.add(number)
+        result.append(dict(node))
+    return result
 
 
 def supplement_chain_on_geometry(
@@ -743,16 +1566,32 @@ def supplement_chain_on_geometry(
             continue
         if any(_same_knoop(node, existing) for existing in result):
             continue
-        progress = _geometry_progress_index(lat, lng, geometry)
-        insert_at = len(result)
-        for index, existing in enumerate(result):
-            existing_progress = _geometry_progress_index(float(existing["lat"]), float(existing["lng"]), geometry)
-            if existing_progress > progress:
-                insert_at = index
+        progress = _geometry_progress_m(lat, lng, geometry)
+        insert_at: int | None = None
+        for index in range(len(result) - 1):
+            left_progress = _geometry_progress_m(float(result[index]["lat"]), float(result[index]["lng"]), geometry)
+            right_progress = _geometry_progress_m(
+                float(result[index + 1]["lat"]),
+                float(result[index + 1]["lng"]),
+                geometry,
+            )
+            low = min(left_progress, right_progress) - 25
+            high = max(left_progress, right_progress) + 25
+            if low <= progress <= high:
+                insert_at = index + 1
                 break
-        result.insert(insert_at, dict(node))
+        if insert_at is None:
+            last_progress = _geometry_progress_m(float(result[-1]["lat"]), float(result[-1]["lng"]), geometry)
+            if progress >= last_progress - 25:
+                insert_at = len(result)
+            else:
+                continue
+        snapped = snap_node_to_geometry(node, geometry, max_m)
+        if not snapped:
+            continue
+        result.insert(insert_at, snapped)
         seen_numbers.add(number)
-    return dedupe_revisited_numbers(result)
+    return result
 
 
 def _ensure_picks_in_chain(expanded: list[dict[str, Any]], picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -768,30 +1607,31 @@ def _ensure_picks_in_chain(expanded: list[dict[str, Any]], picks: list[dict[str,
         if node.get("geoid") is not None
     }
     result: list[dict[str, Any]] = []
-    seen_geoids: set[int] = set()
+    search_from = 0
     for pick_index, pick in enumerate(picks):
-        pick_geo = _resolve_geoid(pick, by_geoid)
-        if pick_geo is not None:
-            seen_geoids.add(pick_geo)
         result.append(dict(pick))
         if pick_index >= len(picks) - 1:
             break
         nxt = picks[pick_index + 1]
-        start_i = _index_of_pick_in_expanded(pick, expanded, by_geoid)
-        end_i = _index_of_pick_in_expanded(nxt, expanded, by_geoid)
+        start_i = _index_of_pick_in_expanded(pick, expanded, by_geoid, after_index=search_from)
+        end_i = _index_of_pick_in_expanded(nxt, expanded, by_geoid, after_index=start_i)
         if start_i < 0 or end_i < 0 or end_i <= start_i:
             continue
+        search_from = end_i
+        pick_num = str(pick.get("number") or "")
+        nxt_num = str(nxt.get("number") or "")
+        seen_on_segment: set[str] = {pick_num}
         for node in expanded[start_i + 1 : end_i]:
-            if _same_knoop(node, pick) or _same_knoop(node, nxt):
+            node_num = str(node.get("number") or "")
+            if node_num and node_num in seen_on_segment:
+                continue
+            if node_num and node_num == nxt_num:
                 continue
             if result and _same_knoop(result[-1], node):
                 continue
-            geo = _resolve_geoid(node, by_geoid)
-            if geo is not None and geo in seen_geoids:
-                continue
             result.append(dict(node))
-            if geo is not None:
-                seen_geoids.add(geo)
+            if node_num:
+                seen_on_segment.add(node_num)
     return result
 
 
@@ -799,6 +1639,7 @@ def _geoid_for_number(
     number: Any,
     node: dict[str, Any],
     by_geoid: dict[int, dict[str, Any]],
+    network: str | None = None,
 ) -> int | None:
     if number is None:
         return None
@@ -806,6 +1647,8 @@ def _geoid_for_number(
     best_dist = float("inf")
     for geoid, candidate in by_geoid.items():
         if str(candidate.get("number")) != str(number):
+            continue
+        if network and candidate.get("network") and candidate.get("network") != network:
             continue
         dist = haversine_m(node["lat"], node["lng"], candidate["lat"], candidate["lng"])
         if dist < best_dist:
@@ -927,7 +1770,7 @@ def _shortest_path(adj: dict[int, list[tuple[int, float]]], start: int, goal: in
                 prev[neighbor] = node
                 heapq.heappush(heap, (next_cost, neighbor))
     if goal not in prev and start != goal:
-        return [start, goal]
+        return []
     path: list[int] = []
     current = goal
     while True:
@@ -997,22 +1840,7 @@ async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dic
             )
             if traject_response.status_code == 200:
                 for feature in traject_response.json().get("features") or []:
-                    props = feature.get("properties") or {}
-                    geom = feature.get("geometry") or {}
-                    raw_coords = geom.get("coordinates") or []
-                    coordinates = (
-                        [[float(c[1]), float(c[0])] for c in raw_coords if len(c) >= 2]
-                        if raw_coords
-                        else []
-                    )
-                    trajects.append(
-                        {
-                            "begin_geoid": props.get("begin_geoid"),
-                            "end_geoid": props.get("end_geoid"),
-                            "shape_length": props.get("shape_length") or 0,
-                            "coordinates": coordinates,
-                        }
-                    )
+                    trajects.append(_traject_from_feature(feature))
     except Exception:
         return [], []
     return nodes, trajects
@@ -1120,14 +1948,29 @@ def _note_needles(notes: str) -> list[str]:
     text = (notes or "").lower()
     needles = [part.strip() for part in re.split(r"[,\s/]+", text) if len(part.strip()) >= 3]
     synonyms = {
-        "cafe": ["cafe", "café", "koffie", "coffee"],
-        "café": ["cafe", "café", "koffie"],
+        "cafe": ["cafe", "café", "koffie", "coffee", "cafetje", "cafetjes"],
+        "café": ["cafe", "café", "koffie", "cafetje", "cafetjes"],
+        "cafetje": ["cafe", "café", "koffie", "cafetjes"],
+        "cafetjes": ["cafe", "café", "koffie", "cafetje"],
         "koffie": ["cafe", "café", "koffie"],
         "pub": ["pub", "bar", "bier"],
         "bar": ["bar", "pub"],
         "eten": ["restaurant", "café", "cafe"],
-        "kasteel": ["kasteel", "burcht", "castle"],
-        "kerk": ["kerk", "kathedraal", "abdij"],
+        "kasteel": ["kasteel", "kastelen", "burcht", "castle"],
+        "kastelen": ["kasteel", "kastelen", "burcht", "castle"],
+        "molen": ["molen", "molens", "windmolen"],
+        "molens": ["molen", "molens", "windmolen"],
+        "kerk": ["kerk", "kerken", "kathedraal", "abdij", "basiliek"],
+        "kerken": ["kerk", "kerken", "kathedraal", "abdij"],
+        "museum": ["museum", "musea"],
+        "musea": ["museum", "musea"],
+        "water": ["water", "rivier", "kanaal", "gracht", "leie", "schelde", "meer"],
+        "natuur": ["natuur", "park", "bos", "reservaat"],
+        "park": ["park", "parken", "natuur"],
+        "bos": ["bos", "bossen", "natuur"],
+        "hoeve": ["hoeve", "boerderij", "farm"],
+        "wijn": ["wijn", "wijngaard", "vineyard"],
+        "markt": ["markt", "markten", "marketplace"],
     }
     expanded: set[str] = set(needles)
     for word in list(expanded):
