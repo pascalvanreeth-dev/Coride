@@ -19,10 +19,11 @@ import {
   poiId,
 } from "../geo.js";
 import { useDebounced } from "../hooks.js";
-import { nodeIcon, startIcon, wishPoiIcon } from "../icons.js";
+import { nodeIcon, startIcon, wishPoiSvg, wishPoiIcon } from "../icons.js";
 import { profileSummary, suggestedDistance, suggestedMinutes, toApiProfile, mergeInterests, interestLabels } from "../profile.js";
 import { MAP_SOURCES, MAP_TILE } from "../mapTiles.js";
 import { getUsedRouteIds } from "../routeHistory.js";
+import FocusPulse from "./FocusPulse.jsx";
 import HereMarker from "./HereMarker.jsx";
 import MapChrome from "./MapChrome.jsx";
 import MapFlyTo from "./MapFlyTo.jsx";
@@ -33,6 +34,12 @@ import RouteLine from "./RouteLine.jsx";
 import "leaflet/dist/leaflet.css";
 
 const COORD_QUERY = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/;
+const MANUAL_MAP_HOLD_MS = 15000;
+let manualMapHoldUntil = 0;
+
+function holdManualMap(ms = MANUAL_MAP_HOLD_MS) {
+  manualMapHoldUntil = Date.now() + ms;
+}
 
 export default function Planner({ busy, error, center, zoom = 14, profile, onEditProfile, onPreview, onPlan }) {
   const [map, setMap] = useState(null);
@@ -71,6 +78,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const [startPickerOpen, setStartPickerOpen] = useState(false);
   const [pendingStartChoice, setPendingStartChoice] = useState(null); // "map" | "gps"
   const [pickedWishPois, setPickedWishPois] = useState([]);
+  const [focusedWishId, setFocusedWishId] = useState("");
+  const [wishPickerOpen, setWishPickerOpen] = useState(false);
+  const [wishPickerPoi, setWishPickerPoi] = useState(null);
+  const [focusPulse, setFocusPulse] = useState(null);
   const pickedWishKey = useMemo(
     () => pickedWishPois.map((poi) => poiId(poi)).join("|"),
     [pickedWishPois],
@@ -335,15 +346,30 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     };
   }, [buildMode, previewKey, origin?.lat, origin?.lng, pickedWishKey]);
 
-  function toggleWishPoi(poi) {
+  function openWishPicker(poi) {
+    if (!poi) return;
     const id = poiId(poi);
     setFocusedWishId(id);
+    setWishPickerPoi(poi);
+    setWishPickerOpen(true);
+    setFocusPulse({ lat: poi.lat, lng: poi.lng, key: Date.now() });
     onPreview({ lat: poi.lat, lng: poi.lng, zoom: 15 });
     document.querySelector(".hero-map")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function closeWishPicker() {
+    setWishPickerOpen(false);
+    setWishPickerPoi(null);
+  }
+
+  function confirmWishPoi() {
+    if (!wishPickerPoi) return;
+    const id = poiId(wishPickerPoi);
     setPickedWishPois((current) => {
       const exists = current.some((item) => poiId(item) === id);
-      return exists ? current.filter((item) => poiId(item) !== id) : [...current, poi];
+      return exists ? current.filter((item) => poiId(item) !== id) : [...current, wishPickerPoi];
     });
+    closeWishPicker();
   }
 
   const routePreview = suggestionPreview;
@@ -388,11 +414,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   const wishSummary = routePreview?.wish_summary || "";
 
-  const [focusedWishId, setFocusedWishId] = useState("");
-
   useEffect(() => {
     setFocusedWishId("");
     setPickedWishPois([]);
+    setFocusPulse(null);
   }, [notes]);
 
   const suggestInterests = useMemo(
@@ -646,6 +671,28 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       }
       rememberNodes(node);
       return [...current, id];
+    });
+  }
+
+  function undoLastKnoop() {
+    if (buildMode !== "manual" || selectedIds.length === 0) return;
+    setSelectedIds((current) => {
+      if (!current.length) return current;
+      const next = current.slice(0, -1);
+      const removedId = current[current.length - 1];
+      if (origin?.source === "knoop" && current[0] === removedId) {
+        if (next.length) {
+          const replacement = nodeLookup.get(next[0]);
+          if (replacement) {
+            setOrigin({ lat: replacement.lat, lng: replacement.lng, source: "knoop" });
+            setStart(`Knooppunt ${replacement.number}`);
+          }
+        } else if (startChoice === "map") {
+          setOrigin(null);
+          setStart("");
+        }
+      }
+      return next;
     });
   }
 
@@ -1143,12 +1190,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             <div className="poi-suggest-section" id="suggestieoverzicht">
               <strong>Suggestieoverzicht</strong>
               <p className="sources" style={{ margin: "6px 0 8px" }}>
-                {wishSummary || "Plekken die passen bij je wens (met AI gekozen). Klik om toe te voegen aan je route — klik opnieuw om te verwijderen."}
+                {wishSummary || "Plekken die passen bij je wens (met AI gekozen). Klik op een plek om te kiezen of je ze in je route opneemt."}
               </p>
               <div className="poi-suggest-grid">
                 {wishSuggestions.map((item) => {
                   const id = poiId(item);
                   const picked = pickedWishPois.some((poi) => poiId(poi) === id);
+                  const glyph = wishPoiSvg(item.interest, item.kind_label || item.kind, item.name, 22);
                   return (
                     <button
                       key={id}
@@ -1157,9 +1205,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                       onPointerUp={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        toggleWishPoi(item);
+                        openWishPicker(item);
                       }}
                     >
+                      <span
+                        className="poi-suggest-glyph"
+                        aria-hidden="true"
+                        dangerouslySetInnerHTML={{ __html: glyph }}
+                      />
                       <span className="poi-suggest-kind">{item.kind_label || item.kind}</span>
                       <strong>{item.name}</strong>
                       {item.hint && <small className="poi-suggest-note">{item.hint}</small>}
@@ -1236,7 +1289,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <MapClick onPick={pickOnMap} />
           <MapResize />
           <MapReady onReady={setMap} />
-          <MapPanFocus active={panFocusActive} delayMs={15000} onFocus={setViewFocus} />
+          <MapPanFocus active={panFocusActive} delayMs={MANUAL_MAP_HOLD_MS} onFocus={setViewFocus} />
+          {buildMode === "manual" && <HoldMapAfterUserPan holdMs={MANUAL_MAP_HOLD_MS} />}
           <MapZoomScale referenceZoom={zoom}>
           {(buildMode === "manual" && draft?.geometry?.length > 1 && (
             <RouteLine positions={draft.geometry} />
@@ -1258,9 +1312,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               items={wishSuggestions}
               pickedIds={new Set(pickedWishPois.map((poi) => poiId(poi)))}
               focusedId={focusedWishId}
-              onSelect={toggleWishPoi}
+              onSelect={openWishPicker}
             />
           )}
+          <FocusPulse
+            position={focusPulse}
+            token={focusPulse?.key}
+            onDone={() => setFocusPulse(null)}
+          />
           {(buildMode === "manual" || (buildMode === "auto" && startChoice === "map")) && (
             <PlannerKnoopMarkers
               nodes={mapNodes}
@@ -1290,8 +1349,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             center={center}
             zoom={zoom}
             locked={
+              buildMode === "manual" ||
               Boolean(origin) ||
-              (buildMode === "manual" && selectedNodes.length > 0) ||
               (buildMode === "suggest" && !!selectedSuggestion)
             }
           />
@@ -1312,12 +1371,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               active={buildMode === "suggest" ? !!selectedSuggestion : !!origin}
             />
           )}
-          {buildMode === "manual" && draft?.geometry?.length > 1 && (
+          {buildMode === "manual" && (
             <FitPreview
-              geometry={draft.geometry}
+              geometry={draft?.geometry}
               nodes={routeNodes}
-              active={routeNodes.length > 0}
-              deferAfterInteractionMs={15000}
+              active={Boolean(draft?.geometry?.length > 1 && routeNodes.length > 0)}
+              deferAfterInteractionMs={MANUAL_MAP_HOLD_MS}
+              fitKey={selectedKey}
             />
           )}
           </MapZoomScale>
@@ -1327,6 +1387,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             map={map}
             onLocate={chooseMyLocation}
             onGoTo={goToSearchPlace}
+            onUndo={buildMode === "manual" ? undoLastKnoop : null}
+            undoDisabled={selectedIds.length === 0}
             locateDisabled={geoBusy}
             locateBusy={geoBusy}
           />
@@ -1452,6 +1514,56 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           </div>,
           document.body,
         )}
+
+      {wishPickerOpen &&
+        wishPickerPoi &&
+        createPortal(
+          <div className="mode-picker-backdrop" onClick={closeWishPicker}>
+            <div
+              className="mode-picker poi-picker"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="wish-picker-title"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="wish-picker-title" className="mode-picker-title">
+                <span
+                  aria-hidden="true"
+                  className="wish-picker-glyph"
+                  dangerouslySetInnerHTML={{
+                    __html: wishPoiSvg(
+                      wishPickerPoi.interest,
+                      wishPickerPoi.kind_label || wishPickerPoi.kind,
+                      wishPickerPoi.name,
+                      22,
+                    ),
+                  }}
+                />
+                {wishPickerPoi.name}
+              </h2>
+              <p className="sources" style={{ margin: "8px 0 0" }}>
+                {wishPickerPoi.kind_label || wishPickerPoi.kind}
+                {wishPickerPoi.hint ? ` · ${wishPickerPoi.hint}` : ""}
+              </p>
+              <p className="sources" style={{ margin: "10px 0 0" }}>
+                {pickedWishPois.some((poi) => poiId(poi) === poiId(wishPickerPoi))
+                  ? "Deze plek zit al in je route. Wil je ze verwijderen?"
+                  : "Wil je deze plek opnemen in je route? De fietsroute wordt dan aangepast."}
+              </p>
+              <div className="poi-picker-actions">
+                <button type="button" className="submit" onClick={confirmWishPoi}>
+                  {pickedWishPois.some((poi) => poiId(poi) === poiId(wishPickerPoi))
+                    ? "Ja, verwijderen"
+                    : "Ja, opnemen in de route"}
+                </button>
+                <button type="button" className="ghost mode-picker-cancel" onClick={closeWishPicker}>
+                  Nee, overslaan
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
@@ -1466,6 +1578,7 @@ function WishRouteMarkers({ items, pickedIds, focusedId, onSelect }) {
         icon={wishPoiIcon({
           interest: item.interest,
           kind: item.kind_label || item.kind,
+          name: item.name,
           focused: focusedId === item.id,
           selected: picked,
         })}
@@ -1601,7 +1714,29 @@ function PlannerKnoopMarkers({ nodes, buildMode, startChoice, selectedIds, origi
   });
 }
 
-function MapPanFocus({ active, delayMs = 15000, onFocus }) {
+function HoldMapAfterUserPan({ holdMs = MANUAL_MAP_HOLD_MS }) {
+  const map = useMap();
+  useEffect(() => {
+    const el = map.getContainer();
+    const mark = () => holdManualMap(holdMs);
+    el.addEventListener("pointerdown", mark);
+    el.addEventListener("wheel", mark, { passive: true });
+    el.addEventListener("touchstart", mark, { passive: true });
+    return () => {
+      el.removeEventListener("pointerdown", mark);
+      el.removeEventListener("wheel", mark);
+      el.removeEventListener("touchstart", mark);
+    };
+  }, [holdMs, map]);
+  useMapEvents({
+    dragstart() {
+      holdManualMap(holdMs);
+    },
+  });
+  return null;
+}
+
+function MapPanFocus({ active, delayMs = MANUAL_MAP_HOLD_MS, onFocus }) {
   const map = useMap();
   const timerRef = useRef(null);
   const onFocusRef = useRef(onFocus);
@@ -1680,21 +1815,25 @@ function FocusLastSelected({ node, trigger }) {
 
 function FitNodes({ origin }) {
   const map = useMap();
+  const seen = useRef("");
   useEffect(() => {
     if (!origin) return;
+    const key = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}`;
+    if (key === seen.current) return;
+    seen.current = key;
     map.setView([origin.lat, origin.lng], Math.max(map.getZoom(), 14), { animate: true });
   }, [origin?.lat, origin?.lng, map]);
   return null;
 }
 
-function FitPreview({ geometry, nodes, active, deferAfterInteractionMs = 0 }) {
+function FitPreview({ geometry, nodes, active, deferAfterInteractionMs = 0, fitKey = "" }) {
   const map = useMap();
-  const lockUntilRef = useRef(0);
   const timerRef = useRef(null);
+  const fittingRef = useRef(false);
+  const fittedKeyRef = useRef("");
 
   const fitBounds = () => {
     if (!active) return;
-    if (deferAfterInteractionMs > 0 && Date.now() < lockUntilRef.current) return;
     const bounds = [];
     if (geometry?.length) {
       for (const point of geometry) {
@@ -1707,36 +1846,47 @@ function FitPreview({ geometry, nodes, active, deferAfterInteractionMs = 0 }) {
       if (Number.isFinite(lat) && Number.isFinite(lng)) bounds.push([lat, lng]);
     }
     if (!bounds.length) return;
+    fittingRef.current = true;
     map.fitBounds(bounds, { padding: [72, 72], maxZoom: 13 });
+    fittedKeyRef.current = fitKey;
+    map.once("moveend", () => {
+      fittingRef.current = false;
+    });
   };
 
-  const scheduleFit = () => {
+  const scheduleFit = (force) => {
     clearTimeout(timerRef.current);
-    const now = Date.now();
+    if (!active) return;
     const waitMs =
-      deferAfterInteractionMs > 0
-        ? Math.max(0, lockUntilRef.current - now, 0)
-        : 0;
-    timerRef.current = setTimeout(fitBounds, waitMs);
+      deferAfterInteractionMs > 0 ? Math.max(0, manualMapHoldUntil - Date.now()) : 0;
+    if (waitMs > 0) {
+      timerRef.current = setTimeout(fitBounds, waitMs);
+      return;
+    }
+    if (deferAfterInteractionMs > 0 && !force && fittedKeyRef.current === fitKey) {
+      return;
+    }
+    fitBounds();
   };
 
   useMapEvents({
     dragstart() {
       if (!deferAfterInteractionMs) return;
-      lockUntilRef.current = Date.now() + deferAfterInteractionMs;
-      clearTimeout(timerRef.current);
+      holdManualMap(deferAfterInteractionMs);
+      scheduleFit(true);
     },
     zoomstart() {
-      if (!deferAfterInteractionMs) return;
-      lockUntilRef.current = Date.now() + deferAfterInteractionMs;
-      clearTimeout(timerRef.current);
+      if (!deferAfterInteractionMs || fittingRef.current) return;
+      holdManualMap(deferAfterInteractionMs);
+      scheduleFit(true);
     },
   });
 
   useEffect(() => {
-    scheduleFit();
+    const selectionChanged = Boolean(fitKey) && fitKey !== fittedKeyRef.current;
+    scheduleFit(selectionChanged);
     return () => clearTimeout(timerRef.current);
-  }, [active, geometry, nodes, map, deferAfterInteractionMs]);
+  }, [active, geometry, nodes, map, deferAfterInteractionMs, fitKey]);
 
   return null;
 }

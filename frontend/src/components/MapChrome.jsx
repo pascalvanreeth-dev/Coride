@@ -12,6 +12,8 @@ export default function MapChrome({
   map,
   onLocate,
   onGoTo,
+  onUndo = null,
+  undoDisabled = true,
   locateDisabled = false,
   locateBusy = false,
 }) {
@@ -116,6 +118,28 @@ export default function MapChrome({
           −
         </button>
       </div>
+
+      {onUndo && (
+        <button
+          type="button"
+          className="map-chrome-btn map-chrome-undo"
+          onClick={onUndo}
+          disabled={undoDisabled}
+          title="Laatste knooppunt ongedaan maken"
+          aria-label="Laatste knooppunt ongedaan maken"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M7.2 6.4a7.2 7.2 0 1 1-1.35 9.55"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.6"
+              strokeLinecap="round"
+            />
+            <path d="M7.2 2.8 3.2 7.2 7.2 11.6Z" fill="currentColor" stroke="none" />
+          </svg>
+        </button>
+      )}
 
       <div className="map-chrome-search" ref={panelRef}>
         <button

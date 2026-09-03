@@ -171,6 +171,26 @@ export function dedupeRevisitedNumbers(chain) {
   return result;
 }
 
+/** Afgelegde meters vanaf het begin van de route tot het dichtste punt op de lijn. */
+export function distanceAlongGeometry(lat, lng, geometry) {
+  if (!geometry?.length || geometry.length < 2) return 0;
+  let bestDist = Infinity;
+  let bestProgress = 0;
+  let cumulative = 0;
+  for (let index = 0; index < geometry.length - 1; index += 1) {
+    const a = geometry[index];
+    const b = geometry[index + 1];
+    const snapped = snapToSegment(lat, lng, a[0], a[1], b[0], b[1]);
+    if (snapped.dist < bestDist) {
+      bestDist = snapped.dist;
+      bestProgress =
+        cumulative + haversine({ lat: a[0], lng: a[1] }, { lat: snapped.lat, lng: snapped.lng });
+    }
+    cumulative += haversine({ lat: a[0], lng: a[1] }, { lat: b[0], lng: b[1] });
+  }
+  return bestProgress;
+}
+
 export function geometryProgressIndex(lat, lng, geometry) {
   if (!geometry?.length || geometry.length < 2) return 0;
   let bestI = 0;

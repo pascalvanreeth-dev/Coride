@@ -91,10 +91,17 @@ async def rank_wish_poi_suggestions(
     candidates: list[dict[str, Any]],
     profile_interests: list[str] | None = None,
     wish_interests: list[str] | None = None,
+    *,
+    target_count: int | None = None,
+    route_km: float | None = None,
 ) -> dict[str, Any] | None:
-    """Laat Gemini de beste plekken kiezen voor het suggestieoverzicht."""
+    """Laat Gemini de beste plekken kiezen voor het suggestieoverzicht langs de route."""
     if not has_ai() or not (notes or "").strip() or not candidates:
         return None
+    wanted = int(target_count or 12)
+    wanted = max(8, min(36, wanted))
+    lo = max(6, wanted - 4)
+    hi = min(36, wanted + 4)
     compact = [
         {
             "id": str(c["id"]),
@@ -102,22 +109,36 @@ async def rank_wish_poi_suggestions(
             "kind": c.get("kind_label") or c.get("kind"),
             "interest": c.get("interest"),
             "on_route": bool(c.get("on_route")),
+            "progress": c.get("route_progress"),
+            "lat": round(float(c["lat"]), 4) if c.get("lat") is not None else None,
+            "lng": round(float(c["lng"]), 4) if c.get("lng") is not None else None,
         }
-        for c in candidates[:56]
+        for c in candidates[:80]
         if c.get("id") and c.get("name")
     ]
     if not compact:
         return None
+    route_hint = ""
+    if route_km and route_km > 0:
+        route_hint = (
+            f"De fietsroute is ongeveer {route_km:.0f} km. "
+            "Spreid de suggesties over begin, midden en einde (gebruik progress 0–1 of lat/lng). "
+        )
     parsed = await _generate_json(
         "Je bent een fietsgids in Vlaanderen. "
-        "Kies uit de gegeven plekken de beste suggesties voor de extra_wens van de fietser. "
-        "Geef diversiteit (niet allemaal hetzelfde type). "
+        "Bekijk de kandidaten langs de geplande fietsroute en kies een selectie suggesties "
+        "die passen bij de extra_wens van de fietser. "
+        f"{route_hint}"
+        f"Kies bij voorkeur {wanted} plekken (minstens {lo}, max {hi}). "
+        "Geef diversiteit (niet allemaal hetzelfde type of dezelfde stad). "
         "Prefer plekken met on_route=true als die passen. "
-        "JSON: {pick_ids: [6-18 id strings, beste eerst], hints: {id: korte reden max 12 woorden}, summary: 1 zin}. "
+        "JSON: {pick_ids: [id strings, beste eerst], hints: {id: korte reden max 12 woorden}, summary: 1 zin}. "
         "Alleen ids uit plekken. Nederlands. Verzin geen plekken.",
         json.dumps(
             {
                 "extra_wens": notes.strip(),
+                "route_km": round(float(route_km), 1) if route_km else None,
+                "doel_aantal": wanted,
                 "profiel_interesses": list(profile_interests or []),
                 "route_interesses": list(wish_interests or []),
                 "plekken": compact,
@@ -134,7 +155,7 @@ async def rank_wish_poi_suggestions(
     summary = str(parsed.get("summary") or "").strip()
     if not pick_ids and not summary:
         return None
-    return {"pick_ids": pick_ids[:18], "hints": hints, "summary": summary}
+    return {"pick_ids": pick_ids[:hi], "hints": hints, "summary": summary}
 
 
 async def enrich_with_ai(

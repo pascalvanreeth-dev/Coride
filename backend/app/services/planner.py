@@ -15,7 +15,13 @@ from app.services import suggestions as suggestion_service
 from app.services import wikipedia
 from app.services import wikipedia
 from app.services.ai import enrich_with_ai, fallback_scripts, has_ai, interpret_wish_notes, polish_scripts, rank_wish_poi_suggestions
-from app.services.geo import haversine_m, point_to_segment_m, unique_key
+from app.services.geo import (
+    haversine_m,
+    point_on_geometry_at_progress,
+    point_to_segment_m,
+    snap_point_on_geometry_with_progress,
+    unique_key,
+)
 
 
 SPEED_KMH = {
@@ -614,10 +620,11 @@ def _insert_poi_waypoints(
     waypoints: list[tuple[float, float]],
     picks: list[Any],
 ) -> list[tuple[float, float]]:
+    """Legacy helper — voorkeur gaat naar _apply_poi_spurs op de basisroute."""
     if not picks:
         return waypoints
     points = list(waypoints)
-    ordered: list[tuple[float, float, float]] = []
+    ordered: list[tuple[float, int, float, float]] = []
     for pick in picks:
         data = pick.model_dump() if hasattr(pick, "model_dump") else dict(pick)
         plat = float(data["lat"])
@@ -638,6 +645,181 @@ def _insert_poi_waypoints(
             continue
         points.insert(insert_at, (plat, plng))
     return routing._clean_waypoints(points)
+
+
+def _vertex_index_at_progress(geometry: list[list[float]], progress_m: float) -> int:
+    """Index van het vertex net vóór of op progress_m langs de polyline."""
+    if not geometry:
+        return 0
+    if len(geometry) < 2:
+        return 0
+    remaining = max(0.0, float(progress_m))
+    for index in range(len(geometry) - 1):
+        seg = haversine_m(
+            geometry[index][0],
+            geometry[index][1],
+            geometry[index + 1][0],
+            geometry[index + 1][1],
+        )
+        if remaining <= seg:
+            return index
+        remaining -= seg
+    return max(0, len(geometry) - 2)
+
+
+async def _osrm_leg(a: tuple[float, float], b: tuple[float, float]) -> list[list[float]]:
+    if haversine_m(a[0], a[1], b[0], b[1]) < 12:
+        return [[a[0], a[1]], [b[0], b[1]]]
+    try:
+        osrm = await routing.bike_route([a, b], retries=1)
+        piece = list(osrm.get("geometry") or [])
+        if not piece:
+            return [[a[0], a[1]], [b[0], b[1]]]
+        piece[0] = [a[0], a[1]]
+        piece[-1] = [b[0], b[1]]
+        return piece
+    except Exception:
+        return [[a[0], a[1]], [b[0], b[1]]]
+
+
+async def _apply_poi_spurs(
+    route: dict[str, Any],
+    picks: list[Any],
+) -> dict[str, Any]:
+    """Voeg POI's toe als korte lokale aftakkingen op de bestaande knooppuntenroute.
+
+    Zo blijft A→B op het netwerk intact. We doen niet A→POI→B (dat veroorzaakt
+    heen-en-weer-lussen). In plaats daarvan: route tot snap → POI → verderop op de route.
+    """
+    geometry = [list(point) for point in (route.get("geometry") or []) if point and len(point) >= 2]
+    if len(geometry) < 2 or not picks:
+        return route
+
+    placements: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pick in picks:
+        data = pick.model_dump() if hasattr(pick, "model_dump") else dict(pick)
+        try:
+            plat = float(data["lat"])
+            plng = float(data["lng"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = unique_key(str(data.get("id") or data.get("name") or ""), plat, plng)
+        if key in seen:
+            continue
+        seen.add(key)
+        snap_lat, snap_lng, dist, progress = snap_point_on_geometry_with_progress(plat, plng, geometry)
+        # Al vrijwel op de route: geen aftakking nodig.
+        if dist < 35:
+            continue
+        placements.append(
+            {
+                "lat": plat,
+                "lng": plng,
+                "snap_lat": snap_lat,
+                "snap_lng": snap_lng,
+                "dist": dist,
+                "progress": progress,
+            }
+        )
+
+    if not placements:
+        return route
+
+    # Van achter naar voren invoegen zodat progress-indices stabiel blijven.
+    placements.sort(key=lambda item: item["progress"], reverse=True)
+    distance_m = float(route.get("distance_m") or 0)
+    duration_s = float(route.get("duration_s") or 0)
+    steps = list(route.get("steps") or [])
+
+    for item in placements:
+        snap = (float(item["snap_lat"]), float(item["snap_lng"]))
+        poi = (float(item["lat"]), float(item["lng"]))
+        progress = float(item["progress"])
+        idx = _vertex_index_at_progress(geometry, progress)
+
+        # Verderop op de route hervatten (niet terugkeren naar snap) → minder overlap.
+        ahead_m = 120.0 if item["dist"] < 400 else 180.0
+        ahead = point_on_geometry_at_progress(geometry, progress + ahead_m)
+        if haversine_m(snap[0], snap[1], ahead[0], ahead[1]) < 45:
+            ahead = point_on_geometry_at_progress(geometry, progress + 220.0)
+        ahead_idx = _vertex_index_at_progress(geometry, progress + ahead_m)
+        if ahead_idx <= idx:
+            ahead_idx = min(len(geometry) - 1, idx + 1)
+            ahead = (float(geometry[ahead_idx][0]), float(geometry[ahead_idx][1]))
+
+        # Als we dicht bij het einde zitten: korte heen-en-terug naar snap.
+        near_end = ahead_idx >= len(geometry) - 1 and haversine_m(
+            ahead[0], ahead[1], geometry[-1][0], geometry[-1][1]
+        ) < 40
+        to_poi = await _osrm_leg(snap, poi)
+        if near_end:
+            from_poi = await _osrm_leg(poi, snap)
+            resume = snap
+            resume_idx = idx
+        else:
+            from_poi = await _osrm_leg(poi, ahead)
+            resume = ahead
+            resume_idx = ahead_idx
+
+        spur = list(to_poi)
+        if from_poi:
+            spur.extend(from_poi[1:] if spur else from_poi)
+
+        left = [list(point) for point in geometry[: idx + 1]]
+        if not left:
+            left = [[snap[0], snap[1]]]
+        elif haversine_m(left[-1][0], left[-1][1], snap[0], snap[1]) > 10:
+            left.append([snap[0], snap[1]])
+        else:
+            left[-1] = [snap[0], snap[1]]
+
+        right = [list(point) for point in geometry[resume_idx:]]
+        if right:
+            if haversine_m(right[0][0], right[0][1], resume[0], resume[1]) > 10:
+                right = [[resume[0], resume[1]], *right]
+            else:
+                right[0] = [resume[0], resume[1]]
+        else:
+            right = [[resume[0], resume[1]]]
+
+        # spur begint op snap; left eindigt op snap → skip eerste spur-punt.
+        mid = spur[1:] if spur and haversine_m(spur[0][0], spur[0][1], snap[0], snap[1]) < 15 else spur
+        # right begint op resume; mid eindigt op resume → skip eerste right-punt.
+        if mid and right and haversine_m(mid[-1][0], mid[-1][1], right[0][0], right[0][1]) < 15:
+            geometry = left + mid + right[1:]
+        else:
+            geometry = left + mid + right
+
+        # Ruwe afstand/tijd bijwerken.
+        spur_m = 0.0
+        for i in range(1, len(spur)):
+            spur_m += haversine_m(spur[i - 1][0], spur[i - 1][1], spur[i][0], spur[i][1])
+        # Trek het overgeslagen stuk snap→ahead van de basisroute af (dat vervangen we).
+        skipped = haversine_m(snap[0], snap[1], resume[0], resume[1])
+        distance_m = max(0.0, distance_m - skipped + spur_m)
+        duration_s = max(60.0, duration_s - skipped / 4.0 + spur_m / 3.9)
+
+    # Lichte dedupe (niet 12 m — dat kan de POI-aftakking platslaan).
+    cleaned: list[list[float]] = []
+    for point in geometry:
+        if cleaned and haversine_m(cleaned[-1][0], cleaned[-1][1], point[0], point[1]) < 2.5:
+            cleaned[-1] = [point[0], point[1]]
+            continue
+        cleaned.append([point[0], point[1]])
+    geometry = cleaned
+    for item in placements:
+        geometry = _pin_nodes_on_geometry(
+            geometry,
+            [{"lat": item["lat"], "lng": item["lng"], "number": ""}],
+        )
+    return {
+        **route,
+        "geometry": geometry,
+        "distance_m": distance_m,
+        "duration_s": duration_s,
+        "steps": steps,
+    }
 
 
 async def _build_knoop_route(
@@ -669,18 +851,7 @@ async def _build_knoop_route(
         route_chain = list(spine_geo)
     must_visit = route_chain
 
-    # Waypoints altijd op de echte pick-coördinaten van de gebruiker.
-    waypoints = knoop_service.waypoints_for_chain(
-        start_lat,
-        start_lng,
-        must_visit,
-        close_loop=close_loop,
-        end_lat=end_lat,
-        end_lng=end_lng,
-    )
-    if poi_picks:
-        waypoints = _insert_poi_waypoints(waypoints, poi_picks)
-
+    # Eerst de zuivere knooppuntenroute; POI's daarna als lokale spur (geen A→POI→B).
     route = await _route_along_must_visit(
         start_lat,
         start_lng,
@@ -690,9 +861,10 @@ async def _build_knoop_route(
         close_loop=close_loop,
         end_lat=end_lat,
         end_lng=end_lng,
-        poi_picks=poi_picks,
-        waypoints_with_poi=waypoints if poi_picks else None,
     )
+    if poi_picks:
+        route = await _apply_poi_spurs(route, poi_picks)
+
     # Absolute garantie: elke gekozen knoop ligt op de rode lijn.
     route["geometry"] = _pin_nodes_on_geometry(route.get("geometry") or [], spine_geo)
     if not _route_covers_nodes(route.get("geometry") or [], spine_geo, max_m=50):
@@ -1082,22 +1254,68 @@ def _near_chain(pois: list[dict[str, Any]], chain: list[dict[str, Any]], notes: 
 def _on_route_geometry(poi: dict[str, Any], geometry: list[list[float]], max_m: float = 650) -> bool:
     if not geometry or len(geometry) < 2:
         return False
-    step = max(1, len(geometry) // 48)
+    # Langere routes: dichter bemonsteren zodat stadsdoorsteken niet gemist worden.
+    samples = min(160, max(48, len(geometry) // 8))
+    step = max(1, len(geometry) // samples)
     for index in range(0, len(geometry) - 1, step):
         a = geometry[index]
         b = geometry[index + 1]
         if point_to_segment_m(poi["lat"], poi["lng"], a[0], a[1], b[0], b[1]) <= max_m:
             return True
-    return False
+    # Altijd ook het laatste segment checken.
+    a = geometry[-2]
+    b = geometry[-1]
+    return point_to_segment_m(poi["lat"], poi["lng"], a[0], a[1], b[0], b[1]) <= max_m
+
+
+def _geometry_length_km(geometry: list[list[float]]) -> float:
+    if not geometry or len(geometry) < 2:
+        return 0.0
+    total = 0.0
+    step = max(1, len(geometry) // 200)
+    prev = geometry[0]
+    for index in range(step, len(geometry), step):
+        point = geometry[index]
+        total += haversine_m(prev[0], prev[1], point[0], point[1])
+        prev = point
+    last = geometry[-1]
+    if prev is not last:
+        total += haversine_m(prev[0], prev[1], last[0], last[1])
+    return total / 1000.0
 
 
 def _sample_route_points(geometry: list[list[float]], count: int = 6) -> list[tuple[float, float]]:
+    """Sample roughly evenly along the polyline (by distance), not only by vertex index."""
     if not geometry:
         return []
-    if len(geometry) <= count:
-        return [(float(point[0]), float(point[1])) for point in geometry]
-    step = max(1, len(geometry) // count)
-    return [(float(geometry[index][0]), float(geometry[index][1])) for index in range(0, len(geometry), step)][:count]
+    points = [(float(point[0]), float(point[1])) for point in geometry if len(point) >= 2]
+    if len(points) <= count:
+        return points
+    if count <= 1:
+        return [points[0]]
+
+    # Cumulative distances.
+    dists = [0.0]
+    for index in range(1, len(points)):
+        dists.append(
+            dists[-1] + haversine_m(points[index - 1][0], points[index - 1][1], points[index][0], points[index][1])
+        )
+    total = dists[-1] or 1.0
+    targets = [total * i / (count - 1) for i in range(count)]
+    sampled: list[tuple[float, float]] = []
+    cursor = 0
+    for target in targets:
+        while cursor < len(dists) - 1 and dists[cursor] < target:
+            cursor += 1
+        sampled.append(points[cursor])
+    # Unieke opeenvolgende punten behouden.
+    unique: list[tuple[float, float]] = []
+    for point in sampled:
+        if not unique or haversine_m(unique[-1][0], unique[-1][1], point[0], point[1]) > 80:
+            unique.append(point)
+    if points[-1] not in unique:
+        unique.append(points[-1])
+    return unique[:count]
 
 
 def _route_midpoint(geometry: list[list[float]]) -> tuple[float, float] | None:
@@ -1112,6 +1330,13 @@ def _notes_want_halfway(notes: str) -> bool:
     return any(key in text for key in ("halverwege", "halfway", " halve ", "midden", "tussendoor", " onderweg"))
 
 
+def _wish_suggestion_target(route_km: float, wish_interests: list[str]) -> int:
+    """Meer suggesties op langere routes doorheen meerdere steden."""
+    by_distance = int(round(route_km / 4.0))  # ~1 per 4 km
+    by_theme = max(8, len(wish_interests or []) * 6)
+    return max(12, min(36, max(by_distance, by_theme)))
+
+
 async def _wish_pois_for_geometry(
     notes: str,
     candidates: list[dict[str, Any]],
@@ -1124,31 +1349,70 @@ async def _wish_pois_for_geometry(
         return [], ""
     wish_interests = pois_service.wish_interests_for_notes(notes, profile_interests)
     wish_set = set(wish_interests)
+    route_km = _geometry_length_km(geometry)
+    target = _wish_suggestion_target(route_km, wish_interests)
     route_candidates = _merge(candidates, ranked)
-    sample_points = _sample_route_points(geometry, 6)
+
+    # Langere routes: dichter bemonsteren langs de hele corridor (niet alleen start).
+    sample_count = max(8, min(16, int(round(route_km / 6.0)) or 8))
+    sample_points = _sample_route_points(geometry, sample_count)
     if _notes_want_halfway(notes):
         midpoint = _route_midpoint(geometry)
         if midpoint:
             sample_points.append(midpoint)
+    corridor_m = 4200 if route_km >= 40 else 3500
     if wish_interests:
         along = await _optional(
-            pois_service.fetch_pois_along_points(sample_points, 3200, wish_interests, max_points=5),
+            pois_service.fetch_pois_along_points(
+                sample_points,
+                corridor_m,
+                wish_interests,
+                max_points=len(sample_points),
+            ),
             [],
-            32,
+            45,
         )
         route_candidates = _merge(route_candidates, along)
     if pois_service.notes_want_horeca(notes, wish_interests):
+        horeca_points = sample_points[: max(6, min(12, len(sample_points)))]
         horeca_parts = await asyncio.gather(
             *[
-                _optional(pois_service.fetch_horeca(plat, plng, 3500), [], 22)
-                for plat, plng in sample_points[:5]
+                _optional(pois_service.fetch_horeca(plat, plng, corridor_m), [], 22)
+                for plat, plng in horeca_points
             ],
             return_exceptions=True,
         )
         for part in horeca_parts:
             if isinstance(part, list):
                 route_candidates = _merge(route_candidates, part)
-    near = _near_chain(route_candidates, chain, notes) if route_candidates else []
+
+    # Houd plekken bij de route-corridor (niet enkel dicht bij een knooppunt).
+    near = []
+    seen_near: set[str] = set()
+    corridor_keep_m = 2800 if route_km >= 40 else 2200
+    for poi in route_candidates:
+        pid = str(poi.get("id") or "")
+        key = pid or unique_key(poi.get("name") or "", poi["lat"], poi["lng"])
+        if key in seen_near:
+            continue
+        wish = pois_service.matches_notes(poi, notes) or (
+            bool(wish_set) and poi.get("interest") in wish_set
+        )
+        if not wish and not (bool(wish_set) and poi.get("interest") in wish_set):
+            # Alleen wens-relevante kandidaten in het suggestieoverzicht.
+            if not pois_service.matches_notes(poi, notes):
+                continue
+        near_knoop = any(
+            haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < (3000 if wish else 1400)
+            for n in chain
+        ) if chain else False
+        near_line = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
+        if near_line or near_knoop or pois_service.matches_notes(poi, notes):
+            near.append(poi)
+            seen_near.add(key)
+    if not near:
+        near = _near_chain(route_candidates, chain, notes) if route_candidates else []
+
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -1175,11 +1439,14 @@ async def _wish_pois_for_geometry(
         tagged = dict(poi)
         tagged["on_route"] = _on_route_geometry(poi, geometry)
         result.append(tagged)
+
+    # Op lange routes iets dichter bij elkaar toegestaan, anders blijft de lijst te kort.
+    min_gap = 450 if route_km >= 50 else 550
     diverse = pois_service.pick_diverse_pois(
         result,
         wish_interests or list(wish_set) or ["geschiedenis"],
-        wanted=min(24, max(12, len(wish_interests or wish_set) * 6)),
-        min_distance_m=550,
+        wanted=target,
+        min_distance_m=min_gap,
     )
     for poi in diverse:
         poi["on_route"] = _on_route_geometry(poi, geometry)
@@ -1195,36 +1462,72 @@ async def _wish_pois_for_geometry(
                 if fits_wish(poi)
             ],
         )
-        if len(pool) < 10:
+        if len(pool) < max(14, target):
             pool = _merge(
                 pool,
                 [
                     dict(poi, on_route=_on_route_geometry(poi, geometry))
-                    for poi in near[:36]
+                    for poi in near[:120]
                     if poi.get("interest") in wish_set or fits_wish(poi)
                 ],
             )
-        ai_rank = await rank_wish_poi_suggestions(notes, pool, profile_interests, wish_interests)
+        for poi in pool:
+            poi["route_progress"] = _route_progress(poi, geometry)
+            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(poi, geometry)
+        for poi in result:
+            poi["route_progress"] = _route_progress(poi, geometry)
+            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(poi, geometry)
+        ai_rank = await rank_wish_poi_suggestions(
+            notes,
+            pool,
+            profile_interests,
+            wish_interests,
+            target_count=target,
+            route_km=route_km,
+        )
         if ai_rank:
             wish_summary = str(ai_rank.get("summary") or "").strip()
             pick_ids = ai_rank.get("pick_ids") or []
             hints = ai_rank.get("hints") or {}
-            if pick_ids:
-                diverse = _apply_ai_wish_pick_order(pool, pick_ids, hints)
-                diverse = diverse[:24]
-                for poi in diverse:
-                    poi["on_route"] = _on_route_geometry(poi, geometry)
-                diverse.sort(
-                    key=lambda item: (0 if item.get("on_route") else 1, (item.get("name") or "").lower())
+            # Alleen AI-picks als start; daarna aanvullen tot target, gespreid over de route.
+            # (Niet de hele pool dumpen — dat gaf óf te weinig óf een willekeurige alfabetlijst.)
+            seeded = _ai_wish_seed(pool, pick_ids, hints)
+            diverse = _spread_fill_wish_pois(seeded, result or pool, target, geometry)
+            for poi in diverse:
+                poi["on_route"] = _on_route_geometry(poi, geometry)
+            diverse.sort(
+                key=lambda item: (
+                    item.get("route_progress") if item.get("route_progress") is not None else 1.5,
+                    (item.get("name") or "").lower(),
                 )
+            )
+    elif len(diverse) < target and result:
+        diverse = _spread_fill_wish_pois(diverse, result, target, geometry)
     return diverse, wish_summary
 
 
-def _apply_ai_wish_pick_order(
+def _route_progress(poi: dict[str, Any], geometry: list[list[float]]) -> float | None:
+    """Ruwe positie langs de route (0–1) via dichtstbijzijnde vertex."""
+    if not geometry or poi.get("lat") is None or poi.get("lng") is None:
+        return None
+    best_i = 0
+    best_d = float("inf")
+    step = max(1, len(geometry) // 120)
+    for index in range(0, len(geometry), step):
+        point = geometry[index]
+        dist = haversine_m(poi["lat"], poi["lng"], point[0], point[1])
+        if dist < best_d:
+            best_d = dist
+            best_i = index
+    return round(best_i / max(1, len(geometry) - 1), 3)
+
+
+def _ai_wish_seed(
     pois: list[dict[str, Any]],
     pick_ids: list[str],
     hints: dict[str, str],
 ) -> list[dict[str, Any]]:
+    """Alleen de door AI gekozen ids, in AI-volgorde."""
     by_id = {str(poi.get("id")): poi for poi in pois if poi.get("id")}
     ordered: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1239,6 +1542,65 @@ def _apply_ai_wish_pick_order(
             tagged["hint"] = hint
         ordered.append(tagged)
         seen.add(pid)
+    return ordered
+
+
+def _spread_fill_wish_pois(
+    selected: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    target: int,
+    geometry: list[list[float]],
+) -> list[dict[str, Any]]:
+    """Vul aan tot target, zo gespreid mogelijk langs de route."""
+    out = [dict(poi) for poi in selected]
+    have = {str(poi.get("id")) for poi in out if poi.get("id")}
+    remaining = [
+        dict(poi)
+        for poi in candidates
+        if poi.get("id") and str(poi.get("id")) not in have
+    ]
+    while len(out) < target and remaining:
+        sel_prog = [
+            p.get("route_progress")
+            if p.get("route_progress") is not None
+            else _route_progress(p, geometry)
+            for p in out
+        ]
+        sel_prog = [p for p in sel_prog if p is not None]
+        best = None
+        best_score = -1.0
+        for poi in remaining:
+            prog = poi.get("route_progress")
+            if prog is None:
+                prog = _route_progress(poi, geometry)
+                poi["route_progress"] = prog
+            if prog is None:
+                score = 0.05
+            elif not sel_prog:
+                score = 1.0
+            else:
+                score = min(abs(float(prog) - float(s)) for s in sel_prog)
+            if poi.get("on_route") or _on_route_geometry(poi, geometry):
+                score += 0.02
+            if score > best_score:
+                best_score = score
+                best = poi
+        if not best:
+            break
+        out.append(best)
+        have.add(str(best.get("id")))
+        remaining = [poi for poi in remaining if str(poi.get("id")) not in have]
+    return out[:target]
+
+
+def _apply_ai_wish_pick_order(
+    pois: list[dict[str, Any]],
+    pick_ids: list[str],
+    hints: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Backwards-compatible: AI-volgorde, daarna rest van de pool."""
+    ordered = _ai_wish_seed(pois, pick_ids, hints)
+    seen = {str(poi.get("id")) for poi in ordered if poi.get("id")}
     for poi in pois:
         pid = str(poi.get("id") or "")
         if not pid or pid in seen:

@@ -14,6 +14,7 @@ import {
   getBrowserLocation,
   haversine,
   interpolate,
+  distanceAlongGeometry,
   ID_JOIN,
   knoopMatches,
   knoopOnRoute,
@@ -26,9 +27,10 @@ import {
   stopSpeaking,
   uniqueChainIds,
 } from "../geo.js";
-import { nodeIcon, wishPoiIcon } from "../icons.js";
+import { nodeIcon, wishPoiSvg, wishPoiIcon } from "../icons.js";
 import { useDebounced } from "../hooks.js";
 import { interestLabels } from "../profile.js";
+import FocusPulse from "./FocusPulse.jsx";
 import HereMarker from "./HereMarker.jsx";
 import MapChrome from "./MapChrome.jsx";
 import MapFlyTo from "./MapFlyTo.jsx";
@@ -63,6 +65,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [followGps, setFollowGps] = useState(false);
   const [locateTick, setLocateTick] = useState(0);
   const [focusTarget, setFocusTarget] = useState(null);
+  const [focusPulse, setFocusPulse] = useState(null);
   const [focusedStop, setFocusedStop] = useState(null);
   const [stopPickerOpen, setStopPickerOpen] = useState(false);
   const [stopBlurbs, setStopBlurbs] = useState({});
@@ -88,6 +91,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [listening, setListening] = useState(false);
   const [chats, setChats] = useState({});
   const [heading, setHeading] = useState(null);
+  const [rideStartedAt, setRideStartedAt] = useState(null);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const knoopPassedAtRef = useRef(new Map());
   const [surroundingsOn, setSurroundingsOn] = useState(() => plan.interaction !== "passief");
   const [surroundings, setSurroundings] = useState(null);
   const [surroundingsBusy, setSurroundingsBusy] = useState(false);
@@ -116,23 +122,21 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
   const suggestionStops = useMemo(() => {
-    const wishOff = [];
+    const wish = [];
     const rest = [];
     for (const stop of plan.stops || []) {
-      if (stop.matches_wish) {
-        if (!stop.on_route) wishOff.push(stop);
-      } else {
-        rest.push(stop);
-      }
+      if (stop.matches_wish) wish.push(stop);
+      else rest.push(stop);
     }
-    return [...wishOff, ...rest];
+    wish.sort((a, b) => Number(Boolean(a.on_route)) - Number(Boolean(b.on_route)));
+    return [...wish, ...rest];
   }, [plan.stops]);
-  const wishStopsOnRoute = useMemo(
-    () => (plan.stops || []).filter((stop) => stop.matches_wish && stop.on_route),
+  const wishStops = useMemo(
+    () => (plan.stops || []).filter((stop) => stop.matches_wish),
     [plan.stops],
   );
   const mapStops = useMemo(
-    () => (plan.stops || []).filter((stop) => !stop.matches_wish || !stop.on_route),
+    () => (plan.stops || []).filter((stop) => !stop.matches_wish),
     [plan.stops],
   );
   const allNodes = plan.all_knooppunten?.length ? plan.all_knooppunten : plan.knooppunten || [];
@@ -199,6 +203,83 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       course,
     };
   }, [heading, plan.knooppunten, position]);
+
+  const rideGeometry = dirty && draft?.geometry?.length ? draft.geometry : plan.geometry;
+  const knoopProgress = useMemo(() => {
+    const chain = routeNodes || [];
+    if (!chain.length) return null;
+    const riderAlong = distanceAlongGeometry(position.lat, position.lng, rideGeometry);
+    const withAlong = chain.map((node, index) => ({
+      node,
+      index,
+      along: distanceAlongGeometry(Number(node.lat), Number(node.lng), rideGeometry),
+      dist: haversine(position, { lat: node.lat, lng: node.lng }),
+    }));
+    let currentIndex = 0;
+    for (let i = 0; i < withAlong.length; i += 1) {
+      if (withAlong[i].along <= riderAlong + 80) currentIndex = i;
+    }
+    const near = withAlong.reduce((best, item) => (item.dist < best.dist ? item : best), withAlong[0]);
+    if (near.dist < 80) currentIndex = near.index;
+    const prev = currentIndex > 0 ? withAlong[currentIndex - 1] : null;
+    const current = withAlong[currentIndex] || null;
+    const next = currentIndex < withAlong.length - 1 ? withAlong[currentIndex + 1] : null;
+    const elapsedMs = rideStartedAt ? Math.max(0, nowTick - rideStartedAt) : 0;
+    const planMeters = Math.max(1, (plan.distance_km || 0) * 1000);
+    const planMs = Math.max(1, (plan.duration_min || 1) * 60_000);
+    const paceMsPerM =
+      riderAlong > 40 && elapsedMs > 8_000 ? elapsedMs / riderAlong : planMs / planMeters;
+
+    function card(item, role) {
+      if (!item) return null;
+      const id = nodeId(item.node);
+      const passedAt = knoopPassedAtRef.current.get(id);
+      let timeMs;
+      if (role === "current" && rideStartedAt) timeMs = elapsedMs;
+      else if (passedAt && rideStartedAt) timeMs = Math.max(0, passedAt - rideStartedAt);
+      else timeMs = item.along * paceMsPerM;
+      return {
+        role,
+        number: item.node.number,
+        alongM: item.along,
+        timeMs,
+        distM: item.dist,
+      };
+    }
+
+    return {
+      prev: card(prev, "prev"),
+      current: card(current, "current"),
+      next: card(next, "next"),
+      currentIndex,
+      riderAlong,
+      elapsedMs,
+    };
+  }, [
+    nowTick,
+    plan.distance_km,
+    plan.duration_min,
+    position,
+    rideGeometry,
+    rideStartedAt,
+    routeNodes,
+  ]);
+
+  useEffect(() => {
+    if (!knoopProgress?.current || mode === "idle") return;
+    if (knoopProgress.current.distM < 100) {
+      const id = nodeId(routeNodes[knoopProgress.currentIndex]);
+      if (id && !knoopPassedAtRef.current.has(id)) {
+        knoopPassedAtRef.current.set(id, Date.now());
+      }
+    }
+  }, [knoopProgress, mode, routeNodes]);
+
+  useEffect(() => {
+    if (mode === "idle") return undefined;
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [mode]);
 
   const currentLocality = useMemo(() => {
     const list = plan.localities || [];
@@ -355,6 +436,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     setFollowGps(false);
     setFocusedStop(stop);
     setFocusTarget({ lat: stop.lat, lng: stop.lng, key: Date.now() });
+    setFocusPulse({ lat: stop.lat, lng: stop.lng, key: Date.now() });
     guideSpeak(`${stop.arrived} ${stop.why || ""}`.trim());
     stopPickerTimerRef.current = setTimeout(() => {
       setStopPickerOpen(true);
@@ -499,6 +581,8 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     }
     setMode("idle");
     setFollowGps(false);
+    setRideStartedAt(null);
+    knoopPassedAtRef.current = new Map();
   }
 
   function onMove(here, fromGps = false) {
@@ -574,6 +658,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   async function startLive() {
     stopTracking();
+    knoopPassedAtRef.current = new Map();
+    setRideStartedAt(Date.now());
+    setNowTick(Date.now());
     setMode("live");
     setPhase("intro");
     setFollowGps(true);
@@ -602,6 +689,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   function startDemo() {
     stopTracking();
+    knoopPassedAtRef.current = new Map();
+    setRideStartedAt(Date.now());
+    setNowTick(Date.now());
     setMode("demo");
     const total = routeLength(plan.geometry);
     const started = performance.now();
@@ -1080,7 +1170,24 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                   className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""} ${stop.matches_wish ? "wish" : ""} ${stop.matches_wish && !stop.on_route ? "wish-off-route" : ""}`}
                   onClick={() => openStopSuggestion(stop)}
                 >
-                  <span className="num">{index + 1}</span>
+                  {stop.matches_wish ? (
+                    <span
+                      className="num wish-num"
+                      aria-hidden="true"
+                      dangerouslySetInnerHTML={{
+                        __html: wishPoiSvg(
+                          stop.interest,
+                          stop.kind_label || stop.kind,
+                          stop.name,
+                          16,
+                        ),
+                      }}
+                    />
+                  ) : (
+                    <span className="num" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                  )}
                   <span>
                     <strong>{stop.name}</strong>
                     <br />
@@ -1095,7 +1202,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
             </div>
           </div>
         )}
-        {plan.notes?.trim() && wishStopsOnRoute.length > 0 && suggestionStops.length === 0 && (
+        {plan.notes?.trim() && wishStops.some((stop) => stop.on_route) && suggestionStops.length === 0 && (
           <p className="sources" style={{ margin: "0 0 12px" }}>
             Je wens ligt op de route — zie het pictogram op de kaart.
           </p>
@@ -1132,6 +1239,13 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       </aside>
 
       <section className="map-wrap">
+        {knoopProgress && (
+          <div className="knoop-progress" aria-label="Knooppunten onderweg">
+            <KnoopProgressCard label="Vorige" item={knoopProgress.prev} />
+            <KnoopProgressCard label="Nu" item={knoopProgress.current} current />
+            <KnoopProgressCard label="Volgende" item={knoopProgress.next} />
+          </div>
+        )}
         <MapContainer center={[plan.start.lat, plan.start.lng]} zoom={13} scrollWheelZoom zoomControl={false}>
           <TileLayer attribution={MAP_TILE.attribution} url={MAP_TILE.url} />
           <MapResize />
@@ -1160,22 +1274,39 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               </Popup>
             </Marker>
           ))}
-          {wishStopsOnRoute.map((stop) => (
+          {wishStops.map((stop) => (
             <Marker
               key={`wish-${stop.id}`}
               position={[stop.lat, stop.lng]}
-              icon={wishPoiIcon({ interest: stop.interest, kind: stop.kind })}
+              icon={wishPoiIcon({
+                interest: stop.interest,
+                kind: stop.kind_label || stop.kind,
+                name: stop.name,
+                selected: Boolean(stop.on_route) || routePoiIds.includes(stop.id),
+              })}
               zIndexOffset={1500}
+              eventHandlers={{
+                click: (event) => {
+                  if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+                  openStopSuggestion(stop);
+                },
+              }}
             >
               <Popup>
                 <strong>{stop.name}</strong>
                 <p style={{ margin: "6px 0 0" }}>
-                  Past bij je wens · op je route
-                  {stop.kind ? ` · ${stop.kind}` : ""}
+                  Past bij je wens
+                  {stop.on_route || routePoiIds.includes(stop.id) ? " · op je route" : ""}
+                  {stop.kind_label || stop.kind ? ` · ${stop.kind_label || stop.kind}` : ""}
                 </p>
               </Popup>
             </Marker>
           ))}
+          <FocusPulse
+            position={focusPulse}
+            token={focusPulse?.key}
+            onDone={() => setFocusPulse(null)}
+          />
           {mode === "demo" && <Marker position={[position.lat, position.lng]} icon={bikeIcon} />}
           <HereMarker position={gps} accuracy={gps?.accuracy} />
           <MapFlyTo position={gps} trigger={locateTick} zoom={16} />
@@ -1198,7 +1329,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           />
         </div>
         {currentStep && mode !== "idle" && (
-          <div className="nav-banner">
+          <div className={`nav-banner${knoopProgress ? " with-knoop-progress" : ""}`}>
             <div className="kicker">
               {nextKnoop
                 ? `Knooppunt ${nextKnoop.number} · ${formatDistance(nextKnoop.distance)} · ${compassLabel(nextKnoop.course)}`
@@ -1277,12 +1408,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                 </p>
               ) : null}
               <p className="sources" style={{ margin: "10px 0 0" }}>
-                {routePoiIds.includes(focusedStop.id)
-                  ? "Deze plek zit al in je aangepaste route."
-                  : "Wil je deze suggestie meenemen in je route? De fietsroute wordt dan automatisch aangepast."}
+                {focusedStop.on_route || routePoiIds.includes(focusedStop.id)
+                  ? "Deze plek zit al in je route."
+                  : "Wil je deze plek meenemen in je route? De fietsroute wordt dan automatisch aangepast."}
               </p>
               <div className="poi-picker-actions">
-                {routePoiIds.includes(focusedStop.id) ? (
+                {focusedStop.on_route || routePoiIds.includes(focusedStop.id) ? (
                   <button type="button" className="ghost mode-picker-cancel" onClick={closeStopPicker}>
                     Sluiten
                   </button>
@@ -1440,6 +1571,28 @@ function RideKnoopMarkers({ nodes, nodeVariant, onToggle, customIds }) {
       />
     );
   });
+}
+
+function formatElapsed(ms) {
+  const secs = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (secs < 60) return `${Math.round(secs)} sec`;
+  return formatDuration(Math.round(secs / 60));
+}
+
+function KnoopProgressCard({ label, item, current = false }) {
+  return (
+    <div className={`knoop-progress-card${current ? " current" : ""}`}>
+      <span className="kicker">{label}</span>
+      {item ? (
+        <>
+          <strong>{item.number}</strong>
+          <small>{formatKm(item.alongM / 1000)} · {formatElapsed(item.timeMs)}</small>
+        </>
+      ) : (
+        <strong className="knoop-progress-empty">—</strong>
+      )}
+    </div>
+  );
 }
 
 function FitRoute({ geometry, nodes }) {
