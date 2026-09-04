@@ -503,35 +503,14 @@ def _horeca_query(
         around = f"around:{radius_m},{plat:.5f},{plng:.5f}"
         for filt in filters:
             clauses.append(f"nwr{filt}{name_filter}({around});")
-    limit = 80 if require_name else 120
-    return f"[out:json][timeout:20];({''.join(clauses)});out center {limit};"
+    limit = 100 if require_name else 150
+    return f"[out:json][timeout:35];({''.join(clauses)});out center {limit};"
 
 
-async def fetch_horeca(
-    lat: float,
-    lng: float,
-    radius_m: int,
-    extra_point: tuple[float, float] | None = None,
-    prefs: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    radius_m = max(2500, min(radius_m, 16000))
-    points = [(lat, lng)]
-    if extra_point:
-        points.append(extra_point)
-    filters = []
-    for pref in prefs or []:
-        filters.extend(HORECA_PREF_FILTERS.get(pref, []))
-    if not filters:
-        filters = [HORECA_FILTER]
-    try:
-        data = await _overpass(_horeca_query(points, radius_m, filters, require_name=True))
-        if not data.get("elements"):
-            data = await _overpass(_horeca_query(points, min(radius_m + 1500, 16000), filters, require_name=False))
-    except Exception:
-        return []
+def _parse_horeca_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     pois: list[dict[str, Any]] = []
-    for element in data.get("elements", []):
+    for element in elements or []:
         tags = element.get("tags") or {}
         name = (tags.get("name:nl") or tags.get("name") or "").strip()
         if not name:
@@ -561,6 +540,266 @@ async def fetch_horeca(
             }
         )
     return pois
+
+
+async def fetch_horeca(
+    lat: float,
+    lng: float,
+    radius_m: int,
+    extra_point: tuple[float, float] | None = None,
+    prefs: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    radius_m = max(2500, min(radius_m, 16000))
+    points = [(lat, lng)]
+    if extra_point:
+        points.append(extra_point)
+    filters = []
+    for pref in prefs or []:
+        filters.extend(HORECA_PREF_FILTERS.get(pref, []))
+    if not filters:
+        filters = [HORECA_FILTER]
+    try:
+        data = await _overpass(_horeca_query(points, radius_m, filters, require_name=True))
+        if not data.get("elements"):
+            data = await _overpass(_horeca_query(points, min(radius_m + 1500, 16000), filters, require_name=False))
+    except Exception:
+        return []
+    return _parse_horeca_elements(data.get("elements") or [])
+
+
+async def _overpass_fast(query: str, *, timeout_s: float = 18.0) -> dict[str, Any]:
+    """Snelle Overpass: alleen eerste werkende mirror, raw POST."""
+    errors: list[str] = []
+    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()]
+    for url in mirrors[:2]:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_s, connect=4.0),
+                headers={"User-Agent": settings.user_agent},
+                follow_redirects=True,
+            ) as http:
+                response = await http.post(
+                    url,
+                    content=query.encode("utf-8"),
+                    headers={
+                        "User-Agent": settings.user_agent,
+                        "Content-Type": "text/plain; charset=utf-8",
+                    },
+                )
+                if response.status_code >= 400:
+                    errors.append(f"{url} -> HTTP {response.status_code}")
+                    continue
+                payload = response.json()
+                remark = str(payload.get("remark") or "")
+                if "error" in remark.lower() or "runtime error" in remark.lower():
+                    errors.append(f"{url} -> {remark[:120]}")
+                    continue
+                return payload
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url} -> {type(exc).__name__}")
+            continue
+    raise RuntimeError("Overpass (fast) faalde: " + "; ".join(errors))
+
+
+async def fetch_horeca_along_points(
+    points: list[tuple[float, float]],
+    radius_m: int,
+    prefs: list[str] | None = None,
+    *,
+    chunk_size: int = 4,
+    max_points: int = 8,
+) -> list[dict[str, Any]]:
+    """Zoek cafés/horeca langs een route — Overpass + Nominatim parallel (niet minuten wachten)."""
+    radius_m = max(3500, min(int(radius_m), 14000))
+    cleaned: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        cleaned.append((float(lat), float(lng)))
+    if not cleaned:
+        return []
+    if len(cleaned) > max_points:
+        step = max(1, (len(cleaned) - 1) // (max_points - 1))
+        spaced = [cleaned[0]]
+        for index in range(step, len(cleaned) - 1, step):
+            spaced.append(cleaned[index])
+            if len(spaced) >= max_points - 1:
+                break
+        if cleaned[-1] != spaced[-1]:
+            spaced.append(cleaned[-1])
+        cleaned = spaced[:max_points]
+
+    filters: list[str] = []
+    for pref in prefs or []:
+        filters.extend(HORECA_PREF_FILTERS.get(pref, []))
+    if not filters:
+        filters = [HORECA_FILTER]
+
+    async def _overpass_path() -> list[dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        # Max 2 chunks — daarna stoppen i.p.v. alle mirrors uitputten.
+        size = max(2, min(chunk_size, 4))
+        for index in range(0, min(len(cleaned), size * 2), size):
+            chunk = cleaned[index : index + size]
+            try:
+                data = await _overpass_fast(
+                    _horeca_query(chunk, radius_m, filters, require_name=True),
+                    timeout_s=16.0,
+                )
+            except Exception:
+                continue
+            for poi in _parse_horeca_elements(data.get("elements") or []):
+                found[str(poi["id"])] = poi
+            if len(found) >= 12:
+                break
+        return list(found.values())
+
+    async def _fallback_path() -> list[dict[str, Any]]:
+        nomi = await fetch_horeca_nominatim_along_points(cleaned, max_points=min(6, len(cleaned)), per_point=8)
+        if len(nomi) >= 6:
+            return nomi
+        photon = await fetch_horeca_photon_along_points(cleaned, max_points=min(6, len(cleaned)))
+        merged: dict[str, dict[str, Any]] = {str(p["id"]): p for p in nomi}
+        for poi in photon:
+            merged[str(poi["id"])] = poi
+        return list(merged.values())
+
+    overpass_task = asyncio.create_task(_overpass_path())
+    fallback_task = asyncio.create_task(_fallback_path())
+    merged: dict[str, dict[str, Any]] = {}
+
+    done, pending = await asyncio.wait(
+        {overpass_task, fallback_task},
+        timeout=35.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in done:
+        try:
+            for poi in task.result() or []:
+                merged[str(poi["id"])] = poi
+        except Exception:
+            continue
+
+    # Als we al genoeg hebben: rest annuleren.
+    if len(merged) >= 8:
+        for task in pending:
+            task.cancel()
+        return list(merged.values())
+
+    if pending:
+        done2, still = await asyncio.wait(pending, timeout=25.0)
+        for task in still:
+            task.cancel()
+        for task in done2:
+            try:
+                for poi in task.result() or []:
+                    merged[str(poi["id"])] = poi
+            except Exception:
+                continue
+
+    return list(merged.values())
+
+
+async def fetch_horeca_photon_along_points(
+    points: list[tuple[float, float]],
+    *,
+    max_points: int = 10,
+    per_point: int = 12,
+) -> list[dict[str, Any]]:
+    """Horeca via Photon (Komoot) als Overpass niet meewerkt."""
+    cleaned: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        cleaned.append((float(lat), float(lng)))
+    if not cleaned:
+        return []
+    if len(cleaned) > max_points:
+        step = max(1, (len(cleaned) - 1) // (max_points - 1))
+        spaced = [cleaned[i] for i in range(0, len(cleaned), step)][: max_points - 1]
+        if cleaned[-1] not in spaced:
+            spaced.append(cleaned[-1])
+        cleaned = spaced[:max_points]
+
+    tags = ("amenity:cafe", "amenity:pub", "amenity:bar", "amenity:restaurant", "amenity:biergarten")
+    queries = ("café", "cafe", "restaurant", "pub")
+    merged: dict[str, dict[str, Any]] = {}
+
+    async def _one(lat: float, lng: float, query: str, osm_tag: str) -> list[dict[str, Any]]:
+        try:
+            async with client() as http:
+                response = await http.get(
+                    "https://photon.komoot.io/api/",
+                    params={
+                        "q": query,
+                        "lat": lat,
+                        "lon": lng,
+                        "limit": per_point,
+                        "lang": "nl",
+                        "osm_tag": osm_tag,
+                        "bbox": "2.3,49.45,6.45,51.55",
+                    },
+                    timeout=httpx.Timeout(12.0, connect=5.0),
+                )
+                if response.status_code >= 400:
+                    return []
+                payload = response.json()
+        except Exception:
+            return []
+        rows: list[dict[str, Any]] = []
+        for feature in payload.get("features") or []:
+            geometry = feature.get("geometry") or {}
+            coords = geometry.get("coordinates") or []
+            props = feature.get("properties") or {}
+            if len(coords) < 2:
+                continue
+            name = str(props.get("name") or "").strip()
+            if not name:
+                continue
+            plat, plng = float(coords[1]), float(coords[0])
+            osm_value = str(props.get("osm_value") or props.get("type") or "cafe")
+            osm_id = props.get("osm_id") or unique_key(name, plat, plng)
+            rows.append(
+                {
+                    "id": f"horeca-photon-{osm_id}",
+                    "name": name,
+                    "lat": plat,
+                    "lng": plng,
+                    "kind": osm_value,
+                    "kind_label": kind_label(osm_value),
+                    "interest": "horeca",
+                    "source": "Photon",
+                    "wikipedia": None,
+                    "wikidata": props.get("wikidata"),
+                    "description": "",
+                    "heritage": "",
+                }
+            )
+        return rows
+
+    tasks = []
+    for lat, lng in cleaned:
+        for query, tag in zip(queries, tags, strict=False):
+            tasks.append(_one(lat, lng, query, tag))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        for poi in result:
+            # Houd Photon-hits redelijk dicht bij een samplepunt.
+            if any(haversine_m(poi["lat"], poi["lng"], lat, lng) <= 9000 for lat, lng in cleaned):
+                merged[str(poi["id"])] = poi
+    return list(merged.values())
 
 
 async def fetch_poi_at(lat: float, lng: float, *, name: str | None = None, radius_m: int = 70) -> dict[str, Any] | None:
@@ -616,24 +855,164 @@ async def fetch_poi_at(lat: float, lng: float, *, name: str | None = None, radiu
 async def _overpass(query: str) -> dict[str, Any]:
     errors: list[str] = []
     mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()]
-    async with client() as http:
-        for url in mirrors:
-            try:
-                response = await http.post(
-                    url,
-                    content=query.encode("utf-8"),
-                    headers={"Content-Type": "text/plain; charset=utf-8"},
-                    timeout=httpx.Timeout(20.0, connect=6.0),
-                )
+
+    async def _try(url: str, *, as_form: bool) -> dict[str, Any] | None:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(28.0, connect=5.0),
+                headers={"User-Agent": settings.user_agent},
+                follow_redirects=True,
+            ) as http:
+                if as_form:
+                    response = await http.post(url, data={"data": query})
+                else:
+                    response = await http.post(
+                        url,
+                        content=query.encode("utf-8"),
+                        headers={
+                            "User-Agent": settings.user_agent,
+                            "Content-Type": "text/plain; charset=utf-8",
+                        },
+                    )
                 if response.status_code >= 400:
-                    errors.append(f"{url} -> HTTP {response.status_code}")
-                    continue
+                    errors.append(f"{url} form={as_form} -> HTTP {response.status_code}")
+                    return None
                 payload = response.json()
                 remark = str(payload.get("remark") or "")
                 if "error" in remark.lower() or "runtime error" in remark.lower():
-                    errors.append(f"{url} -> {remark[:120]}")
-                    continue
+                    errors.append(f"{url} form={as_form} -> {remark[:120]}")
+                    return None
                 return payload
-            except Exception as exc:  # noqa: BLE001 - try next mirror
-                errors.append(f"{url} -> {type(exc).__name__}: {exc or 'geen bericht'}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url} form={as_form} -> {type(exc).__name__}: {exc or 'geen bericht'}")
+            return None
+
+    # Raw body eerst (werkt betrouwbaarder op kumi), daarna form-encoded.
+    for url in mirrors:
+        for as_form in (False, True):
+            payload = await _try(url, as_form=as_form)
+            if payload is not None:
+                return payload
     raise RuntimeError("Overpass API reageerde niet: " + "; ".join(errors))
+
+
+async def fetch_horeca_nominatim_along_points(
+    points: list[tuple[float, float]],
+    *,
+    max_points: int = 8,
+    per_point: int = 10,
+) -> list[dict[str, Any]]:
+    """Horeca via Nominatim als Overpass/Photon niet meewerken."""
+    cleaned: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        cleaned.append((float(lat), float(lng)))
+    if not cleaned:
+        return []
+    if len(cleaned) > max_points:
+        step = max(1, (len(cleaned) - 1) // (max_points - 1))
+        spaced = [cleaned[i] for i in range(0, len(cleaned), step)][: max_points - 1]
+        if cleaned[-1] not in spaced:
+            spaced.append(cleaned[-1])
+        cleaned = spaced[:max_points]
+
+    merged: dict[str, dict[str, Any]] = {}
+    queries = ("café", "restaurant")
+
+    async def _one(lat: float, lng: float, query: str) -> None:
+        delta = 0.06  # ~6–7 km
+        viewbox = f"{lng - delta},{lat + delta},{lng + delta},{lat - delta}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=5.0),
+                headers={
+                    "User-Agent": settings.nominatim_user_agent,
+                    "Accept": "application/json",
+                    "Accept-Language": "nl,en",
+                },
+                follow_redirects=True,
+            ) as http:
+                response = await http.get(
+                    f"{settings.nominatim_url}/search",
+                    params={
+                        "q": query,
+                        "format": "jsonv2",
+                        "limit": per_point,
+                        "viewbox": viewbox,
+                        "bounded": 1,
+                        "countrycodes": "be",
+                        "addressdetails": 0,
+                    },
+                )
+                if response.status_code >= 400:
+                    return
+                rows = response.json()
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            try:
+                plat = float(row["lat"])
+                plng = float(row["lon"])
+                name = str(row.get("name") or row.get("display_name") or "").split(",")[0].strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not name:
+                continue
+            kind = "cafe"
+            cls = str(row.get("class") or "")
+            typ = str(row.get("type") or "")
+            if cls == "amenity" and typ in {
+                "cafe",
+                "pub",
+                "bar",
+                "restaurant",
+                "biergarten",
+                "fast_food",
+                "ice_cream",
+            }:
+                kind = typ
+            elif cls in {"amenity", "tourism"} and typ:
+                kind = typ
+            else:
+                # Geen duidelijke horeca-hit (bv. straat/adres) → overslaan.
+                blob = f"{name} {row.get('display_name') or ''}".lower()
+                if not any(
+                    key in blob
+                    for key in ("café", "cafe", "restaurant", "brasserie", "pub", "bar ", "bistro")
+                ):
+                    continue
+                if query == "restaurant" or "restaurant" in blob:
+                    kind = "restaurant"
+            if name.isdigit() or len(name) < 3:
+                continue
+            pid = f"horeca-nom-{row.get('osm_type', 'n')}{row.get('osm_id') or unique_key(name, plat, plng)}"
+            merged[pid] = {
+                "id": pid,
+                "name": name,
+                "lat": plat,
+                "lng": plng,
+                "kind": kind,
+                "kind_label": kind_label(kind),
+                "interest": "horeca",
+                "source": "Nominatim",
+                "wikipedia": None,
+                "wikidata": None,
+                "description": "",
+                "heritage": "",
+            }
+
+    tasks = [_one(lat, lng, query) for lat, lng in cleaned for query in queries]
+    # Nominatim rate-limit: kleine batches, korte pauze.
+    for index in range(0, len(tasks), 4):
+        await asyncio.gather(*tasks[index : index + 4], return_exceptions=True)
+        if index + 4 < len(tasks):
+            await asyncio.sleep(0.85)
+    return list(merged.values())

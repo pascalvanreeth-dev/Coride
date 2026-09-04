@@ -132,6 +132,7 @@ async def rank_wish_poi_suggestions(
         f"Kies bij voorkeur {wanted} plekken (minstens {lo}, max {hi}). "
         "Geef diversiteit (niet allemaal hetzelfde type of dezelfde stad). "
         "Prefer plekken met on_route=true als die passen. "
+        "Als er kandidaten zijn die bij de wens passen, kies die — zeg niet dat er niets is. "
         "JSON: {pick_ids: [id strings, beste eerst], hints: {id: korte reden max 12 woorden}, summary: 1 zin}. "
         "Alleen ids uit plekken. Nederlands. Verzin geen plekken.",
         json.dumps(

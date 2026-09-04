@@ -1309,13 +1309,13 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           />
           {mode === "demo" && <Marker position={[position.lat, position.lng]} icon={bikeIcon} />}
           <HereMarker position={gps} accuracy={gps?.accuracy} />
-          <MapFlyTo position={gps} trigger={locateTick} zoom={16} />
+          <MapFlyTo position={locateTick > 0 ? gps : null} trigger={locateTick} zoom={16} />
           <MapFlyTo
             position={focusTarget}
             trigger={focusTarget?.key || 0}
             zoom={15}
           />
-          <FitRoute geometry={plan.geometry} nodes={plan.knooppunten} />
+          <FitRoute geometry={plan.geometry} nodes={plan.knooppunten} start={plan.start} />
           <Follow position={mode === "demo" ? position : gps || position} enabled={mode === "demo" || followGps} />
           </MapZoomScale>
         </MapContainer>
@@ -1595,7 +1595,7 @@ function KnoopProgressCard({ label, item, current = false }) {
   );
 }
 
-function FitRoute({ geometry, nodes }) {
+function FitRoute({ geometry, nodes, start }) {
   const map = useMap();
   useEffect(() => {
     const points = [];
@@ -1609,9 +1609,16 @@ function FitRoute({ geometry, nodes }) {
         }
       }
     }
-    if (points.length < 2) return;
-    map.fitBounds(points, { padding: [48, 48], maxZoom: 14 });
-  }, [geometry, nodes, map]);
+    if (points.length >= 2) {
+      map.fitBounds(points, { padding: [48, 48], maxZoom: 14 });
+      return;
+    }
+    const lat = Number(start?.lat);
+    const lng = Number(start?.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      map.setView([lat, lng], 14);
+    }
+  }, [geometry, nodes, start, map]);
   return null;
 }
 

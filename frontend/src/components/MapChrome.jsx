@@ -87,7 +87,7 @@ export default function MapChrome({
     } catch (err) {
       setError(
         err?.message?.includes("fetch")
-          ? "Zoeken lukt niet. Controleer of de backend draait op poort 8000."
+          ? "Zoeken lukt niet. Controleer of de backend draait."
           : err?.message || "Zoeken mislukt. Probeer opnieuw.",
       );
       setResults([]);

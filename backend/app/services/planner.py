@@ -12,7 +12,7 @@ from app.services import places as places_service
 from app.services import pois as pois_service
 from app.services import routing
 from app.services import suggestions as suggestion_service
-from app.services import wikipedia
+from app.services import weather as weather_service
 from app.services import wikipedia
 from app.services.ai import enrich_with_ai, fallback_scripts, has_ai, interpret_wish_notes, polish_scripts, rank_wish_poi_suggestions
 from app.services.geo import (
@@ -591,6 +591,68 @@ async def preview_route(
         ],
         "knoop_chain": knoop_service.chain_label(knoop_chain_display),
         "suggestions": suggestions,
+    }
+
+
+def _format_wish_suggestions(wish_pois: list[dict[str, Any]], notes: str) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    note_interests = pois_service.interests_from_notes(notes)
+    fallback_interest = note_interests[0] if note_interests else "geschiedenis"
+    for poi in wish_pois:
+        try:
+            suggestions.append(
+                {
+                    "id": str(poi["id"]),
+                    "name": poi["name"],
+                    "lat": float(poi["lat"]),
+                    "lng": float(poi["lng"]),
+                    "kind": str(poi.get("kind") or "plek"),
+                    "kind_label": poi.get("kind_label"),
+                    "interest": poi.get("interest") or fallback_interest,
+                    "on_route": bool(poi.get("on_route")),
+                    "hint": poi.get("hint"),
+                }
+            )
+        except Exception:
+            continue
+    return suggestions
+
+
+async def wish_suggestions_along_route(
+    notes: str,
+    geometry: list[list[float]],
+    nodes: list[Any] | None = None,
+    profile_interests: list[str] | None = None,
+) -> dict[str, Any]:
+    """Suggesties voor een bestaande (manuele) knooppuntenroute op basis van extra wens."""
+    if not (notes or "").strip() or not geometry or len(geometry) < 2:
+        return {"suggestions": [], "wish_summary": None}
+    chain: list[dict[str, Any]] = []
+    for node in nodes or []:
+        data = node.model_dump() if hasattr(node, "model_dump") else dict(node)
+        if data.get("lat") is None or data.get("lng") is None:
+            continue
+        chain.append(
+            {
+                "id": data.get("id") or "",
+                "number": str(data.get("number") or ""),
+                "lat": float(data["lat"]),
+                "lng": float(data["lng"]),
+                "network": data.get("network"),
+                "geoid": data.get("geoid"),
+            }
+        )
+    wish_pois, wish_summary = await _wish_pois_for_geometry(
+        notes,
+        [],
+        [],
+        chain,
+        geometry,
+        profile_interests,
+    )
+    return {
+        "suggestions": _format_wish_suggestions(wish_pois, notes),
+        "wish_summary": wish_summary or None,
     }
 
 
@@ -1352,44 +1414,74 @@ async def _wish_pois_for_geometry(
     route_km = _geometry_length_km(geometry)
     target = _wish_suggestion_target(route_km, wish_interests)
     route_candidates = _merge(candidates, ranked)
+    want_horeca = pois_service.notes_want_horeca(notes, wish_interests)
 
-    # Langere routes: dichter bemonsteren langs de hele corridor (niet alleen start).
-    sample_count = max(8, min(16, int(round(route_km / 6.0)) or 8))
+    # Langere routes: spaarzaam bemonsteren + ruime straal (weinig Overpass-calls).
+    sample_count = max(8, min(14, int(round(route_km / 10.0)) or 8))
     sample_points = _sample_route_points(geometry, sample_count)
+    # Een handvol knooppunten meenemen (dorpen), niet allemaal — dat maakt Overpass te traag.
+    for node in (chain or [])[:: max(1, len(chain or []) // 6 or 1)][:8]:
+        try:
+            sample_points.append((float(node["lat"]), float(node["lng"])))
+        except (KeyError, TypeError, ValueError):
+            continue
     if _notes_want_halfway(notes):
         midpoint = _route_midpoint(geometry)
         if midpoint:
             sample_points.append(midpoint)
-    corridor_m = 4200 if route_km >= 40 else 3500
-    if wish_interests:
+    corridor_m = 8000 if route_km >= 80 else (6500 if route_km >= 40 else 4500)
+    corridor_keep_m = 7000 if route_km >= 80 else (5000 if route_km >= 40 else 2800)
+
+    # Horeca (café/…) — geen korte outer-timeout die alles weggooit bij trage mirrors.
+    if want_horeca:
+        try:
+            horeca = await pois_service.fetch_horeca_along_points(
+                sample_points,
+                corridor_m,
+                max_points=8,
+                chunk_size=4,
+            )
+        except Exception:
+            horeca = []
+        if len(horeca) < 5:
+            try:
+                nomi = await pois_service.fetch_horeca_nominatim_along_points(
+                    sample_points, max_points=6, per_point=8
+                )
+                horeca = _merge(horeca, nomi)
+            except Exception:
+                pass
+        route_candidates = _merge(route_candidates, horeca)
+
+    other_interests = [item for item in wish_interests if not (want_horeca and item == "horeca")]
+    if other_interests:
+        along = await _optional(
+            pois_service.fetch_pois_along_points(
+                sample_points,
+                corridor_m,
+                other_interests,
+                max_points=min(18, len(sample_points)),
+            ),
+            [],
+            50,
+        )
+        route_candidates = _merge(route_candidates, along)
+    elif wish_interests and not want_horeca:
         along = await _optional(
             pois_service.fetch_pois_along_points(
                 sample_points,
                 corridor_m,
                 wish_interests,
-                max_points=len(sample_points),
+                max_points=min(18, len(sample_points)),
             ),
             [],
-            45,
+            50,
         )
         route_candidates = _merge(route_candidates, along)
-    if pois_service.notes_want_horeca(notes, wish_interests):
-        horeca_points = sample_points[: max(6, min(12, len(sample_points)))]
-        horeca_parts = await asyncio.gather(
-            *[
-                _optional(pois_service.fetch_horeca(plat, plng, corridor_m), [], 22)
-                for plat, plng in horeca_points
-            ],
-            return_exceptions=True,
-        )
-        for part in horeca_parts:
-            if isinstance(part, list):
-                route_candidates = _merge(route_candidates, part)
 
     # Houd plekken bij de route-corridor (niet enkel dicht bij een knooppunt).
     near = []
     seen_near: set[str] = set()
-    corridor_keep_m = 2800 if route_km >= 40 else 2200
     for poi in route_candidates:
         pid = str(poi.get("id") or "")
         key = pid or unique_key(poi.get("name") or "", poi["lat"], poi["lng"])
@@ -1398,12 +1490,11 @@ async def _wish_pois_for_geometry(
         wish = pois_service.matches_notes(poi, notes) or (
             bool(wish_set) and poi.get("interest") in wish_set
         )
-        if not wish and not (bool(wish_set) and poi.get("interest") in wish_set):
-            # Alleen wens-relevante kandidaten in het suggestieoverzicht.
-            if not pois_service.matches_notes(poi, notes):
+        if not wish and not pois_service.matches_notes(poi, notes):
+            if not (bool(wish_set) and poi.get("interest") in wish_set):
                 continue
         near_knoop = any(
-            haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < (3000 if wish else 1400)
+            haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < (3500 if wish else 1400)
             for n in chain
         ) if chain else False
         near_line = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
@@ -1412,6 +1503,20 @@ async def _wish_pois_for_geometry(
             seen_near.add(key)
     if not near:
         near = _near_chain(route_candidates, chain, notes) if route_candidates else []
+    # Laatste redmiddel: horeca-kandidaten dichter bij samplepunten houden, niet wegfilteren.
+    if want_horeca and route_candidates:
+        have = {str(p.get("id")) for p in near if p.get("id")}
+        for poi in route_candidates:
+            if poi.get("interest") != "horeca":
+                continue
+            pid = str(poi.get("id") or "")
+            if pid in have:
+                continue
+            if _on_route_geometry(poi, geometry, max_m=max(corridor_keep_m, 9000)) or any(
+                haversine_m(poi["lat"], poi["lng"], plat, plng) <= 9000 for plat, plng in sample_points
+            ):
+                near.append(poi)
+                have.add(pid)
 
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1437,11 +1542,11 @@ async def _wish_pois_for_geometry(
             continue
         seen.add(pid)
         tagged = dict(poi)
-        tagged["on_route"] = _on_route_geometry(poi, geometry)
+        tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
         result.append(tagged)
 
     # Op lange routes iets dichter bij elkaar toegestaan, anders blijft de lijst te kort.
-    min_gap = 450 if route_km >= 50 else 550
+    min_gap = 400 if route_km >= 50 else 550
     diverse = pois_service.pick_diverse_pois(
         result,
         wish_interests or list(wish_set) or ["geschiedenis"],
@@ -1449,7 +1554,7 @@ async def _wish_pois_for_geometry(
         min_distance_m=min_gap,
     )
     for poi in diverse:
-        poi["on_route"] = _on_route_geometry(poi, geometry)
+        poi["on_route"] = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
     diverse.sort(key=lambda item: (0 if item.get("on_route") else 1, (item.get("name") or "").lower()))
 
     wish_summary = ""
@@ -1457,7 +1562,7 @@ async def _wish_pois_for_geometry(
         pool = _merge(
             diverse,
             [
-                dict(poi, on_route=_on_route_geometry(poi, geometry))
+                dict(poi, on_route=_on_route_geometry(poi, geometry, max_m=corridor_keep_m))
                 for poi in ordered
                 if fits_wish(poi)
             ],
@@ -1466,41 +1571,51 @@ async def _wish_pois_for_geometry(
             pool = _merge(
                 pool,
                 [
-                    dict(poi, on_route=_on_route_geometry(poi, geometry))
-                    for poi in near[:120]
+                    dict(poi, on_route=_on_route_geometry(poi, geometry, max_m=corridor_keep_m))
+                    for poi in near[:160]
                     if poi.get("interest") in wish_set or fits_wish(poi)
                 ],
             )
         for poi in pool:
             poi["route_progress"] = _route_progress(poi, geometry)
-            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(poi, geometry)
+            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(
+                poi, geometry, max_m=corridor_keep_m
+            )
         for poi in result:
             poi["route_progress"] = _route_progress(poi, geometry)
-            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(poi, geometry)
-        ai_rank = await rank_wish_poi_suggestions(
-            notes,
-            pool,
-            profile_interests,
-            wish_interests,
-            target_count=target,
-            route_km=route_km,
+            poi["on_route"] = bool(poi.get("on_route")) or _on_route_geometry(
+                poi, geometry, max_m=corridor_keep_m
+            )
+        ai_rank = await _optional(
+            rank_wish_poi_suggestions(
+                notes,
+                pool,
+                profile_interests,
+                wish_interests,
+                target_count=target,
+                route_km=route_km,
+            ),
+            None,
+            14,
         )
         if ai_rank:
             wish_summary = str(ai_rank.get("summary") or "").strip()
             pick_ids = ai_rank.get("pick_ids") or []
             hints = ai_rank.get("hints") or {}
             # Alleen AI-picks als start; daarna aanvullen tot target, gespreid over de route.
-            # (Niet de hele pool dumpen — dat gaf óf te weinig óf een willekeurige alfabetlijst.)
             seeded = _ai_wish_seed(pool, pick_ids, hints)
             diverse = _spread_fill_wish_pois(seeded, result or pool, target, geometry)
             for poi in diverse:
-                poi["on_route"] = _on_route_geometry(poi, geometry)
+                poi["on_route"] = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
             diverse.sort(
                 key=lambda item: (
                     item.get("route_progress") if item.get("route_progress") is not None else 1.5,
                     (item.get("name") or "").lower(),
                 )
             )
+        elif result:
+            # AI gaf niets bruikbaars terug: toon OSM-resultaten toch.
+            diverse = _spread_fill_wish_pois(diverse, result, target, geometry)
     elif len(diverse) < target and result:
         diverse = _spread_fill_wish_pois(diverse, result, target, geometry)
     return diverse, wish_summary

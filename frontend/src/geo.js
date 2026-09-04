@@ -405,19 +405,66 @@ export function mergeMapKnooppunten(nearby, routeNodes, pinned = [], geometry = 
   return [...byId.values()];
 }
 
-export function getBrowserLocation() {
+const LAST_LOCATION_KEY = "veloverhaal-last-location";
+const FALLBACK_LOCATION = { lat: 51.05, lng: 3.72, accuracy: 5000 };
+
+export function readCachedLocation() {
+  try {
+    const raw = localStorage.getItem(LAST_LOCATION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const lat = Number(parsed?.lat);
+    const lng = Number(parsed?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    return {
+      lat,
+      lng,
+      accuracy: Number(parsed?.accuracy) || 100,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function rememberLocation(position) {
+  if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) return;
+  try {
+    localStorage.setItem(
+      LAST_LOCATION_KEY,
+      JSON.stringify({
+        lat: position.lat,
+        lng: position.lng,
+        accuracy: position.accuracy || 100,
+        at: Date.now(),
+      }),
+    );
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+export function getBrowserLocation(options = {}) {
+  const {
+    enableHighAccuracy = true,
+    timeout = 15000,
+    maximumAge = 4000,
+  } = options;
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {
       reject(new Error("GPS is niet beschikbaar in deze browser."));
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      (pos) =>
-        resolve({
+      (pos) => {
+        const next = {
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
           accuracy: pos.coords.accuracy || 25,
-        }),
+        };
+        rememberLocation(next);
+        resolve(next);
+      },
       (err) => {
         if (err?.code === 1) {
           reject(new Error("GPS-toegang geweigerd. Sta locatie toe voor deze site."));
@@ -427,7 +474,32 @@ export function getBrowserLocation() {
           reject(new Error("GPS duurde te lang. Open de site via http://localhost:5173 en probeer opnieuw."));
         }
       },
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 4000 },
+      { enableHighAccuracy, timeout, maximumAge },
     );
   });
+}
+
+/** Snelle startlocatie: cache / snelle GPS eerst, daarna nauwkeuriger. */
+export async function getStartupLocation() {
+  const cached = readCachedLocation();
+  try {
+    const quick = await getBrowserLocation({
+      enableHighAccuracy: false,
+      timeout: 4500,
+      maximumAge: 300000,
+    });
+    return quick;
+  } catch {
+    if (cached) return cached;
+    try {
+      return await getBrowserLocation({
+        enableHighAccuracy: true,
+        timeout: 12000,
+        maximumAge: 0,
+      });
+    } catch {
+      if (cached) return cached;
+      return { ...FALLBACK_LOCATION };
+    }
+  }
 }

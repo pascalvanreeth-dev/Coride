@@ -10,6 +10,7 @@ from app.services import nominatim, photon
 
 BELGIUM = {"min_lng": 2.3, "min_lat": 49.45, "max_lng": 6.45, "max_lat": 51.55}
 COORD_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
+OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
 
 def in_belgium(lat: float, lng: float) -> bool:
@@ -21,17 +22,6 @@ def in_belgium(lat: float, lng: float) -> bool:
 
 def coord_label(lat: float, lng: float) -> str:
     return f"{lat:.5f}, {lng:.5f}"
-
-
-def _query_variants(query: str) -> list[str]:
-    cleaned = query.strip()
-    if not cleaned:
-        return []
-    variants = [cleaned]
-    lower = cleaned.lower()
-    if "belgi" not in lower and "belg" not in lower:
-        variants.append(f"{cleaned}, België")
-    return variants
 
 
 def _rows_to_hits(rows: list[dict], fallback_label: str) -> list[GeocodeHit]:
@@ -56,51 +46,104 @@ def _rows_to_hits(rows: list[dict], fallback_label: str) -> list[GeocodeHit]:
     return [hit for _, _, hit in ranked]
 
 
-async def _search_rows(query: str, limit: int = 5) -> list[dict]:
+async def _open_meteo_search(query: str, limit: int = 5) -> list[dict]:
+    """Snelle stadzoekdienst (Open-Meteo) — werkt als Nominatim/Photon time-outen."""
+    cleaned = query.strip()
+    if not cleaned:
+        return []
     try:
-        return await nominatim.search(query, limit=limit)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            await asyncio.sleep(2.0)
-            try:
-                return await nominatim.search(query, limit=limit)
-            except httpx.HTTPStatusError:
-                return await photon.search(query, limit=limit)
-        if exc.response.status_code == 403:
-            return await photon.search(query, limit=limit)
-        raise
-    except httpx.HTTPError:
-        return await photon.search(query, limit=limit)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as http:
+            response = await http.get(
+                OPEN_METEO_GEOCODE,
+                params={
+                    "name": cleaned,
+                    "count": max(limit, 5),
+                    "language": "nl",
+                    "countryCode": "BE",
+                    "format": "json",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for item in payload.get("results") or []:
+        try:
+            lat = float(item["latitude"])
+            lng = float(item["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not in_belgium(lat, lng):
+            continue
+        parts = [
+            str(item.get("name") or "").strip(),
+            str(item.get("admin2") or "").strip(),
+            str(item.get("admin1") or "").strip(),
+            str(item.get("country") or "België").strip(),
+        ]
+        label = ", ".join(part for part in parts if part)
+        population = float(item.get("population") or 0)
+        rows.append(
+            {
+                "lat": lat,
+                "lon": lng,
+                "display_name": label or cleaned,
+                "importance": min(0.95, 0.4 + population / 500_000),
+                "place_rank": 16 if population >= 20000 else 20,
+            }
+        )
+    return rows
+
+
+async def _search_rows(query: str, limit: int = 5) -> list[dict]:
+    # 1) Open-Meteo eerst (snel & betrouwbaar)
+    rows = await _open_meteo_search(query, limit=limit)
+    if rows:
+        return rows
+
+    # 2) Photon met korte timeout (Nominatim vermijden: kan de globale lock vastzetten)
+    try:
+        rows = await asyncio.wait_for(photon.search(query, limit=limit), timeout=3.0)
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return []
 
 
 async def geocode(query: str, limit: int = 5) -> list[GeocodeHit]:
     hits: list[GeocodeHit] = []
     seen: set[str] = set()
-    for variant in _query_variants(query):
-        rows = await _search_rows(variant, limit=limit)
-        for hit in _rows_to_hits(rows, variant):
-            key = f"{hit.lat:.4f},{hit.lng:.4f}"
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append(hit)
-        if hits:
-            break
+    base = query.strip()
+    if not base:
+        return []
+    rows = await _search_rows(base, limit=limit)
+    for hit in _rows_to_hits(rows, base):
+        key = f"{hit.lat:.4f},{hit.lng:.4f}"
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append(hit)
     return hits[:limit]
 
 
 async def reverse(lat: float, lng: float) -> GeocodeHit | None:
     if not in_belgium(lat, lng):
         raise ValueError("Dit GPS-punt ligt buiten België.")
+    fallback = GeocodeHit(label=coord_label(lat, lng), lat=lat, lng=lng)
+    # Nominatim time-out vaak; nooit de UI blokkeren — korte poging, dan coördinaten.
     try:
-        row = await nominatim.reverse(lat, lng, zoom=16)
+        row = await asyncio.wait_for(nominatim.reverse(lat, lng, zoom=16), timeout=2.5)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in {429, 403}:
-            return GeocodeHit(label=coord_label(lat, lng), lat=lat, lng=lng)
-        raise
+            return fallback
+        return fallback
+    except Exception:
+        return fallback
     if not row or row.get("error"):
-        return GeocodeHit(label=coord_label(lat, lng), lat=lat, lng=lng)
-    return GeocodeHit(label=row.get("display_name") or coord_label(lat, lng), lat=lat, lng=lng)
+        return fallback
+    return GeocodeHit(label=row.get("display_name") or fallback.label, lat=lat, lng=lng)
 
 
 def place_parts(label: str) -> tuple[str | None, str | None]:

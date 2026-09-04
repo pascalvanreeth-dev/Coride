@@ -79,6 +79,19 @@ export async function fetchRoutePreview(payload) {
   return data;
 }
 
+export async function fetchWishSuggestions(payload) {
+  const response = await fetch("/api/wish-suggestions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.detail || "Wenssuggesties konden niet geladen worden.");
+  }
+  return data;
+}
+
 export async function fetchRouteSuggestions(lat, lng, interests = [], used = []) {
   const params = new URLSearchParams({
     lat: String(lat),

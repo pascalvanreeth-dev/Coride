@@ -8,7 +8,8 @@ export const MAP_FLY_PADDING = {
 
 export default function MapFlyTo({ position, trigger = 0, zoom = 15, padding = MAP_FLY_PADDING }) {
   const map = useMap();
-  const lastTrigger = useRef(null);
+  // Alleen vliegen bij een nieuwe trigger (bv. Locatie-knop), niet bij de eerste GPS-fixatie.
+  const lastTrigger = useRef(trigger);
 
   useEffect(() => {
     if (!position) return;

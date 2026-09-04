@@ -1026,6 +1026,19 @@ input, textarea {
   overflow: hidden;
 }
 
+.map-boot-pending {
+  height: 100%;
+  min-height: 280px;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(ellipse at 30% 20%, rgba(199, 0, 104, 0.08), transparent 55%),
+    linear-gradient(160deg, #f4efe8, #ebe4da 60%, #e2d8cc);
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
 .hero-map .leaflet-container,
 .map-wrap .leaflet-container {
   height: 100%;

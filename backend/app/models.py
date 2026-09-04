@@ -237,7 +237,7 @@ class RerouteRequest(BaseModel):
     start_lat: float
     start_lng: float
     nodes: list[Knooppunt]
-    close_loop: bool = True
+    close_loop: bool = False
     end_lat: float | None = None
     end_lng: float | None = None
     reason: AdaptReason | None = None
@@ -277,6 +277,18 @@ class RoutePreviewResponse(BaseModel):
     duration_min: int
     knooppunten: list[Knooppunt] = Field(default_factory=list)
     knoop_chain: str = ""
+    suggestions: list[PoiHit] = Field(default_factory=list)
+    wish_summary: str | None = None
+
+
+class WishSuggestionsRequest(BaseModel):
+    notes: str = Field(default="", max_length=500)
+    interests: list[Interest] = Field(default_factory=list)
+    geometry: list[list[float]] = Field(default_factory=list)
+    nodes: list[Knooppunt] = Field(default_factory=list)
+
+
+class WishSuggestionsResponse(BaseModel):
     suggestions: list[PoiHit] = Field(default_factory=list)
     wish_summary: str | None = None
 

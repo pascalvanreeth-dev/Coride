@@ -2,11 +2,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-from app.models import AskRequest, AskResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse
+from app.models import AskRequest, AskResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
 from app.services.ai import answer_about_stop
 from app.services.geocoding import geocode, reverse
 from app.services import knooppunten as knoop_service
-from app.services.planner import plan_route, preview_route, reroute
+from app.services.planner import plan_route, preview_route, reroute, wish_suggestions_along_route
 from app.services import pois as pois_service
 from app.services import suggestions as suggestion_service
 from app.services import surroundings as surroundings_service
@@ -172,6 +172,22 @@ async def route_preview_endpoint(request: RoutePreviewRequest) -> RoutePreviewRe
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return RoutePreviewResponse(**preview)
+
+
+@app.post("/api/wish-suggestions", response_model=WishSuggestionsResponse)
+async def wish_suggestions_endpoint(request: WishSuggestionsRequest) -> WishSuggestionsResponse:
+    try:
+        data = await wish_suggestions_along_route(
+            request.notes,
+            request.geometry,
+            request.nodes,
+            list(request.interests),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return WishSuggestionsResponse(**data)
 
 
 @app.post("/api/plan", response_model=RoutePlan)

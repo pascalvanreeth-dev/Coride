@@ -3,8 +3,16 @@ import { planRoute } from "./api.js";
 import Onboarding from "./components/Onboarding.jsx";
 import Planner from "./components/Planner.jsx";
 import Ride from "./components/Ride.jsx";
+import { readCachedLocation } from "./geo.js";
 import { loadProfile, saveProfile } from "./profile.js";
 import { recordRouteUse } from "./routeHistory.js";
+
+function initialPreview() {
+  const cached = readCachedLocation();
+  if (cached) return { lat: cached.lat, lng: cached.lng, zoom: 14 };
+  // Geen Gent-default: Planner wacht op GPS vóór de kaart mount.
+  return null;
+}
 
 export default function App() {
   const [profile, setProfile] = useState(() => loadProfile());
@@ -12,9 +20,12 @@ export default function App() {
   const [plan, setPlan] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [preview, setPreview] = useState({ lat: 51.05, lng: 3.72, zoom: 14 });
+  const [preview, setPreview] = useState(initialPreview);
 
-  const center = useMemo(() => [preview.lat, preview.lng], [preview]);
+  const center = useMemo(
+    () => (preview ? [preview.lat, preview.lng] : null),
+    [preview],
+  );
 
   function completeProfile(next) {
     const saved = saveProfile(next);
@@ -47,7 +58,7 @@ export default function App() {
       busy={busy}
       error={error}
       center={center}
-      zoom={preview.zoom}
+      zoom={preview?.zoom ?? 14}
       profile={profile}
       onEditProfile={() => setEditProfile(true)}
       onPreview={setPreview}
