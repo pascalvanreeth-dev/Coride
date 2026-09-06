@@ -6,7 +6,7 @@ import httpx
 from app.config import settings
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
-ROUTING_TIMEOUT = httpx.Timeout(25.0, connect=5.0)
+ROUTING_TIMEOUT = httpx.Timeout(12.0, connect=3.0)
 
 
 @asynccontextmanager

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, fetchWishSuggestions, reverseGeocode, reroute } from "../api.js";
+import { fetchBikeLeg, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, fetchWishSuggestions, reverseGeocode, reroute } from "../api.js";
 import {
   estimateRouteKm,
   formatDuration,
@@ -84,6 +84,23 @@ function sampleGeometryAlongRoute(geometry, maxPoints = 48) {
   return out;
 }
 
+/** Plak een nieuw straatsegment achter de bestaande magenta lijn. */
+function mergeStreetGeometries(base, extension) {
+  if (!extension?.length) return base || [];
+  if (!base?.length) return extension.map((point) => [...point]);
+  const merged = base.map((point) => [...point]);
+  const last = merged[merged.length - 1];
+  const first = extension[0];
+  const sameJoin =
+    last &&
+    first &&
+    haversine({ lat: last[0], lng: last[1] }, { lat: first[0], lng: first[1] }) < 35;
+  for (let index = sameJoin ? 1 : 0; index < extension.length; index += 1) {
+    merged.push([extension[index][0], extension[index][1]]);
+  }
+  return merged;
+}
+
 export default function Planner({ busy, error, center, zoom = 14, profile, onEditProfile, onPreview, onPlan }) {
   const [map, setMap] = useState(null);
   const [start, setStart] = useState("");
@@ -113,6 +130,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const [selectedIds, setSelectedIds] = useState([]);
   const [draft, setDraft] = useState(null);
   const [draftBusy, setDraftBusy] = useState(false);
+  const draftRef = useRef(null);
+  const manualRouteIdsRef = useRef([]);
+  const legCacheRef = useRef(new Map());
+  const routeBuildGenRef = useRef(0);
+  draftRef.current = draft;
   const [suggestions, setSuggestions] = useState([]);
   const [suggestionsBusy, setSuggestionsBusy] = useState(false);
   const [selectedSuggestionId, setSelectedSuggestionId] = useState("");
@@ -137,8 +159,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   );
   originRef.current = origin;
   const reverseKeyRef = useRef("");
-  // Korte debounce zodat de magenta lijn meegroeit tijdens het kiezen.
-  const selectedKey = useDebounced(selectedIds.join(ID_JOIN), 150);
+  // Zelf kiezen: meteen per knooppunt; andere modes: korte debounce.
+  const selectedKeyRaw = selectedIds.join(ID_JOIN);
+  const selectedKeyDebounced = useDebounced(selectedKeyRaw, 150);
+  const selectedKey = buildMode === "manual" ? selectedKeyRaw : selectedKeyDebounced;
   const previewKey = useDebounced(
     origin &&
       ((buildMode === "suggest" && selectedSuggestionId) || buildMode === "auto")
@@ -189,43 +213,23 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     () =>
       mergeMapKnooppunten(
         nodes,
-        routeNodes,
+        // Zelf kiezen: geen via-netwerk-knopen als “op route” op de kaart markeren.
+        buildMode === "manual" ? selectedNodes : routeNodes,
         selectedNodes,
-        draft?.geometry || suggestionPreview?.geometry,
+        buildMode === "manual" ? null : draft?.geometry || suggestionPreview?.geometry,
       ),
-    [nodes, routeNodes, selectedNodes, draft?.geometry, suggestionPreview?.geometry],
+    [buildMode, nodes, routeNodes, selectedNodes, draft?.geometry, suggestionPreview?.geometry],
   );
 
   const estimateKm = estimateRouteKm(origin, selectedNodes, mode !== "punt");
   const liveKm = draft?.distance_km ?? estimateKm;
   const liveMin = draft?.duration_min;
 
-  // Voorlopige magenta lijn: rechte verbindingen tussen gekozen knooppunten (geen lus).
-  const provisionalRouteLine = useMemo(() => {
-    if (buildMode !== "manual" || selectedNodes.length < 2) return null;
-    const pts = [];
-    for (const node of selectedNodes) {
-      if (Number.isFinite(node?.lat) && Number.isFinite(node?.lng)) {
-        pts.push([node.lat, node.lng]);
-      }
-    }
-    return pts.length > 1 ? pts : null;
-  }, [buildMode, selectedNodes]);
-
+  // Magenta groeit meteen (eerst stub, daarna straatsegment); stippellijn = nog bezig.
   const manualRouteLine = useMemo(() => {
-    if (buildMode !== "manual") return null;
-    // Solide magenta zodra de netwerkroute klaar is; anders stippellijn tussen picks.
-    if (draft?.geometry?.length > 1 && !draftBusy) {
-      return { positions: draft.geometry, provisional: false };
-    }
-    if (provisionalRouteLine) {
-      return { positions: provisionalRouteLine, provisional: true };
-    }
-    if (draft?.geometry?.length > 1) {
-      return { positions: draft.geometry, provisional: false };
-    }
-    return null;
-  }, [buildMode, draft?.geometry, draftBusy, provisionalRouteLine]);
+    if (buildMode !== "manual" || !(draft?.geometry?.length > 1)) return null;
+    return { positions: draft.geometry, provisional: draftBusy };
+  }, [buildMode, draft?.geometry, draftBusy]);
 
   const nodeLookupRef = useRef(nodeLookup);
   nodeLookupRef.current = nodeLookup;
@@ -324,6 +328,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     if (buildMode !== "manual" || !selectedKey) {
       setDraft(null);
       setDraftBusy(false);
+      manualRouteIdsRef.current = [];
       return undefined;
     }
     const lookup = nodeLookupRef.current;
@@ -332,23 +337,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       .filter(Boolean)
       .map((id) => lookup.get(id))
       .filter(Boolean);
-    if (!picked.length) {
+    if (picked.length < 2) {
       setDraft(null);
+      setDraftBusy(false);
+      manualRouteIdsRef.current = picked.map((node) => nodeId(node));
       return undefined;
     }
-    const startPoint = mode === "punt" || buildMode === "manual" ? picked[0] : origin;
-    if (!startPoint) {
-      setDraft(null);
-      return undefined;
-    }
-    const endPoint =
-      (mode === "punt" || buildMode === "manual") && picked.length >= 2 ? picked[picked.length - 1] : null;
+
+    const nextIds = picked.map((node) => nodeId(node));
+    const buildId = ++routeBuildGenRef.current;
     let cancelled = false;
-    setDraftBusy(true);
-    reroute({
-      start_lat: startPoint.lat,
-      start_lng: startPoint.lng,
-      nodes: picked.map((node) => ({
+
+    const toDraftNodes = (nodes) =>
+      nodes.map((node) => ({
         id: node.id || "",
         number: node.number,
         lat: node.lat,
@@ -356,39 +357,145 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         network: node.network || null,
         geoid: node.geoid ?? null,
         on_route: true,
-      })),
-      // Zelf kiezen = open A→B route, nooit een gesloten lus.
-      close_loop: buildMode === "manual" ? false : mode !== "punt",
-      end_lat: endPoint?.lat ?? null,
-      end_lng: endPoint?.lng ?? null,
-      poi_picks: pickedWishPois.map((poi) => ({
-        id: poi.id,
-        name: poi.name,
-        lat: poi.lat,
-        lng: poi.lng,
-        kind: poi.kind,
-        kind_label: poi.kind_label || null,
-        interest: poi.interest || "geschiedenis",
-      })),
-    })
-      .then((next) => {
-        if (!cancelled) {
-          setDraft(next);
-          rememberNodes(...(next.knooppunten || []));
+      }));
+
+    const mergeViaChain = (legs) => {
+      const chain = [];
+      for (const leg of legs) {
+        const via = Array.isArray(leg.via_knooppunten) ? leg.via_knooppunten : [];
+        if (!via.length) continue;
+        for (const node of via) {
+          if (chain.length && nodeId(chain[chain.length - 1]) === nodeId(node)) continue;
+          // Ook match op number+coords als ids ontbreken
+          if (
+            chain.length &&
+            String(chain[chain.length - 1].number) === String(node.number) &&
+            Math.abs(chain[chain.length - 1].lat - node.lat) < 0.0003 &&
+            Math.abs(chain[chain.length - 1].lng - node.lng) < 0.0003
+          ) {
+            continue;
+          }
+          chain.push(node);
         }
-      })
-      .catch((err) => {
-        if (!cancelled) {
+      }
+      return chain.length >= 2 ? toDraftNodes(chain) : toDraftNodes(picked);
+    };
+
+    const applyLegs = (legs) => {
+      const geometry = legs.reduce(
+        (acc, leg) => mergeStreetGeometries(acc, leg.geometry || []),
+        [],
+      );
+      if (geometry.length < 2) {
+        throw new Error("Geen fietsroute gevonden langs de knooppunten.");
+      }
+      const distance_km = Number(
+        legs.reduce((sum, leg) => sum + Number(leg.distance_km || 0), 0).toFixed(1),
+      );
+      const duration_min = Math.max(
+        1,
+        Math.round(legs.reduce((sum, leg) => sum + Number(leg.duration_min || 0), 0)),
+      );
+      const knooppunten = mergeViaChain(legs);
+      return {
+        geometry,
+        distance_km,
+        duration_min,
+        knooppunten,
+        knoop_chain: knooppunten.map((node) => node.number).join(" → "),
+        steps: [],
+        reason: "",
+        weather: null,
+      };
+    };
+
+    const straightLeg = (from, to) => ({
+      geometry: [
+        [from.lat, from.lng],
+        [to.lat, to.lng],
+      ],
+      distance_km: Number((haversine(from, to) / 1000).toFixed(2)),
+      duration_min: Math.max(1, Math.round(haversine(from, to) / 250)),
+      steps: [],
+    });
+
+    const publish = (legs, { provisional = false } = {}) => {
+      if (cancelled || buildId !== routeBuildGenRef.current) return;
+      try {
+        const next = applyLegs(legs);
+        setDraft(next);
+        setDraftBusy(provisional);
+        setGeoError("");
+        manualRouteIdsRef.current = nextIds;
+      } catch (err) {
+        if (!provisional) {
           setGeoError(err?.message || "Route kon niet worden berekend.");
         }
-      })
-      .finally(() => {
-        if (!cancelled) setDraftBusy(false);
-      });
+      }
+    };
+
+    setDraftBusy(true);
+    setGeoError("");
+    const legs = [];
+    const missing = [];
+    // 1) Synchronous stub: magenta verschijnt meteen (cache of rechte lijn).
+    for (let index = 0; index < picked.length - 1; index += 1) {
+      const from = picked[index];
+      const to = picked[index + 1];
+      const key = `${nodeId(from)}|${nodeId(to)}`;
+      if (legCacheRef.current.has(key)) {
+        legs.push(legCacheRef.current.get(key));
+      } else {
+        legs.push(straightLeg(from, to));
+        missing.push({ index, from, to, key });
+      }
+    }
+    publish(legs, { provisional: missing.length > 0 });
+
+    if (!missing.length) {
+      rememberNodes(...picked);
+      setDraftBusy(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // 2) Ontbrekende segmenten parallel ophalen via officieel knooppuntennetwerk.
+    (async () => {
+      const results = await Promise.all(
+        missing.map(async (item) => {
+          try {
+            const leg = await fetchBikeLeg(item.from, item.to);
+            return { ...item, leg, ok: true };
+          } catch (err) {
+            return { ...item, err, ok: false };
+          }
+        }),
+      );
+      if (cancelled || buildId !== routeBuildGenRef.current) return;
+      let anyOk = false;
+      for (const item of results) {
+        if (!item.ok) continue;
+        legCacheRef.current.set(item.key, item.leg);
+        legs[item.index] = item.leg;
+        anyOk = true;
+      }
+      if (anyOk) {
+        publish(legs, { provisional: false });
+        rememberNodes(...picked);
+        setDraftBusy(false);
+      } else if (!draftRef.current?.geometry?.length) {
+        setGeoError(results[0]?.err?.message || "Route kon niet worden berekend. Probeer opnieuw.");
+        setDraftBusy(false);
+      } else {
+        setDraftBusy(false);
+      }
+    })();
+
     return () => {
       cancelled = true;
     };
-  }, [buildMode, mode, origin?.lat, origin?.lng, selectedKey, pickedWishKey]);
+  }, [buildMode, selectedKey]);
 
   useEffect(() => {
     if (profile?.interests?.length) setInterests(profile.interests);
@@ -399,30 +506,36 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   // Manuele route: wenssuggesties langs de gekozen knooppunten.
   const manualWishKey = useDebounced(
     buildMode === "manual" && notes.trim() && draft?.geometry?.length > 1
-      ? `${selectedKey}|${notes.trim()}|${Math.round((draft.distance_km || 0) * 10)}`
+      ? `${selectedKey}|${notes.trim()}|${Math.round((draft.distance_km || 0) * 10)}|${activeInterests.join(",")}`
       : "",
     500,
   );
 
   useEffect(() => {
-    if (buildMode !== "manual" || !manualWishKey || !draft?.geometry?.length) {
+    if (buildMode !== "manual" || !manualWishKey) {
       if (buildMode !== "manual" || !notes.trim()) {
         setManualWishSuggestions([]);
         setManualWishSummary("");
         setManualWishBusy(false);
+        setManualWishError("");
       }
       return undefined;
     }
+    const draftNow = draftRef.current;
+    const geometrySource = draftNow?.geometry;
+    if (!geometrySource?.length) return undefined;
+
     let cancelled = false;
     setManualWishBusy(true);
     setManualWishError("");
-    // Dicht genoeg bemonsteren (~elke 3–4 km) zodat cafés op 100+ km routes niet in gaten vallen.
-    const geometry = sampleGeometryAlongRoute(draft.geometry, 48);
+    // Dicht genoeg bemonsteren zodat cafés niet tussen samplepunten vallen.
+    const geometry = sampleGeometryAlongRoute(geometrySource, 56);
+    const nodeSource = draftNow?.knooppunten?.length ? draftNow.knooppunten : selectedNodes;
     fetchWishSuggestions({
       notes: notes.trim(),
       interests: activeInterests,
       geometry,
-      nodes: (draft.knooppunten || selectedNodes).map((node) => ({
+      nodes: nodeSource.map((node) => ({
         id: node.id || "",
         number: node.number,
         lat: node.lat,
@@ -450,7 +563,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     return () => {
       cancelled = true;
     };
-  }, [buildMode, manualWishKey, draft?.geometry, draft?.knooppunten, selectedNodes, activeInterests.join("|"), notes]);
+    // Enkel manualWishKey: voorkomt afbreken wanneer nodeLookup/selectedNodes herberekend worden.
+  }, [buildMode, manualWishKey]);
 
   useEffect(() => {
     if (buildMode !== "suggest") return undefined;
@@ -674,6 +788,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setNodeCatalog({});
     setViewFocus(null);
     setDraft(null);
+    manualRouteIdsRef.current = [];
     reverseKeyRef.current = "";
   }
 
@@ -736,6 +851,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       setNodeCatalog({});
       setViewFocus(null);
       setDraft(null);
+      manualRouteIdsRef.current = [];
       reverseKeyRef.current = "";
     }
 
@@ -872,6 +988,34 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       rememberNodes(node);
       return [...current, id];
     });
+
+    // Optimistic magenta: meteen stub tekenen (buiten setState-updater).
+    if (!selectedIds.includes(id) && selectedIds.length >= 1) {
+      const from = nodeLookup.get(selectedIds[selectedIds.length - 1]);
+      if (from) {
+        const prev = draftRef.current;
+        const stub = [
+          [from.lat, from.lng],
+          [node.lat, node.lng],
+        ];
+        setDraft({
+          ...(prev || {
+            distance_km: 0,
+            duration_min: 1,
+            knooppunten: [],
+            knoop_chain: "",
+            steps: [],
+            reason: "",
+            weather: null,
+          }),
+          geometry:
+            prev?.geometry?.length > 1
+              ? mergeStreetGeometries(prev.geometry, stub)
+              : stub,
+        });
+        setDraftBusy(true);
+      }
+    }
   }
 
   function undoLastKnoop() {
@@ -906,7 +1050,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       return "start";
     }
     const id = nodeId(node);
-    // Gekozen én tussenliggende knooppunten op de route: altijd groen.
+    // Zelf kiezen: alleen echt gekozen knooppunten groen — niet alles op de magenta lijn.
+    if (buildMode === "manual") {
+      if (selectedIdSet.has(id) || selectedNodes.some((picked) => knoopMatches(picked, node, 80))) {
+        return "picked";
+      }
+      return "route";
+    }
+    // Auto/suggest: gekozen én tussenliggende knooppunten op de route groen.
     if (
       selectedIdSet.has(id) ||
       selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
@@ -916,8 +1067,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     ) {
       return "picked";
     }
-    // In handmatige modus meteen rood tonen, niet grijs/paars-achtig idle.
-    if (buildMode === "manual" || (buildMode === "auto" && startChoice === "map")) {
+    if (buildMode === "auto" && startChoice === "map") {
       return "route";
     }
     return "idle";
@@ -1462,7 +1612,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             !wishSuggestions.length && (
             <p className="sources" style={{ margin: "0 0 12px" }}>
               {manualWishError
-                ? `Zoeken mislukt: ${manualWishError} (bron: OpenStreetMap — herstart de backend en probeer opnieuw).`
+                ? `Zoeken mislukt: ${
+                    /not found/i.test(manualWishError)
+                      ? "de wens-API ontbreekt op de backend — herstart backend én frontend"
+                      : manualWishError
+                  } (bron: OpenStreetMap).`
                 : "Geen passende plekken gevonden voor je wens. Probeer “café” of “restaurant”, of even opnieuw zoeken."}
             </p>
           )}
@@ -1533,8 +1687,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               dashed={manualRouteLine.provisional}
             />
           ))}
-          {(buildMode === "manual" && routeNodes.length > 0) && (
-            <RouteChainKnoopMarkers nodes={routeNodes} geometry={draft?.geometry} pool={mapNodes} />
+          {/* Zelf kiezen: alleen jouw picks als groene ketenmarkers — via-netwerk blijft in de lijst. */}
+          {(buildMode === "manual" && selectedNodes.length > 0) && (
+            <RouteChainKnoopMarkers nodes={selectedNodes} geometry={draft?.geometry} pool={mapNodes} />
           )}
           {(buildMode === "suggest" || buildMode === "auto") && routePreview?.geometry?.length > 1 && (
             <RouteLine positions={routePreview.geometry} />

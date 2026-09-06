@@ -259,6 +259,30 @@ class RerouteResponse(BaseModel):
     weather: WeatherInfo | None = None
 
 
+class BikeLegRequest(BaseModel):
+    from_lat: float = Field(ge=49.0, le=52.0)
+    from_lng: float = Field(ge=2.0, le=7.0)
+    to_lat: float = Field(ge=49.0, le=52.0)
+    to_lng: float = Field(ge=2.0, le=7.0)
+    # Identiteit van knooppunten — voor officieel netwerk (geen vrije OSRM).
+    from_id: str = ""
+    from_number: str = ""
+    from_geoid: int | str | None = None
+    from_network: str | None = None
+    to_id: str = ""
+    to_number: str = ""
+    to_geoid: int | str | None = None
+    to_network: str | None = None
+
+
+class BikeLegResponse(BaseModel):
+    geometry: list[list[float]]
+    distance_km: float
+    duration_min: int
+    steps: list[Step] = Field(default_factory=list)
+    via_knooppunten: list[Knooppunt] = Field(default_factory=list)
+
+
 class RoutePreviewRequest(BaseModel):
     lat: float = Field(ge=49.0, le=52.0)
     lng: float = Field(ge=2.0, le=7.0)

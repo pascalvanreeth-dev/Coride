@@ -561,6 +561,107 @@ async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 
     return nodes, trajects
 
 
+async def network_leg(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Officiële knooppunten-trajectgeometrie A→B (via tussenliggende knoops). Geen vrije OSRM."""
+    if _same_knoop(left, right):
+        pt = [float(left["lat"]), float(left["lng"])]
+        return {
+            "geometry": [pt, pt],
+            "distance_m": 0.0,
+            "duration_s": 0.0,
+            "via_knooppunten": [dict(left)],
+        }
+
+    chain = [dict(left), dict(right)]
+    network_nodes, trajects = await fetch_network_for_chain(chain)
+    if not trajects:
+        raise RuntimeError("Geen knooppuntennetwerk gevonden tussen deze knooppunten.")
+
+    enriched = enrich_chain_geoids(chain, network_nodes, trajects)
+    if len(enriched) < 2:
+        enriched = chain
+
+    by_edge, edge_length, adj = index_trajects(trajects)
+    by_geoid: dict[int, dict[str, Any]] = {
+        int(node["geoid"]): node for node in network_nodes if node.get("geoid") is not None
+    }
+    for node in enriched:
+        if node.get("geoid") is not None:
+            by_geoid[int(node["geoid"])] = node
+
+    expanded = expand_chain(enriched, network_nodes, trajects)
+    if len(expanded) < 2:
+        expanded = list(enriched)
+
+    pieces: list[list[list[float]]] = []
+    total_m = 0.0
+    for index in range(len(expanded) - 1):
+        piece, length = geometry_between_nodes(
+            expanded[index],
+            expanded[index + 1],
+            by_edge,
+            edge_length,
+            adj,
+            by_geoid,
+        )
+        if not piece or len(piece) < 2:
+            piece, length = geometry_through_network(
+                expanded[index],
+                expanded[index + 1],
+                by_edge,
+                edge_length,
+                adj,
+                by_geoid,
+            )
+        if not piece or len(piece) < 2:
+            raise RuntimeError(
+                f"Geen officieel traject tussen knooppunt {expanded[index].get('number')} "
+                f"en {expanded[index + 1].get('number')}."
+            )
+        pieces.append(piece)
+        if length > 0:
+            total_m += length
+        else:
+            for step in range(1, len(piece)):
+                total_m += haversine_m(
+                    piece[step - 1][0],
+                    piece[step - 1][1],
+                    piece[step][0],
+                    piece[step][1],
+                )
+
+    geometry = _merge_geometry_parts(pieces)
+    if len(geometry) < 2:
+        raise RuntimeError("Geen officiële fietsroute gevonden langs de knooppunten.")
+
+    start = enriched[0]
+    end = enriched[-1]
+    geometry[0] = [float(start["lat"]), float(start["lng"])]
+    geometry[-1] = [float(end["lat"]), float(end["lng"])]
+
+    via: list[dict[str, Any]] = []
+    for node in expanded:
+        item = {
+            "id": str(node.get("id") or ""),
+            "number": str(node.get("number") or ""),
+            "lat": float(node["lat"]),
+            "lng": float(node["lng"]),
+            "network": node.get("network"),
+            "geoid": node.get("geoid"),
+            "on_route": True,
+        }
+        if via and _same_knoop(via[-1], item):
+            continue
+        via.append(item)
+
+    return {
+        "geometry": geometry,
+        "distance_m": float(total_m),
+        "duration_s": max(60.0, float(total_m) / 3.9),
+        "via_knooppunten": via,
+    }
+
+
 def dominant_network_near(
     nodes: list[dict[str, Any]],
     lat: float,

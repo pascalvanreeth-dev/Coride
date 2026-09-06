@@ -10,9 +10,18 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: "http://127.0.0.1:8003",
         timeout: 120_000,
         proxyTimeout: 120_000,
+      },
+      // Direct OSRM for magenta legs — skips FastAPI hop (~sneller).
+      "/osrm-bike": {
+        target: "https://routing.openstreetmap.de",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (path) => path.replace(/^\/osrm-bike/, "/routed-bike"),
+        timeout: 20_000,
+        proxyTimeout: 20_000,
       },
     },
   },

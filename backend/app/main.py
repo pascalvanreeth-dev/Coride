@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-from app.models import AskRequest, AskResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
+from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
 from app.services.ai import answer_about_stop
 from app.services.geocoding import geocode, reverse
 from app.services import knooppunten as knoop_service
 from app.services.planner import plan_route, preview_route, reroute, wish_suggestions_along_route
 from app.services import pois as pois_service
+from app.services import routing as routing_service
 from app.services import suggestions as suggestion_service
 from app.services import surroundings as surroundings_service
 from app.services import wikipedia as wikipedia_service
@@ -268,6 +269,63 @@ async def ask_endpoint(request: AskRequest) -> AskResponse:
         return AskResponse(answer=answer)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/bike-leg", response_model=BikeLegResponse)
+async def bike_leg_endpoint(request: BikeLegRequest) -> BikeLegResponse:
+    """Magenta-segment: alleen langs het officiële knooppuntennetwerk (WFS-trajecten)."""
+    left = {
+        "id": request.from_id or "",
+        "number": request.from_number or "",
+        "lat": request.from_lat,
+        "lng": request.from_lng,
+        "geoid": request.from_geoid,
+        "network": request.from_network,
+    }
+    right = {
+        "id": request.to_id or "",
+        "number": request.to_number or "",
+        "lat": request.to_lat,
+        "lng": request.to_lng,
+        "geoid": request.to_geoid,
+        "network": request.to_network,
+    }
+    try:
+        route = await knoop_service.network_leg(left, right)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc) or "Geen officiële knooppuntenroute tussen deze knooppunten.",
+        ) from exc
+    geometry = list(route.get("geometry") or [])
+    if len(geometry) < 2:
+        raise HTTPException(
+            status_code=502,
+            detail="Geen officiële knooppuntenroute tussen deze knooppunten.",
+        )
+    via_raw = route.get("via_knooppunten") or []
+    via = [
+        Knooppunt(
+            id=str(node.get("id") or ""),
+            number=str(node.get("number") or ""),
+            lat=float(node["lat"]),
+            lng=float(node["lng"]),
+            network=node.get("network"),
+            geoid=node.get("geoid"),
+            on_route=True,
+        )
+        for node in via_raw
+        if node.get("number") is not None and node.get("lat") is not None
+    ]
+    return BikeLegResponse(
+        geometry=geometry,
+        distance_km=round(float(route["distance_m"]) / 1000, 2),
+        duration_min=max(1, round(float(route["duration_s"]) / 60)),
+        steps=[],
+        via_knooppunten=via,
+    )
 
 
 @app.post("/api/reroute", response_model=RerouteResponse)

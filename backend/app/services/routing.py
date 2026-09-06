@@ -40,7 +40,13 @@ def _merge_geometries(parts: list[list[list[float]]]) -> list[list[float]]:
     return geometry
 
 
-async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> dict[str, Any]:
+async def bike_route(
+    points: list[tuple[float, float]],
+    *,
+    retries: int = 1,
+    overview: str = "full",
+    steps: bool = True,
+) -> dict[str, Any]:
     if len(points) < 2:
         raise ValueError("Een fietsroute heeft minstens twee punten nodig.")
     coords = ";".join(f"{lng:.6f},{lat:.6f}" for lat, lng in points)
@@ -52,9 +58,9 @@ async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> 
                 response = await http.get(
                     url,
                     params={
-                        "overview": "full",
+                        "overview": overview,
                         "geometries": "geojson",
-                        "steps": "true",
+                        "steps": "true" if steps else "false",
                         "annotations": "false",
                         "alternatives": "false",
                         "continue_straight": "false",
@@ -70,14 +76,19 @@ async def bike_route(points: list[tuple[float, float]], *, retries: int = 1) -> 
                 "geometry": geometry,
                 "distance_m": float(route["distance"]),
                 "duration_s": float(route["duration"]),
-                "steps": _parse_steps(route.get("legs") or []),
+                "steps": _parse_steps(route.get("legs") or []) if steps else [],
             }
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt < retries:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.35)
     assert last_error is not None
     raise last_error
+
+
+async def bike_route_fast(a: tuple[float, float], b: tuple[float, float]) -> dict[str, Any]:
+    """Snelle magenta-segmenten: lichtere OSRM-payload, geen steps."""
+    return await bike_route([a, b], retries=0, overview="simplified", steps=False)
 
 
 async def bike_route_via_waypoints(waypoints: list[tuple[float, float]]) -> dict[str, Any]:
@@ -110,14 +121,10 @@ async def bike_route_via_waypoints(waypoints: list[tuple[float, float]]) -> dict
             for pair_i in range(len(chunk) - 1):
                 pair = [chunk[pair_i], chunk[pair_i + 1]]
                 try:
-                    piece = await bike_route(pair, retries=0)
+                    piece = await bike_route(pair, retries=1)
                 except Exception:
-                    piece = {
-                        "geometry": [[pair[0][0], pair[0][1]], [pair[1][0], pair[1][1]]],
-                        "distance_m": haversine_m(pair[0][0], pair[0][1], pair[1][0], pair[1][1]),
-                        "duration_s": 60.0,
-                        "steps": [],
-                    }
+                    # Geen vogelvlucht — dit stuk overslaan i.p.v. rechte lijn.
+                    continue
                 geometries.append(piece["geometry"])
                 distance_m += float(piece["distance_m"])
                 duration_s += float(piece["duration_s"])

@@ -1,5 +1,5 @@
 export async function geocode(q) {
-  const response = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+  const response = await apiFetch(`/api/geocode?q=${encodeURIComponent(q)}`);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = typeof data.detail === "string" ? data.detail : "Zoeken mislukt.";
@@ -9,7 +9,7 @@ export async function geocode(q) {
 }
 
 export async function reverseGeocode(lat, lng) {
-  const response = await fetch(`/api/reverse?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`);
+  const response = await apiFetch(`/api/reverse?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.detail || "Dit GPS-punt kon niet omgezet worden naar een adres.");
@@ -18,7 +18,7 @@ export async function reverseGeocode(lat, lng) {
 }
 
 export async function planRoute(payload) {
-  const response = await fetch("/api/plan", {
+  const response = await apiFetch("/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -39,8 +39,24 @@ function formatApiError(detail, fallback) {
   return fallback;
 }
 
+function networkErrorMessage(err, fallback) {
+  const msg = String(err?.message || "");
+  if (/failed to fetch|networkerror|load failed|fetch failed/i.test(msg)) {
+    return "Geen verbinding met de server. Controleer of de backend draait en probeer opnieuw.";
+  }
+  return msg || fallback;
+}
+
+async function apiFetch(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    throw new Error(networkErrorMessage(err, "Netwerkfout."));
+  }
+}
+
 export async function askAbout(payload) {
-  const response = await fetch("/api/ask", {
+  const response = await apiFetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
@@ -54,7 +70,7 @@ export async function askAbout(payload) {
 }
 
 export async function fetchSurroundings(payload) {
-  const response = await fetch("/api/surroundings", {
+  const response = await apiFetch("/api/surroundings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -67,7 +83,7 @@ export async function fetchSurroundings(payload) {
 }
 
 export async function fetchRoutePreview(payload) {
-  const response = await fetch("/api/route-preview", {
+  const response = await apiFetch("/api/route-preview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -80,7 +96,7 @@ export async function fetchRoutePreview(payload) {
 }
 
 export async function fetchWishSuggestions(payload) {
-  const response = await fetch("/api/wish-suggestions", {
+  const response = await apiFetch("/api/wish-suggestions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -99,7 +115,7 @@ export async function fetchRouteSuggestions(lat, lng, interests = [], used = [])
   });
   for (const interest of interests) params.append("interests", interest);
   for (const id of used) params.append("used", id);
-  const response = await fetch(`/api/route-suggestions?${params}`);
+  const response = await apiFetch(`/api/route-suggestions?${params}`);
   const data = await response.json().catch(() => []);
   if (!response.ok) {
     throw new Error(data.detail || "Route Top 10 kon niet geladen worden.");
@@ -118,7 +134,7 @@ export async function fetchPoiSuggestions(lat, lng, interests = [], { radius = 7
     params.append("sample_lat", String(point.lat));
     params.append("sample_lng", String(point.lng));
   }
-  const response = await fetch(`/api/poi-suggestions?${params}`);
+  const response = await apiFetch(`/api/poi-suggestions?${params}`);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     let message = typeof data.detail === "string" ? data.detail : "Suggesties konden niet geladen worden.";
@@ -136,7 +152,7 @@ export async function fetchKnooppunten(lat, lng, radius = 12000) {
     lng: String(lng),
     radius: String(radius),
   });
-  const response = await fetch(`/api/knooppunten?${params}`);
+  const response = await apiFetch(`/api/knooppunten?${params}`);
   const data = await response.json().catch(() => []);
   if (!response.ok) {
     throw new Error(data.detail || "Knooppunten konden niet geladen worden.");
@@ -155,7 +171,7 @@ export async function fetchStopSummary({ name, lat, lng, wikipedia_url = null, w
   if (wikidata) params.set("wikidata", wikidata);
   if (description) params.set("description", description);
   if (kind) params.set("kind", kind);
-  const response = await fetch(`/api/stop-summary?${params}`);
+  const response = await apiFetch(`/api/stop-summary?${params}`);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.detail || "Beschrijving kon niet geladen worden.");
@@ -163,8 +179,39 @@ export async function fetchStopSummary({ name, lat, lng, wikipedia_url = null, w
   return data;
 }
 
+/** Magenta-leg via officieel knooppuntennetwerk (backend WFS-trajecten). */
+export async function fetchBikeLeg(from, to) {
+  const response = await apiFetch("/api/bike-leg", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from_lat: from.lat,
+      from_lng: from.lng,
+      to_lat: to.lat,
+      to_lng: to.lng,
+      from_id: from.id || "",
+      from_number: String(from.number ?? ""),
+      from_geoid: from.geoid ?? null,
+      from_network: from.network || null,
+      to_id: to.id || "",
+      to_number: String(to.number ?? ""),
+      to_geoid: to.geoid ?? null,
+      to_network: to.network || null,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof data.detail === "string"
+        ? data.detail
+        : "Geen officiële knooppuntenroute tussen deze knooppunten.",
+    );
+  }
+  return data;
+}
+
 export async function reroute(payload) {
-  const response = await fetch("/api/reroute", {
+  const response = await apiFetch("/api/reroute", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
