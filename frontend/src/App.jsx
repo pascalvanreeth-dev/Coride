@@ -63,6 +63,7 @@ export default function App() {
       onEditProfile={() => setEditProfile(true)}
       onPreview={setPreview}
       onPlan={onPlan}
+      onClearError={() => setError("")}
     />
   );
 }

@@ -4,6 +4,7 @@ import asyncio
 import heapq
 import math
 import re
+import time
 from typing import Any
 
 from app.http import client
@@ -20,6 +21,42 @@ from app.services.geo import (
 from app.services.pois import _overpass
 
 WFS_URL = "https://geodata.toerismevlaanderen.be/geoserver/wfs"
+
+# Caches voor snelle magenta-legs (blijven op officieel netwerk).
+_BBOX_CACHE: dict[str, tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = {}
+_LEG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_BBOX_TTL_S = 20 * 60
+_LEG_TTL_S = 45 * 60
+
+
+def _cache_prune(cache: dict[str, tuple], keep: int = 80) -> None:
+    if len(cache) <= keep:
+        return
+    oldest = sorted(cache.items(), key=lambda item: item[1][0])[: max(1, len(cache) - keep)]
+    for key, _ in oldest:
+        cache.pop(key, None)
+
+
+def _leg_cache_key(left: dict[str, Any], right: dict[str, Any]) -> str:
+    def part(node: dict[str, Any]) -> str:
+        geoid = node.get("geoid")
+        if geoid is not None and str(geoid) != "":
+            return f"g{geoid}"
+        return (
+            f"n{node.get('number')}:"
+            f"{round(float(node['lat']), 4)},{round(float(node['lng']), 4)}"
+        )
+
+    return f"{part(left)}|{part(right)}"
+
+
+def _bbox_cache_key(bbox: tuple[float, float, float, float]) -> str:
+    min_lng, min_lat, max_lng, max_lat = bbox
+    # Grid ~1 km zodat nabije klikken dezelfde WFS-tegel hergebruiken.
+    return (
+        f"{round(min_lng, 2)},{round(min_lat, 2)},"
+        f"{round(max_lng, 2)},{round(max_lat, 2)}"
+    )
 
 
 async def fetch_nodes(
@@ -561,6 +598,76 @@ async def fetch_network_for_chain(chain: list[dict[str, Any]], padding_m: int = 
     return nodes, trajects
 
 
+async def fetch_network_for_leg(left: dict[str, Any], right: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Lichtere netwerk-fetch voor één magenta-segment (minder WFS-rondes dan volle chain)."""
+    chain = [left, right]
+    gap = haversine_m(float(left["lat"]), float(left["lng"]), float(right["lat"]), float(right["lng"]))
+    pad_m = max(3500, min(12000, gap * 0.85 + 2000))
+    min_lat = min(float(left["lat"]), float(right["lat"]))
+    max_lat = max(float(left["lat"]), float(right["lat"]))
+    min_lng = min(float(left["lng"]), float(right["lng"]))
+    max_lng = max(float(left["lng"]), float(right["lng"]))
+    pad_lat = pad_m / 111_000
+    pad_lng = pad_m / (111_000 * max(0.2, math.cos(math.radians((min_lat + max_lat) / 2))))
+    bbox = (min_lng - pad_lng, min_lat - pad_lat, max_lng + pad_lng, max_lat + pad_lat)
+
+    nodes, trajects = await _fetch_bbox(bbox)
+    all_nodes_by_geoid = {
+        int(node["geoid"]): node for node in nodes if node.get("geoid") is not None
+    }
+    inferred = infer_chain_network(chain, nodes)
+    network = left.get("network") or right.get("network") or inferred
+    nodes, trajects = filter_network_data(nodes, trajects, network)
+    nodes = _merge_chain_picks_into_nodes(nodes, chain)
+
+    # Geoid-expansie alleen als nodig: max 2 rondes i.p.v. 6.
+    pick_geoids = {
+        int(pick["geoid"])
+        for pick in chain
+        if pick.get("geoid") is not None
+    }
+    if not pick_geoids:
+        # Probeer geoids uit bbox-nodes te koppelen via nummer/positie.
+        for pick in chain:
+            if pick.get("geoid") is not None:
+                continue
+            number = str(pick.get("number") or "")
+            for node in nodes:
+                if str(node.get("number")) != number:
+                    continue
+                if haversine_m(float(pick["lat"]), float(pick["lng"]), float(node["lat"]), float(node["lng"])) <= 250:
+                    pick["geoid"] = node.get("geoid")
+                    if node.get("geoid") is not None:
+                        pick_geoids.add(int(node["geoid"]))
+                    break
+
+    if pick_geoids:
+        extra = await _fetch_trajects_for_geoids(pick_geoids)
+        trajects = _merge_trajects(trajects, extra)
+        nodes, trajects = _trajects_for_connected_nodes(nodes, trajects, all_nodes_by_geoid)
+        by_geoid = {int(n["geoid"]): n for n in nodes if n.get("geoid") is not None}
+        adj = build_adjacency(trajects)
+        ends = list(pick_geoids)
+        path_ok = False
+        if len(ends) >= 2 and ends[0] in adj and ends[1] in adj:
+            path_ok = len(_shortest_path(adj, ends[0], ends[1])) >= 2
+        if not path_ok:
+            geoids = {int(n["geoid"]) for n in nodes if n.get("geoid") is not None}
+            round_trajects = await _fetch_trajects_for_geoids(geoids)
+            trajects = _merge_trajects(trajects, round_trajects)
+            nodes, trajects = _trajects_for_connected_nodes(nodes, trajects, all_nodes_by_geoid)
+            missing = {
+                int(n["geoid"]) for n in nodes if n.get("geoid") is not None
+            } - set(all_nodes_by_geoid.keys())
+            if missing:
+                for node in await _fetch_nodes_for_geoids(missing):
+                    all_nodes_by_geoid[int(node["geoid"])] = node
+                    nodes.append(node)
+    else:
+        nodes, trajects = _trajects_for_connected_nodes(nodes, trajects, all_nodes_by_geoid)
+    return nodes, trajects
+
+
 async def network_leg(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     """Officiële knooppunten-trajectgeometrie A→B (via tussenliggende knoops). Geen vrije OSRM."""
     if _same_knoop(left, right):
@@ -572,8 +679,16 @@ async def network_leg(left: dict[str, Any], right: dict[str, Any]) -> dict[str, 
             "via_knooppunten": [dict(left)],
         }
 
+    cache_key = _leg_cache_key(left, right)
+    cached = _LEG_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] <= _LEG_TTL_S:
+        return dict(cached[1])
+
     chain = [dict(left), dict(right)]
-    network_nodes, trajects = await fetch_network_for_chain(chain)
+    network_nodes, trajects = await fetch_network_for_leg(chain[0], chain[1])
+    if not trajects:
+        # Fallback: volledige chain-fetch als lichte path faalt.
+        network_nodes, trajects = await fetch_network_for_chain(chain)
     if not trajects:
         raise RuntimeError("Geen knooppuntennetwerk gevonden tussen deze knooppunten.")
 
@@ -636,8 +751,11 @@ async def network_leg(left: dict[str, Any], right: dict[str, Any]) -> dict[str, 
 
     start = enriched[0]
     end = enriched[-1]
-    geometry[0] = [float(start["lat"]), float(start["lng"])]
-    geometry[-1] = [float(end["lat"]), float(end["lng"])]
+    # Alleen eindpunten snappen als ze dicht bij het traject liggen (geen spikes).
+    if geometry and haversine_m(float(start["lat"]), float(start["lng"]), geometry[0][0], geometry[0][1]) <= 120:
+        geometry[0] = [float(start["lat"]), float(start["lng"])]
+    if geometry and haversine_m(float(end["lat"]), float(end["lng"]), geometry[-1][0], geometry[-1][1]) <= 120:
+        geometry[-1] = [float(end["lat"]), float(end["lng"])]
 
     via: list[dict[str, Any]] = []
     for node in expanded:
@@ -654,12 +772,15 @@ async def network_leg(left: dict[str, Any], right: dict[str, Any]) -> dict[str, 
             continue
         via.append(item)
 
-    return {
+    result = {
         "geometry": geometry,
         "distance_m": float(total_m),
         "duration_s": max(60.0, float(total_m) / 3.9),
         "via_knooppunten": via,
     }
+    _LEG_CACHE[cache_key] = (time.monotonic(), result)
+    _cache_prune(_LEG_CACHE, keep=120)
+    return dict(result)
 
 
 def dominant_network_near(
@@ -923,6 +1044,18 @@ def _pick_network_node(
     options = _options_for_number(number, network_nodes, network)
     if not options:
         return None
+    # Nooit een knoop ver van de klik kiezen — zelfde nummers bestaan in meerdere regio's.
+    near = [
+        node
+        for node in options
+        if haversine_m(lat, lng, float(node["lat"]), float(node["lng"])) <= max_m
+    ]
+    if not near:
+        best = min(options, key=lambda item: haversine_m(lat, lng, float(item["lat"]), float(item["lng"])))
+        if haversine_m(lat, lng, float(best["lat"]), float(best["lng"])) > max_m:
+            return None
+        return best
+    options = near
     if prev_node is not None and adj:
         by_geoid = _by_geoid_map(network_nodes)
         ranked: list[tuple[int, int, float, dict[str, Any]]] = []
@@ -945,12 +1078,13 @@ def _pick_network_node(
                 (
                     number_revisits,
                     len(segment),
-                    haversine_m(lat, lng, option["lat"], option["lng"]),
+                    haversine_m(lat, lng, float(option["lat"]), float(option["lng"])),
                     option,
                 )
             )
         if ranked:
-            ranked.sort(key=lambda item: (item[0], -item[1], item[2]))
+            # Korter pad + dichter bij klik wint (niet: langer pad).
+            ranked.sort(key=lambda item: (item[0], item[1], item[2]))
             return ranked[0][3]
     if prev_geoid is not None and adj:
         neighbors = {neighbor for neighbor, _ in adj.get(prev_geoid, [])}
@@ -958,7 +1092,7 @@ def _pick_network_node(
             node for node in options if node.get("geoid") is not None and int(node["geoid"]) in neighbors
         ]
         if graph_options:
-            return min(graph_options, key=lambda item: haversine_m(lat, lng, item["lat"], item["lng"]))
+            return min(graph_options, key=lambda item: haversine_m(lat, lng, float(item["lat"]), float(item["lng"])))
         ranked: list[tuple[int, float, dict[str, Any]]] = []
         for option in options:
             geo = option.get("geoid")
@@ -969,7 +1103,7 @@ def _pick_network_node(
                 continue
             if _path_revisits_geoid(path):
                 continue
-            ranked.append((len(path), haversine_m(lat, lng, option["lat"], option["lng"]), option))
+            ranked.append((len(path), haversine_m(lat, lng, float(option["lat"]), float(option["lng"])), option))
         if ranked:
             ranked.sort(key=lambda item: (item[0], item[1]))
             return ranked[0][2]
@@ -983,15 +1117,17 @@ def _pick_network_node(
                 continue
             revisit_count = len(path) - len(set(path))
             fallback.append(
-                (revisit_count, len(path), haversine_m(lat, lng, option["lat"], option["lng"]), option)
+                (
+                    revisit_count,
+                    len(path),
+                    haversine_m(lat, lng, float(option["lat"]), float(option["lng"])),
+                    option,
+                )
             )
         if fallback:
             fallback.sort(key=lambda item: (item[0], item[1], item[2]))
             return fallback[0][3]
-    best = min(options, key=lambda item: haversine_m(lat, lng, item["lat"], item["lng"]))
-    if haversine_m(lat, lng, best["lat"], best["lng"]) > max_m:
-        return None
-    return best
+    return min(options, key=lambda item: haversine_m(lat, lng, float(item["lat"]), float(item["lng"])))
 
 
 def build_adjacency(trajects: list[dict[str, Any]]) -> dict[int, list[tuple[int, float]]]:
@@ -1086,14 +1222,18 @@ def geometry_between_nodes(
     piece = list(geometry)
     left_pt = (float(left["lat"]), float(left["lng"]))
     right_pt = (float(right["lat"]), float(right["lng"]))
-    if piece and haversine_m(left_pt[0], left_pt[1], piece[0][0], piece[0][1]) > 25:
-        piece = [[left_pt[0], left_pt[1]], *piece]
-    elif piece:
-        piece[0] = [left_pt[0], left_pt[1]]
-    if piece and haversine_m(right_pt[0], right_pt[1], piece[-1][0], piece[-1][1]) > 25:
-        piece = [*piece, [right_pt[0], right_pt[1]]]
-    elif piece:
-        piece[-1] = [right_pt[0], right_pt[1]]
+    # Alleen kleine snaps: verre klik/geoid-mismatch mag geen rechte spike maken.
+    snap_m = 120.0
+    if piece and haversine_m(left_pt[0], left_pt[1], piece[0][0], piece[0][1]) <= snap_m:
+        if haversine_m(left_pt[0], left_pt[1], piece[0][0], piece[0][1]) > 25:
+            piece = [[left_pt[0], left_pt[1]], *piece]
+        else:
+            piece[0] = [left_pt[0], left_pt[1]]
+    if piece and haversine_m(right_pt[0], right_pt[1], piece[-1][0], piece[-1][1]) <= snap_m:
+        if haversine_m(right_pt[0], right_pt[1], piece[-1][0], piece[-1][1]) > 25:
+            piece = [*piece, [right_pt[0], right_pt[1]]]
+        else:
+            piece[-1] = [right_pt[0], right_pt[1]]
     return piece, length
 
 
@@ -1886,13 +2026,18 @@ def _shortest_path(adj: dict[int, list[tuple[int, float]]], start: int, goal: in
 
 
 async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    cache_key = _bbox_cache_key(bbox)
+    cached = _BBOX_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] <= _BBOX_TTL_S:
+        return list(cached[1]), list(cached[2])
+
     min_lng, min_lat, max_lng, max_lat = bbox
     cql = f"BBOX(geom,{min_lng:.5f},{min_lat:.5f},{max_lng:.5f},{max_lat:.5f},'EPSG:4326')"
     nodes: list[dict[str, Any]] = []
     trajects: list[dict[str, Any]] = []
     try:
         async with client() as http:
-            node_response = await http.get(
+            node_task = http.get(
                 WFS_URL,
                 params={
                     "service": "WFS",
@@ -1906,6 +2051,21 @@ async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dic
                 },
                 timeout=14.0,
             )
+            traject_task = http.get(
+                WFS_URL,
+                params={
+                    "service": "WFS",
+                    "version": "1.1.0",
+                    "request": "GetFeature",
+                    "typeName": "routes:traject_fiets",
+                    "outputFormat": "application/json",
+                    "srsName": "EPSG:4326",
+                    "maxFeatures": 1200,
+                    "cql_filter": cql,
+                },
+                timeout=16.0,
+            )
+            node_response, traject_response = await asyncio.gather(node_task, traject_task)
             if node_response.status_code == 200:
                 for feature in node_response.json().get("features") or []:
                     props = feature.get("properties") or {}
@@ -1925,26 +2085,15 @@ async def _fetch_bbox(bbox: tuple[float, float, float, float]) -> tuple[list[dic
                             "source": "Toerisme Vlaanderen",
                         }
                     )
-            traject_response = await http.get(
-                WFS_URL,
-                params={
-                    "service": "WFS",
-                    "version": "1.1.0",
-                    "request": "GetFeature",
-                    "typeName": "routes:traject_fiets",
-                    "outputFormat": "application/json",
-                    "srsName": "EPSG:4326",
-                    "maxFeatures": 1200,
-                    "cql_filter": cql,
-                },
-                timeout=16.0,
-            )
             if traject_response.status_code == 200:
                 for feature in traject_response.json().get("features") or []:
                     trajects.append(_traject_from_feature(feature))
     except Exception:
         return [], []
-    return nodes, trajects
+
+    _BBOX_CACHE[cache_key] = (time.monotonic(), nodes, trajects)
+    _cache_prune(_BBOX_CACHE, keep=40)
+    return list(nodes), list(trajects)
 
 
 def attach_nearby(nodes: list[dict[str, Any]], pois: list[dict[str, Any]], radius_m: int = 550) -> list[dict[str, Any]]:

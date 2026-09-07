@@ -223,15 +223,18 @@ NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
 
 
 def wish_interests_for_notes(notes: str, fallback: list[str] | None = None) -> list[str]:
-    """Map vrije extra-wens-tekst naar zoekbare interesses."""
+    """Map vrije extra-wens-tekst naar zoekbare interesses, altijd aangevuld met profiel."""
     found = interests_from_notes(notes)
-    if found:
-        return _unique_interests(found)[:4]
-    if not (notes or "").strip():
+    profile = [item for item in (fallback or []) if item]
+    if not (notes or "").strip() and not found and not profile:
         return []
-    if fallback:
-        return _unique_interests(fallback)[:4]
-    return _unique_interests(["geschiedenis", "natuur", "architectuur", "horeca"])[:3]
+    # Extra wens eerst, daarna profiel — beide mogen in het suggestieoverzicht.
+    merged = _unique_interests([*found, *profile])
+    if merged:
+        return merged[:6]
+    if (notes or "").strip():
+        return _unique_interests(["geschiedenis", "natuur", "architectuur", "horeca"])[:3]
+    return []
 
 
 def interests_from_notes(notes: str) -> list[str]:
@@ -430,7 +433,7 @@ async def fetch_pois_along_points(
     try:
         return await asyncio.wait_for(
             _fetch_pois_along_points_impl(sampled, radius_m, interests),
-            timeout=40.0,
+            timeout=18.0,
         )
     except TimeoutError as exc:
         raise RuntimeError("Overpass API reageerde niet: timeout") from exc
@@ -1015,4 +1018,116 @@ async def fetch_horeca_nominatim_along_points(
         await asyncio.gather(*tasks[index : index + 4], return_exceptions=True)
         if index + 4 < len(tasks):
             await asyncio.sleep(0.85)
+    return list(merged.values())
+
+
+_THEME_NOMINATIM_QUERIES: dict[str, tuple[str, ...]] = {
+    "geschiedenis": ("museum", "kasteel", "monument"),
+    "natuur": ("park", "natuurgebied", "bos"),
+    "architectuur": ("kerk", "molen", "kapel"),
+    "landbouw": ("hoeve", "boerderij", "wijngaard"),
+    "oorlog": ("oorlogsmonument", "memorial", "fort"),
+    "activiteiten": ("uitzicht", "attractie"),
+    "evenementen": ("theater", "cultuurcentrum"),
+}
+
+
+async def fetch_theme_nominatim_along_points(
+    points: list[tuple[float, float]],
+    interests: list[str],
+    *,
+    max_points: int = 5,
+    per_point: int = 6,
+) -> list[dict[str, Any]]:
+    """Profiel-thema's via Nominatim wanneer Overpass niet reageert."""
+    themes = [item for item in _unique_interests(interests) if item in _THEME_NOMINATIM_QUERIES]
+    if not themes:
+        return []
+    cleaned: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        cleaned.append((float(lat), float(lng)))
+    if not cleaned:
+        return []
+    if len(cleaned) > max_points:
+        step = max(1, (len(cleaned) - 1) // max(1, max_points - 1))
+        spaced = [cleaned[i] for i in range(0, len(cleaned), step)][: max_points - 1]
+        if cleaned[-1] not in spaced:
+            spaced.append(cleaned[-1])
+        cleaned = spaced[:max_points]
+
+    merged: dict[str, dict[str, Any]] = {}
+
+    async def _one(lat: float, lng: float, interest: str, query: str) -> None:
+        delta = 0.07
+        viewbox = f"{lng - delta},{lat + delta},{lng + delta},{lat - delta}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0, connect=4.0),
+                headers={
+                    "User-Agent": settings.nominatim_user_agent,
+                    "Accept": "application/json",
+                    "Accept-Language": "nl,en",
+                },
+                follow_redirects=True,
+            ) as http:
+                response = await http.get(
+                    f"{settings.nominatim_url}/search",
+                    params={
+                        "q": query,
+                        "format": "jsonv2",
+                        "limit": per_point,
+                        "viewbox": viewbox,
+                        "bounded": 1,
+                    },
+                )
+                if response.status_code != 200:
+                    return
+                rows = response.json()
+                if not isinstance(rows, list):
+                    return
+        except Exception:
+            return
+        for row in rows:
+            try:
+                plat = float(row["lat"])
+                plng = float(row["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            name = (row.get("name") or row.get("display_name") or "").split(",")[0].strip()
+            if not name or name.isdigit() or len(name) < 3:
+                continue
+            kind = query
+            pid = f"theme-nom-{interest}-{row.get('osm_type', 'n')}{row.get('osm_id') or unique_key(name, plat, plng)}"
+            merged[pid] = {
+                "id": pid,
+                "name": name,
+                "lat": plat,
+                "lng": plng,
+                "kind": kind,
+                "kind_label": kind_label(kind),
+                "interest": interest,
+                "source": "Nominatim",
+                "wikipedia": None,
+                "wikidata": None,
+                "description": "",
+                "heritage": "",
+            }
+
+    jobs = [
+        _one(lat, lng, interest, query)
+        for lat, lng in cleaned
+        for interest in themes
+        for query in _THEME_NOMINATIM_QUERIES[interest][:2]
+    ]
+    for index in range(0, len(jobs), 4):
+        await asyncio.gather(*jobs[index : index + 4], return_exceptions=True)
+        if index + 4 < len(jobs):
+            await asyncio.sleep(0.75)
     return list(merged.values())

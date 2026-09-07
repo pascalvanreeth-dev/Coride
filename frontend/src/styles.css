@@ -1114,7 +1114,7 @@ input, textarea {
 }
 
 .route-knoop-list li {
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 34px minmax(0, 1fr);
 }
 
 .route-knoop-list .num {
@@ -1181,6 +1181,12 @@ input, textarea {
   cursor: pointer;
   font-size: 1.1rem;
   line-height: 1;
+  flex-shrink: 0;
+}
+
+.ghost-mini-spacer {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .ghost-mini:hover { color: var(--ink); background: var(--line); }

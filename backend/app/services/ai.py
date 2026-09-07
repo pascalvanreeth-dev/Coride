@@ -126,13 +126,14 @@ async def rank_wish_poi_suggestions(
         )
     parsed = await _generate_json(
         "Je bent een fietsgids in Vlaanderen. "
-        "Bekijk de kandidaten langs de geplande fietsroute en kies een selectie suggesties "
-        "die passen bij de extra_wens van de fietser. "
+        "Bekijk de kandidaten langs de geplande fietsroute en kies een selectie suggesties. "
         f"{route_hint}"
         f"Kies bij voorkeur {wanted} plekken (minstens {lo}, max {hi}). "
+        "Neem ZOWEL plekken voor extra_wens ALS plekken voor profiel_interesses — "
+        "minstens één per beschikbaar thema als die in plekken zitten. "
         "Geef diversiteit (niet allemaal hetzelfde type of dezelfde stad). "
         "Prefer plekken met on_route=true als die passen. "
-        "Als er kandidaten zijn die bij de wens passen, kies die — zeg niet dat er niets is. "
+        "Als er kandidaten zijn die bij wens of profiel passen, kies die — zeg niet dat er niets is. "
         "JSON: {pick_ids: [id strings, beste eerst], hints: {id: korte reden max 12 woorden}, summary: 1 zin}. "
         "Alleen ids uit plekken. Nederlands. Verzin geen plekken.",
         json.dumps(

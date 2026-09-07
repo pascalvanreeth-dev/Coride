@@ -266,6 +266,48 @@ export function knoopMatches(a, b, maxM = 150) {
   return haversine(a, b) <= maxM;
 }
 
+/**
+ * Koppel gebruikerspicks aan knooppunten in de getoonde keten (na netwerk-snap).
+ * Geeft Set van route-indexen die de gebruiker zelf koos.
+ */
+export function userPickedRouteIndexes(routeNodes, selectedNodes, maxM = 3500) {
+  const claimed = new Set();
+  if (!routeNodes?.length || !selectedNodes?.length) return claimed;
+  for (const sel of selectedNodes) {
+    let bestIdx = -1;
+    let bestD = Infinity;
+    for (let index = 0; index < routeNodes.length; index += 1) {
+      if (claimed.has(index)) continue;
+      const node = routeNodes[index];
+      if (String(node.number) !== String(sel.number)) continue;
+      const dist = haversine(sel, node);
+      if (dist < bestD) {
+        bestD = dist;
+        bestIdx = index;
+      }
+    }
+    if (bestIdx >= 0 && bestD <= maxM) claimed.add(bestIdx);
+  }
+  return claimed;
+}
+
+/** Vind de originele gebruikerspick die bij een route-knoop hoort (voor verwijderen). */
+export function matchingUserPick(routeNode, selectedNodes, maxM = 3500) {
+  if (!routeNode || !selectedNodes?.length) return null;
+  let best = null;
+  let bestD = Infinity;
+  for (const sel of selectedNodes) {
+    if (String(sel.number) !== String(routeNode.number)) continue;
+    const dist = haversine(sel, routeNode);
+    if (dist < bestD) {
+      bestD = dist;
+      best = sel;
+    }
+  }
+  if (best && bestD <= maxM) return best;
+  return selectedNodes.find((sel) => knoopMatches(sel, routeNode, 250)) || null;
+}
+
 export function knoopOnRoute(node, routeNodes) {
   return (routeNodes || []).some((routeNode) => knoopMatches(node, routeNode));
 }

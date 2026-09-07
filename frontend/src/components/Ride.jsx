@@ -20,12 +20,14 @@ import {
   knoopOnRoute,
   knoopOnGeometry,
   listenOnce,
+  matchingUserPick,
   mergeMapKnooppunten,
   nodeId,
   routeLength,
   speak,
   stopSpeaking,
   uniqueChainIds,
+  userPickedRouteIndexes,
 } from "../geo.js";
 import { nodeIcon, wishPoiSvg, wishPoiIcon } from "../icons.js";
 import { useDebounced } from "../hooks.js";
@@ -158,6 +160,10 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       dirty && draft?.knooppunten?.length ? draft.knooppunten : plan.knooppunten || selectedNodes;
     return displayLoopNodes(base, plan.mode !== "punt");
   }, [dirty, draft, plan.knooppunten, plan.mode, selectedNodes]);
+  const userPickedIndexes = useMemo(
+    () => userPickedRouteIndexes(routeNodes, selectedNodes),
+    [routeNodes, selectedNodes],
+  );
   const mapNodes = useMemo(
     () =>
       mergeMapKnooppunten(
@@ -943,17 +949,17 @@ export default function Ride({ plan, onPlanChange, onBack }) {
 
   function nodeVariant(node) {
     const id = nodeId(node);
-    const geometry = dirty && draft?.geometry?.length ? draft.geometry : plan.geometry;
+    // Alle knooppunten op de route groen.
     if (
       customIds.includes(id) ||
-      selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
+      matchingUserPick(node, selectedNodes) ||
       node.on_route ||
       knoopOnRoute(node, routeNodes) ||
-      knoopOnGeometry(node, geometry)
+      knoopOnGeometry(node, dirty && draft?.geometry?.length ? draft.geometry : plan.geometry)
     ) {
       return "picked";
     }
-    return "route";
+    return "idle";
   }
 
   return (
@@ -1117,8 +1123,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
             <ol className="picked-list route-knoop-list">
               {routeNodes.map((node, index) => {
                 const picked =
+                  userPickedIndexes.has(index) ||
                   customIds.includes(nodeId(node)) ||
-                  selectedNodes.some((item) => knoopMatches(item, node, 80));
+                  Boolean(matchingUserPick(node, selectedNodes));
                 return (
                   <li key={`${nodeId(node)}-${index}`} className={picked ? "picked-stop" : "via-stop"}>
                     <span className="num">{index + 1}</span>
@@ -1132,11 +1139,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                           <small> · start</small>
                         )}
                     </span>
-                    {picked && (
-                      <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
-                        ×
-                      </button>
-                    )}
                   </li>
                 );
               })}

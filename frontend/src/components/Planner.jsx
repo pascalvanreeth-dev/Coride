@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { fetchBikeLeg, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, fetchWishSuggestions, reverseGeocode, reroute } from "../api.js";
+import { fetchBikeLeg, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, reverseGeocode, reroute } from "../api.js";
 import {
   estimateRouteKm,
   formatDuration,
@@ -17,7 +17,9 @@ import {
   knoopMatches,
   knoopOnRoute,
   knoopOnGeometry,
+  matchingUserPick,
   mergeMapKnooppunten,
+  userPickedRouteIndexes,
   geometryProgressIndex,
   nodeId,
   poiId,
@@ -101,7 +103,7 @@ function mergeStreetGeometries(base, extension) {
   return merged;
 }
 
-export default function Planner({ busy, error, center, zoom = 14, profile, onEditProfile, onPreview, onPlan }) {
+export default function Planner({ busy, error, center, zoom = 14, profile, onEditProfile, onPreview, onPlan, onClearError }) {
   const [map, setMap] = useState(null);
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
@@ -209,6 +211,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
+  const userPickedIndexes = useMemo(
+    () => userPickedRouteIndexes(routeNodes, selectedNodes),
+    [routeNodes, selectedNodes],
+  );
+
   const mapNodes = useMemo(
     () =>
       mergeMapKnooppunten(
@@ -312,6 +319,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         if (cancelled) return;
         setNodes(next);
         rememberNodes(...next);
+        setGeoError("");
       })
       .catch((err) => {
         if (!cancelled) setGeoError(err.message);
@@ -442,7 +450,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     for (let index = 0; index < picked.length - 1; index += 1) {
       const from = picked[index];
       const to = picked[index + 1];
-      const key = `${nodeId(from)}|${nodeId(to)}`;
+      const key = `net2|${nodeId(from)}|${nodeId(to)}`;
       if (legCacheRef.current.has(key)) {
         legs.push(legCacheRef.current.get(key));
       } else {
@@ -474,16 +482,20 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       );
       if (cancelled || buildId !== routeBuildGenRef.current) return;
       let anyOk = false;
+      let stillMissing = 0;
       for (const item of results) {
-        if (!item.ok) continue;
+        if (!item.ok) {
+          stillMissing += 1;
+          continue;
+        }
         legCacheRef.current.set(item.key, item.leg);
         legs[item.index] = item.leg;
         anyOk = true;
       }
       if (anyOk) {
-        publish(legs, { provisional: false });
+        publish(legs, { provisional: stillMissing > 0 });
         rememberNodes(...picked);
-        setDraftBusy(false);
+        setDraftBusy(stillMissing > 0);
       } else if (!draftRef.current?.geometry?.length) {
         setGeoError(results[0]?.err?.message || "Route kon niet worden berekend. Probeer opnieuw.");
         setDraftBusy(false);
@@ -503,68 +515,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   const activeInterests = profile?.interests?.length ? profile.interests : interests;
 
-  // Manuele route: wenssuggesties langs de gekozen knooppunten.
-  const manualWishKey = useDebounced(
-    buildMode === "manual" && notes.trim() && draft?.geometry?.length > 1
-      ? `${selectedKey}|${notes.trim()}|${Math.round((draft.distance_km || 0) * 10)}|${activeInterests.join(",")}`
-      : "",
-    500,
-  );
-
-  useEffect(() => {
-    if (buildMode !== "manual" || !manualWishKey) {
-      if (buildMode !== "manual" || !notes.trim()) {
-        setManualWishSuggestions([]);
-        setManualWishSummary("");
-        setManualWishBusy(false);
-        setManualWishError("");
-      }
-      return undefined;
-    }
-    const draftNow = draftRef.current;
-    const geometrySource = draftNow?.geometry;
-    if (!geometrySource?.length) return undefined;
-
-    let cancelled = false;
-    setManualWishBusy(true);
-    setManualWishError("");
-    // Dicht genoeg bemonsteren zodat cafés niet tussen samplepunten vallen.
-    const geometry = sampleGeometryAlongRoute(geometrySource, 56);
-    const nodeSource = draftNow?.knooppunten?.length ? draftNow.knooppunten : selectedNodes;
-    fetchWishSuggestions({
-      notes: notes.trim(),
-      interests: activeInterests,
-      geometry,
-      nodes: nodeSource.map((node) => ({
-        id: node.id || "",
-        number: node.number,
-        lat: node.lat,
-        lng: node.lng,
-        network: node.network || null,
-        geoid: node.geoid ?? null,
-      })),
-    })
-      .then((data) => {
-        if (cancelled) return;
-        setManualWishSuggestions(Array.isArray(data?.suggestions) ? data.suggestions : []);
-        setManualWishSummary(data?.wish_summary || "");
-        setManualWishError("");
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setManualWishSuggestions([]);
-          setManualWishSummary("");
-          setManualWishError(err?.message || "Wenssuggesties konden niet geladen worden.");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setManualWishBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // Enkel manualWishKey: voorkomt afbreken wanneer nodeLookup/selectedNodes herberekend worden.
-  }, [buildMode, manualWishKey]);
+  // Geen pre-plan wish-fetch: Overpass kan de backend blokkeren zodat /api/plan
+  // “geen verbinding” geeft. Extra wens gaat mee in de plan-request zelf.
 
   useEffect(() => {
     if (buildMode !== "suggest") return undefined;
@@ -700,21 +652,20 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   const wishSuggestions = useMemo(() => {
     if (!notes.trim()) return [];
-    if (buildMode === "manual") return manualWishSuggestions;
-    if (buildMode === "auto" || buildMode === "suggest") return routePreview?.suggestions || [];
-    return [];
-  }, [buildMode, notes, manualWishSuggestions, routePreview?.suggestions]);
+    return manualWishSuggestions;
+  }, [notes, manualWishSuggestions]);
 
-  const wishSummary =
-    buildMode === "manual" ? manualWishSummary : routePreview?.wish_summary || "";
+  const wishSummary = manualWishSummary;
 
-  const wishBusy = buildMode === "manual" ? manualWishBusy : routePreviewBusy;
+  const wishBusy = manualWishBusy;
 
   useEffect(() => {
     setFocusedWishId("");
     setPickedWishPois([]);
     setFocusPulse(null);
     setManualWishError("");
+    setManualWishSuggestions([]);
+    setManualWishSummary("");
   }, [notes]);
 
   const suggestInterests = useMemo(
@@ -828,6 +779,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setGeoError("");
     setSelectedSuggestionId("");
     setSuggestionPreview(null);
+    setManualWishSuggestions([]);
+    setManualWishSummary("");
+    setManualWishBusy(false);
+    setManualWishError("");
     cancelRouteModePicker();
     cancelStartPicker();
 
@@ -924,9 +879,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     if (buildMode === "suggest") return;
     if (startChoice !== "map") return;
     setGeoError("");
-    if (buildMode === "manual") {
-      setSelectedIds([]);
-      setDraft(null);
+    // Gekozen knooppuntenroute behouden — kaartklik mag die niet wissen.
+    if (buildMode === "manual" && selectedIds.length > 0) {
+      setViewFocus({ lat: next.lat, lng: next.lng });
+      return;
     }
     setViewFocus({ lat: next.lat, lng: next.lng });
     await setFromCoords(next, "map");
@@ -1044,23 +1000,21 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     if (mode === "punt" && selectedNodes.length) {
       const first = selectedNodes[0];
       const last = selectedNodes[selectedNodes.length - 1];
-      if (knoopMatches(first, node, 80)) return "start";
-      if (selectedNodes.length >= 2 && knoopMatches(last, node, 80)) return "end";
+      if (knoopMatches(first, node, 250) || matchingUserPick(node, [first])) return "start";
+      if (
+        selectedNodes.length >= 2 &&
+        (knoopMatches(last, node, 250) || matchingUserPick(node, [last]))
+      ) {
+        return "end";
+      }
     } else if (origin?.source === "knoop" && knoopMatches(origin, node, 80)) {
       return "start";
     }
     const id = nodeId(node);
-    // Zelf kiezen: alleen echt gekozen knooppunten groen — niet alles op de magenta lijn.
-    if (buildMode === "manual") {
-      if (selectedIdSet.has(id) || selectedNodes.some((picked) => knoopMatches(picked, node, 80))) {
-        return "picked";
-      }
-      return "route";
-    }
-    // Auto/suggest: gekozen én tussenliggende knooppunten op de route groen.
+    // Gekozen of op de route: altijd groen.
     if (
       selectedIdSet.has(id) ||
-      selectedNodes.some((picked) => knoopMatches(picked, node, 80)) ||
+      matchingUserPick(node, selectedNodes) ||
       node.on_route ||
       knoopOnRoute(node, routeNodes) ||
       knoopOnGeometry(node, draft?.geometry || routePreview?.geometry)
@@ -1073,10 +1027,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     return "idle";
   }
 
-  function isSelectedNode(node) {
+  function isSelectedNode(node, index = -1) {
+    if (index >= 0 && userPickedIndexes.has(index)) return true;
     const id = nodeId(node);
     if (selectedIdSet.has(id)) return true;
-    return selectedNodes.some((picked) => knoopMatches(picked, node, 80));
+    if (matchingUserPick(node, selectedNodes)) return true;
+    return false;
   }
 
   function submit(event) {
@@ -1106,6 +1062,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       setGeoError("Kies eerst een route uit de Top 10.");
       return;
     }
+
     const tripInterests =
       buildMode === "suggest" && selectedSuggestion
         ? mergeInterests(selectedSuggestion.interests, activeInterests)
@@ -1380,19 +1337,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             {routeNodes.length ? (
               <ol className="picked-list route-knoop-list">
                 {routeNodes.map((node, index) => {
-                  const picked = isSelectedNode(node);
+                  const picked = isSelectedNode(node, index);
                   return (
                     <li key={`${nodeId(node)}-${index}`} className={picked ? "picked-stop" : "via-stop"}>
                       <span className="num">{index + 1}</span>
                       <span>
                         <strong>Knooppunt {node.number}</strong>
-                        {picked && mode === "punt" && selectedNodes.length && knoopMatches(selectedNodes[0], node, 80) && (
+                        {picked && mode === "punt" && selectedNodes.length && knoopMatches(selectedNodes[0], node, 250) && (
                           <small> · A</small>
                         )}
                         {picked &&
                           mode === "punt" &&
                           selectedNodes.length >= 2 &&
-                          knoopMatches(selectedNodes[selectedNodes.length - 1], node, 80) && (
+                          knoopMatches(selectedNodes[selectedNodes.length - 1], node, 250) && (
                             <small> · B</small>
                           )}
                         {picked ? <small> gekozen</small> : <small> · via netwerk</small>}
@@ -1403,11 +1360,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                             <small> · start</small>
                           )}
                       </span>
-                      {picked && (
-                        <button type="button" className="ghost-mini" onClick={() => toggleNode(node)}>
-                          ×
-                        </button>
-                      )}
                     </li>
                   );
                 })}
@@ -1437,7 +1389,17 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               </p>
             )}
             {selectedIds.length > 0 && (
-              <button type="button" className="ghost-link" onClick={() => setSelectedIds([])}>
+              <button
+                type="button"
+                className="ghost-link"
+                onClick={() => {
+                  setSelectedIds([]);
+                  setDraft(null);
+                  setDraftBusy(false);
+                  manualRouteIdsRef.current = [];
+                  legCacheRef.current.clear();
+                }}
+              >
                 Selectie wissen
               </button>
             )}
@@ -1534,12 +1496,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           </label>
           )}
 
-          {buildMode === "manual" && notes.trim() && !draft?.geometry?.length && (
-            <p className="sources" style={{ margin: "0 0 12px" }}>
-              Kies eerst knooppunten op de kaart; daarna zoeken we plekken langs jouw route.
-            </p>
-          )}
-
           {(buildMode === "auto" ||
             buildMode === "manual" ||
             (buildMode === "suggest" && selectedSuggestion)) &&
@@ -1548,7 +1504,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             <div className="poi-suggest-section" id="suggestieoverzicht">
               <strong>Suggestieoverzicht</strong>
               <p className="sources" style={{ margin: "6px 0 8px" }}>
-                {wishSummary || "Plekken die passen bij je wens (met AI gekozen). Klik op een plek om te kiezen of je ze in je route opneemt."}
+                {wishSummary ||
+                  "Plekken langs je route op basis van je extra wens én je profiel. Klik om er een toe te voegen."}
               </p>
               <div className="poi-suggest-grid">
                 {wishSuggestions.map((item) => {
@@ -1588,37 +1545,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                 </p>
               )}
             </div>
-          )}
-
-          {(buildMode === "auto" || buildMode === "manual") &&
-            notes.trim() &&
-            wishBusy &&
-            !wishSuggestions.length && (
-            <p className="sources" style={{ margin: "0 0 12px" }}>
-              Plekken voor je wens worden gezocht met AI...
-            </p>
-          )}
-
-          {buildMode === "auto" && notes.trim() && !routePreviewBusy && !wishSuggestions.length && routePreview?.geometry?.length > 1 && (
-            <p className="sources" style={{ margin: "0 0 12px" }}>
-              Geen passende plekken gevonden voor je wens. Probeer een andere formulering.
-            </p>
-          )}
-
-          {buildMode === "manual" &&
-            notes.trim() &&
-            !manualWishBusy &&
-            draft?.geometry?.length > 1 &&
-            !wishSuggestions.length && (
-            <p className="sources" style={{ margin: "0 0 12px" }}>
-              {manualWishError
-                ? `Zoeken mislukt: ${
-                    /not found/i.test(manualWishError)
-                      ? "de wens-API ontbreekt op de backend — herstart backend én frontend"
-                      : manualWishError
-                  } (bron: OpenStreetMap).`
-                : "Geen passende plekken gevonden voor je wens. Probeer “café” of “restaurant”, of even opnieuw zoeken."}
-            </p>
           )}
 
           {buildMode === "suggest" && selectedSuggestion && (
@@ -1687,9 +1613,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               dashed={manualRouteLine.provisional}
             />
           ))}
-          {/* Zelf kiezen: alleen jouw picks als groene ketenmarkers — via-netwerk blijft in de lijst. */}
-          {(buildMode === "manual" && selectedNodes.length > 0) && (
-            <RouteChainKnoopMarkers nodes={selectedNodes} geometry={draft?.geometry} pool={mapNodes} />
+          {/* Gekozen = groen; overgeslagen via-netwerk = rood. */}
+          {(buildMode === "manual" && routeNodes.length > 0) && (
+            <RouteChainKnoopMarkers
+              nodes={routeNodes}
+              geometry={draft?.geometry}
+              pool={mapNodes}
+            />
           )}
           {(buildMode === "suggest" || buildMode === "auto") && routePreview?.geometry?.length > 1 && (
             <RouteLine positions={routePreview.geometry} />

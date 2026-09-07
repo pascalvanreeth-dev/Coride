@@ -40,6 +40,185 @@ SPEED_KMH = {
 }
 
 
+def _place_from_knoop(node: dict[str, Any]) -> Place:
+    number = str(node.get("number") or "")
+    return Place(
+        lat=float(node["lat"]),
+        lng=float(node["lng"]),
+        label=f"Knooppunt {number}" if number else "Startknooppunt",
+        country="BE",
+        place_name=f"Knooppunt {number}" if number else None,
+        municipality=None,
+    )
+
+
+async def _plan_user_knoop_route(
+    request: PlanRequest,
+    user_chain: list[dict[str, Any]],
+    catalog_route: dict[str, Any] | None = None,
+) -> RoutePlan:
+    """Snelle planning voor zelfgekozen knooppunten — geen zware Overpass/AI-wachttijd."""
+    profile = request.profile
+    first = user_chain[0]
+    last = user_chain[-1]
+    start = _place_from_knoop(first)
+    end = _place_from_knoop(last) if request.mode == "punt" else start
+
+    weather_raw = await _optional(weather_service.fetch_weather(start.lat, start.lng), None, 3)
+    weather = WeatherInfo(**(weather_raw or {})) if isinstance(weather_raw, dict) else WeatherInfo()
+
+    spine = _chain_spine(user_chain)
+    display_chain, route = await _build_knoop_route(
+        start.lat,
+        start.lng,
+        spine,
+        close_loop=request.mode != "punt",
+        end_lat=end.lat if request.mode == "punt" else None,
+        end_lng=end.lng if request.mode == "punt" else None,
+        poi_picks=request.poi_picks,
+    )
+    chain = display_chain or list(user_chain)
+    knoop_label = knoop_service.chain_label(
+        knoop_service.close_chain_for_loop(chain) if request.mode == "lus" else chain
+    )
+
+    selected = _merge_user_pois([], request.poi_picks)
+    stops: list[dict[str, Any]] = []
+    for index, poi in enumerate(selected, start=1):
+        wiki = poi.get("wiki") or {}
+        scripts = fallback_scripts(poi, wiki, request.explanation_level)
+        stops.append(
+            {
+                "id": poi["id"],
+                "name": poi["name"],
+                "lat": poi["lat"],
+                "lng": poi["lng"],
+                "kind": poi.get("kind_label") or poi.get("kind") or "plek",
+                "interest": poi.get("interest") or "geschiedenis",
+                "source": poi.get("source") or "OpenStreetMap",
+                "summary": poi.get("summary") or scripts["summary"],
+                "approaching": scripts["approaching"],
+                "arrived": scripts["arrived"],
+                "why": scripts["why"],
+                "wikipedia_url": wiki.get("url") or None,
+                "image_url": wiki.get("image") or None,
+                "wikipedia": poi.get("wikipedia"),
+                "wikidata": poi.get("wikidata"),
+                "description": poi.get("description") or "",
+                "kind_label": poi.get("kind_label"),
+                "index": index,
+                "matches_wish": True,
+                "on_route": True,
+            }
+        )
+
+    # Snelle wens/profiel-suggesties (Nominatim/Wikipedia — geen trage Overpass).
+    profile_interests = list(request.interests or [])
+    if profile and getattr(profile, "interests", None):
+        profile_interests = list(dict.fromkeys([*profile_interests, *list(profile.interests)]))
+    notes = (request.notes or "").strip()
+    if route.get("geometry") and (notes or profile_interests):
+        try:
+            wish_pois, _ = await asyncio.wait_for(
+                _fast_wish_pois_for_manual(
+                    notes,
+                    chain,
+                    route["geometry"],
+                    profile_interests,
+                ),
+                timeout=18.0,
+            )
+            _merge_wish_into_stops(stops, wish_pois, request, route["geometry"])
+        except TimeoutError:
+            pass
+        except Exception:
+            pass
+
+    stops = places_service.assign_sides(stops, route["geometry"])
+    model_stops = [
+        Stop(
+            id=s["id"],
+            name=s["name"],
+            lat=s["lat"],
+            lng=s["lng"],
+            kind=s["kind"],
+            interest=s["interest"],
+            source=s["source"],
+            summary=s["summary"],
+            approaching=s["approaching"],
+            arrived=s["arrived"],
+            why=s["why"],
+            wikipedia_url=s.get("wikipedia_url"),
+            image_url=s.get("image_url"),
+            wikipedia=s.get("wikipedia"),
+            wikidata=s.get("wikidata"),
+            description=s.get("description"),
+            place_name=s.get("place_name"),
+            population=s.get("population"),
+            local_fact=s.get("local_fact"),
+            side=s.get("side"),
+            matches_wish=bool(s.get("matches_wish")),
+            on_route=bool(s.get("on_route")),
+        )
+        for s in stops
+    ]
+    knoop_chain_display = (
+        knoop_service.close_chain_for_loop(chain) if request.mode == "lus" else chain
+    )
+    knoop_models = [
+        Knooppunt(
+            id=n.get("id") or "",
+            number=str(n["number"]),
+            lat=float(n["lat"]),
+            lng=float(n["lng"]),
+            network=n.get("network"),
+            on_route=True,
+            geoid=n.get("geoid"),
+        )
+        for n in knoop_chain_display
+    ]
+    chain_ids = {n.get("id") for n in chain if n.get("id")}
+    all_knoop = _unique_knooppunten(chain, chain_ids)
+    title = f"Knooppuntenroute {knoop_label}" if knoop_label else "Jouw knooppuntenroute"
+    intro = (
+        f"Je volgt de knooppunten {knoop_label}."
+        if knoop_label
+        else "Je volgt de knooppunten die je zelf koos."
+    )
+    if catalog_route:
+        title = catalog_route.get("title") or title
+    sources = sorted(
+        {stop.source for stop in model_stops}
+        | {"OpenStreetMap", "OSRM fietsrouting", "Fietsknooppuntennetwerk Vlaanderen", "Open-Meteo"}
+    )
+    return RoutePlan(
+        title=title,
+        intro=intro,
+        mode=request.mode,
+        interests=request.interests,
+        notes=(request.notes or "").strip(),
+        start=start,
+        end=end,
+        distance_km=round(float(route["distance_m"]) / 1000, 1),
+        duration_min=max(1, round(float(route["duration_s"]) / 60)),
+        geometry=route["geometry"],
+        stops=model_stops,
+        knooppunten=knoop_models,
+        all_knooppunten=all_knoop,
+        knoop_chain=knoop_label,
+        route_reason="Eigen knooppuntenroute",
+        steps=route.get("steps") or [],
+        explanation_level=request.explanation_level,
+        interaction=(profile.interaction if profile else "live"),
+        weather=weather,
+        budget_mode=request.budget_mode,
+        duration_budget_min=request.duration_min,
+        localities=_localities_from_stops(model_stops),
+        sources=sources,
+        ai_used=False,
+    )
+
+
 async def plan_route(request: PlanRequest) -> RoutePlan:
     catalog_route = suggestion_service.get_route_by_id(request.suggestion_id) if request.suggestion_id else None
     if catalog_route:
@@ -48,6 +227,14 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     wish_interests = pois_service.interests_from_notes(request.notes)
     if wish_interests:
         request.interests = list(dict.fromkeys([*request.interests, *wish_interests]))
+
+    # Zelf gekozen knooppunten: snelle route zonder zware Overpass/AI (voorkomt "geen verbinding").
+    user_chain = knoop_service.chain_from_user(
+        [n.model_dump() for n in request.knooppunten],
+        request.mode == "lus",
+    )
+    if user_chain:
+        return await _plan_user_knoop_route(request, user_chain, catalog_route)
 
     start = await geocoding.geocode_one(request.start)
     if request.mode == "punt":
@@ -232,14 +419,20 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         )
 
     if request.notes.strip() and route.get("geometry"):
-        wish_pois, _ = await _wish_pois_for_geometry(
-            request.notes,
-            candidates,
-            ranked,
-            chain or [],
-            route["geometry"],
-            list(request.interests),
-        )
+        try:
+            wish_pois, _ = await asyncio.wait_for(
+                _wish_pois_for_geometry(
+                    request.notes,
+                    candidates,
+                    ranked,
+                    chain or [],
+                    route["geometry"],
+                    list(request.interests),
+                ),
+                timeout=35.0,
+            )
+        except TimeoutError:
+            wish_pois = []
         _merge_wish_into_stops(stops, wish_pois, request, route["geometry"])
 
     stops = await polish_scripts(stops, request.explanation_level)
@@ -594,10 +787,18 @@ async def preview_route(
     }
 
 
-def _format_wish_suggestions(wish_pois: list[dict[str, Any]], notes: str) -> list[dict[str, Any]]:
+def _format_wish_suggestions(
+    wish_pois: list[dict[str, Any]],
+    notes: str,
+    profile_interests: list[str] | None = None,
+) -> list[dict[str, Any]]:
     suggestions: list[dict[str, Any]] = []
     note_interests = pois_service.interests_from_notes(notes)
-    fallback_interest = note_interests[0] if note_interests else "geschiedenis"
+    fallback_interest = (
+        note_interests[0]
+        if note_interests
+        else ((profile_interests or [None])[0] or "geschiedenis")
+    )
     for poi in wish_pois:
         try:
             suggestions.append(
@@ -642,16 +843,22 @@ async def wish_suggestions_along_route(
                 "geoid": data.get("geoid"),
             }
         )
-    wish_pois, wish_summary = await _wish_pois_for_geometry(
-        notes,
-        [],
-        [],
-        chain,
-        geometry,
-        profile_interests,
-    )
+    try:
+        wish_pois, wish_summary = await asyncio.wait_for(
+            _wish_pois_for_geometry(
+                notes,
+                [],
+                [],
+                chain,
+                geometry,
+                profile_interests,
+            ),
+            timeout=40.0,
+        )
+    except TimeoutError:
+        return {"suggestions": [], "wish_summary": None}
     return {
-        "suggestions": _format_wish_suggestions(wish_pois, notes),
+        "suggestions": _format_wish_suggestions(wish_pois, notes, profile_interests),
         "wish_summary": wish_summary or None,
     }
 
@@ -901,11 +1108,9 @@ async def _build_knoop_route(
     spine_geo = knoop_service.enrich_chain_geoids(
         spine, network_nodes, trajects=trajects, network=chain_network
     )
-    # Behoud klik-coördinaten van de gebruiker (geoid blijft voor netwerkgraaf).
+    # Officiële netwerkcoördinaten behouden voor routing (klik mag geoid niet “wegtrekken”).
     for index, node in enumerate(spine_geo):
         if index < len(spine):
-            node["lat"] = float(spine[index]["lat"])
-            node["lng"] = float(spine[index]["lng"])
             if spine[index].get("id"):
                 node["id"] = spine[index]["id"]
             if spine[index].get("number") is not None:
@@ -915,7 +1120,14 @@ async def _build_knoop_route(
     }
     for node in spine_geo:
         if node.get("geoid") is not None:
-            by_geoid[int(node["geoid"])] = node
+            official = by_geoid.get(int(node["geoid"]))
+            if official:
+                # Gebruik altijd officiële lat/lng voor dit geoid in de graaf.
+                node["lat"] = float(official["lat"])
+                node["lng"] = float(official["lng"])
+                by_geoid[int(node["geoid"])] = {**official, **node, "lat": float(official["lat"]), "lng": float(official["lng"])}
+            else:
+                by_geoid[int(node["geoid"])] = node
     adj = knoop_service.build_adjacency(trajects)
     route_chain = knoop_service._display_chain_between_picks(spine_geo, by_geoid, adj)
     if len(route_chain) < len(spine_geo):
@@ -1445,6 +1657,158 @@ def _wish_suggestion_target(route_km: float, wish_interests: list[str]) -> int:
     return max(12, min(36, max(by_distance, by_theme)))
 
 
+async def _fast_wish_pois_for_manual(
+    notes: str,
+    chain: list[dict[str, Any]],
+    geometry: list[list[float]],
+    profile_interests: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Lichte suggesties voor manuele knooproutes — Nominatim/Wikipedia, geen Overpass."""
+    if not geometry or len(geometry) < 2:
+        return [], ""
+    profile_only = pois_service._unique_interests(profile_interests or [])
+    wish_interests = pois_service.wish_interests_for_notes(notes, profile_only)
+    if not wish_interests:
+        return [], ""
+    wish_set = set(wish_interests)
+    sample_points = _sample_route_points(geometry, 6)
+    for node in (chain or [])[:4]:
+        try:
+            sample_points.append((float(node["lat"]), float(node["lng"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    want_horeca = pois_service.notes_want_horeca(notes, wish_interests)
+
+    tasks: list[asyncio.Task] = []
+    labels: list[str] = []
+    if want_horeca:
+        tasks.append(
+            asyncio.create_task(
+                _optional(
+                    pois_service.fetch_horeca_nominatim_along_points(
+                        sample_points, max_points=3, per_point=5
+                    ),
+                    [],
+                    10,
+                )
+            )
+        )
+        labels.append("horeca")
+    themes = [item for item in wish_interests if item != "horeca"][:4]
+    if themes:
+        tasks.append(
+            asyncio.create_task(
+                _optional(
+                    pois_service.fetch_theme_nominatim_along_points(
+                        sample_points, themes, max_points=3, per_point=4
+                    ),
+                    [],
+                    10,
+                )
+            )
+        )
+        labels.append("themes")
+    start_pt = sample_points[0]
+    end_pt = sample_points[-1] if len(sample_points) > 1 else None
+    tasks.append(
+        asyncio.create_task(
+            _optional(
+                wikipedia.places_for_route(
+                    start_pt[0],
+                    start_pt[1],
+                    7000,
+                    end_pt,
+                ),
+                [],
+                8,
+            )
+        )
+    )
+    labels.append("wiki")
+
+    groups = await asyncio.gather(*tasks) if tasks else []
+    merged: list[dict[str, Any]] = []
+    for group in groups:
+        merged = _merge(merged, group or [])
+
+    # (Her)label Wikipedia/Nominatim-hits naar wens/profiel-thema's.
+    for poi in merged:
+        name = (poi.get("name") or "").lower()
+        current = poi.get("interest")
+        if current == "horeca":
+            continue
+        if any(key in name for key in ("park", "bos", "duin", "natuur", "heide", "meer", "beek")) and "natuur" in wish_set:
+            poi["interest"] = "natuur"
+            if "natuur" in set(profile_only):
+                poi["hint"] = "uit je profiel"
+        elif any(key in name for key in ("kerk", "molen", "kapel", "kasteel", "basiliek", "toren")) and (
+            "architectuur" in wish_set or "geschiedenis" in wish_set
+        ):
+            poi["interest"] = "architectuur" if "architectuur" in wish_set else "geschiedenis"
+            if poi["interest"] in set(profile_only):
+                poi["hint"] = "uit je profiel"
+        elif not current:
+            poi["interest"] = profile_only[0] if profile_only else next(iter(wish_set), "geschiedenis")
+            if poi.get("interest") in set(profile_only) and not poi.get("hint"):
+                poi["hint"] = "uit je profiel"
+        elif current in set(profile_only) and not poi.get("hint"):
+            poi["hint"] = "uit je profiel"
+
+    kept: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for poi in merged:
+        interest = poi.get("interest")
+        if interest not in wish_set and not pois_service.matches_notes(poi, notes):
+            continue
+        key = str(poi.get("id") or "") or unique_key(poi.get("name") or "", poi["lat"], poi["lng"])
+        if key in seen:
+            continue
+        if not (
+            _on_route_geometry(poi, geometry, max_m=7000)
+            or any(haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < 4000 for n in chain)
+        ):
+            continue
+        seen.add(key)
+        tagged = dict(poi)
+        tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=3500)
+        if (
+            not pois_service.matches_notes(poi, notes)
+            and interest in set(profile_only)
+            and not tagged.get("hint")
+        ):
+            tagged["hint"] = "uit je profiel"
+        kept.append(tagged)
+
+    # Eerst per interesse minstens één plek (wens + profiel), daarna diversiteit.
+    prioritized: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for interest in wish_interests:
+        for poi in kept:
+            pid = str(poi.get("id") or "")
+            if poi.get("interest") != interest or pid in used:
+                continue
+            prioritized.append(poi)
+            used.add(pid)
+            break
+    rest = [p for p in kept if str(p.get("id") or "") not in used]
+    diverse = pois_service.pick_diverse_pois(
+        [*prioritized, *rest],
+        wish_interests,
+        wanted=min(12, max(6, len(wish_interests) * 3)),
+        min_distance_m=400,
+    )
+    if want_horeca and not any(p.get("interest") == "horeca" for p in diverse):
+        mid = sample_points[len(sample_points) // 2]
+        extra = await _optional(
+            pois_service.fetch_horeca_nominatim_along_points([mid], max_points=1, per_point=8),
+            [],
+            6,
+        )
+        if extra:
+            diverse = [*extra[:2], *diverse][:12]
+    return diverse, ""
+
+
 async def _wish_pois_for_geometry(
     notes: str,
     candidates: list[dict[str, Any]],
@@ -1453,9 +1817,15 @@ async def _wish_pois_for_geometry(
     geometry: list[list[float]],
     profile_interests: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    if not notes.strip() or not geometry:
+    if not geometry:
         return [], ""
-    wish_interests = pois_service.wish_interests_for_notes(notes, profile_interests)
+    if not notes.strip() and not (profile_interests or []):
+        return [], ""
+    note_interests = pois_service.interests_from_notes(notes)
+    profile_only = pois_service._unique_interests(profile_interests or [])
+    wish_interests = pois_service.wish_interests_for_notes(notes, profile_only)
+    if not wish_interests:
+        return [], ""
     wish_set = set(wish_interests)
     route_km = _geometry_length_km(geometry)
     target = _wish_suggestion_target(route_km, wish_interests)
@@ -1478,52 +1848,103 @@ async def _wish_pois_for_geometry(
     corridor_m = 8000 if route_km >= 80 else (6500 if route_km >= 40 else 4500)
     corridor_keep_m = 7000 if route_km >= 80 else (5000 if route_km >= 40 else 2800)
 
-    # Horeca (café/…) — geen korte outer-timeout die alles weggooit bij trage mirrors.
-    if want_horeca:
-        try:
-            horeca = await pois_service.fetch_horeca_along_points(
+    # Extra wens (bv. café) en profiel-thema's apart ophalen zodat profiel niet verdwijnt.
+    async def _fetch_themes(themes: list[str]) -> list[dict[str, Any]]:
+        cleaned = [item for item in themes if item]
+        if not cleaned:
+            return []
+        return await _optional(
+            pois_service.fetch_pois_along_points(
                 sample_points,
                 corridor_m,
-                max_points=8,
-                chunk_size=4,
-            )
-        except Exception:
-            horeca = []
-        if len(horeca) < 5:
-            try:
-                nomi = await pois_service.fetch_horeca_nominatim_along_points(
-                    sample_points, max_points=6, per_point=8
-                )
-                horeca = _merge(horeca, nomi)
-            except Exception:
-                pass
-        route_candidates = _merge(route_candidates, horeca)
+                cleaned,
+                max_points=min(12, len(sample_points)),
+            ),
+            [],
+            18,
+        )
 
-    other_interests = [item for item in wish_interests if not (want_horeca and item == "horeca")]
-    if other_interests:
-        along = await _optional(
-            pois_service.fetch_pois_along_points(
-                sample_points,
-                corridor_m,
-                other_interests,
-                max_points=min(18, len(sample_points)),
+    horeca_task = None
+    if want_horeca:
+        async def _horeca_path() -> list[dict[str, Any]]:
+            try:
+                horeca = await pois_service.fetch_horeca_along_points(
+                    sample_points,
+                    corridor_m,
+                    max_points=8,
+                    chunk_size=4,
+                )
+            except Exception:
+                horeca = []
+            if len(horeca) < 5:
+                try:
+                    nomi = await pois_service.fetch_horeca_nominatim_along_points(
+                        sample_points, max_points=6, per_point=8
+                    )
+                    horeca = _merge(horeca, nomi)
+                except Exception:
+                    pass
+            return horeca
+
+        horeca_task = asyncio.create_task(_horeca_path())
+
+    note_themes = [item for item in note_interests if not (want_horeca and item == "horeca")]
+    profile_themes = [item for item in profile_only if item]
+    note_task = asyncio.create_task(_fetch_themes(note_themes))
+    profile_task = asyncio.create_task(_fetch_themes(profile_themes))
+
+    horeca = await horeca_task if horeca_task else []
+    note_pois = await note_task
+    profile_pois = await profile_task
+    # Overpass valt vaak stil: Wikipedia + Nominatim als fallback voor profiel-thema's.
+    profile_hit = {poi.get("interest") for poi in profile_pois}
+    if profile_themes and len(profile_hit.intersection(profile_themes)) < min(2, len(profile_themes)):
+        start_pt = sample_points[0]
+        end_pt = sample_points[-1] if len(sample_points) > 1 else None
+        wiki = await _optional(
+            wikipedia.places_for_route(
+                start_pt[0],
+                start_pt[1],
+                min(int(corridor_m), 9000),
+                end_pt,
             ),
             [],
-            50,
+            12,
         )
-        route_candidates = _merge(route_candidates, along)
-    elif wish_interests and not want_horeca:
-        along = await _optional(
-            pois_service.fetch_pois_along_points(
+        for poi in wiki:
+            name = (poi.get("name") or "").lower()
+            if any(key in name for key in ("park", "bos", "duin", "natuur", "heide", "meer ")):
+                interest = "natuur" if "natuur" in profile_themes else profile_themes[0]
+            elif any(key in name for key in ("kerk", "molen", "kapel", "basiliek")):
+                interest = (
+                    "architectuur"
+                    if "architectuur" in profile_themes
+                    else ("geschiedenis" if "geschiedenis" in profile_themes else profile_themes[0])
+                )
+            elif "geschiedenis" in profile_themes:
+                interest = "geschiedenis"
+            else:
+                interest = profile_themes[0]
+            poi["interest"] = interest
+            if not poi.get("hint"):
+                poi["hint"] = "uit je profiel"
+        nomi = await _optional(
+            pois_service.fetch_theme_nominatim_along_points(
                 sample_points,
-                corridor_m,
-                wish_interests,
-                max_points=min(18, len(sample_points)),
+                profile_themes,
+                max_points=4,
+                per_point=4,
             ),
             [],
-            50,
+            14,
         )
-        route_candidates = _merge(route_candidates, along)
+        for poi in nomi:
+            if not poi.get("hint"):
+                poi["hint"] = "uit je profiel"
+        profile_pois = _merge(profile_pois, wiki, nomi)
+    if horeca:
+        route_candidates = _merge(route_candidates, horeca)
+    route_candidates = _merge(route_candidates, note_pois, profile_pois)
 
     # Houd plekken bij de route-corridor (niet enkel dicht bij een knooppunt).
     near = []
@@ -1536,9 +1957,8 @@ async def _wish_pois_for_geometry(
         wish = pois_service.matches_notes(poi, notes) or (
             bool(wish_set) and poi.get("interest") in wish_set
         )
-        if not wish and not pois_service.matches_notes(poi, notes):
-            if not (bool(wish_set) and poi.get("interest") in wish_set):
-                continue
+        if not wish:
+            continue
         near_knoop = any(
             haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < (3500 if wish else 1400)
             for n in chain
@@ -1575,7 +1995,8 @@ async def _wish_pois_for_geometry(
     ordered = sorted(
         near,
         key=lambda poi: (
-            0 if fits_wish(poi) else 1,
+            0 if pois_service.matches_notes(poi, notes) else 1,
+            0 if (poi.get("interest") in set(profile_only)) else 1,
             0 if _on_route_geometry(poi, geometry) else 1,
             poi.get("name") or "",
         ),
@@ -1589,6 +2010,12 @@ async def _wish_pois_for_geometry(
         seen.add(pid)
         tagged = dict(poi)
         tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=corridor_keep_m)
+        if (
+            not pois_service.matches_notes(poi, notes)
+            and poi.get("interest") in set(profile_only)
+            and not tagged.get("hint")
+        ):
+            tagged["hint"] = "uit je profiel"
         result.append(tagged)
 
     # Op lange routes iets dichter bij elkaar toegestaan, anders blijft de lijst te kort.
@@ -1636,13 +2063,13 @@ async def _wish_pois_for_geometry(
             rank_wish_poi_suggestions(
                 notes,
                 pool,
-                profile_interests,
+                profile_only,
                 wish_interests,
                 target_count=target,
                 route_km=route_km,
             ),
             None,
-            14,
+            8,
         )
         if ai_rank:
             wish_summary = str(ai_rank.get("summary") or "").strip()
@@ -1664,6 +2091,15 @@ async def _wish_pois_for_geometry(
             diverse = _spread_fill_wish_pois(diverse, result, target, geometry)
     elif len(diverse) < target and result:
         diverse = _spread_fill_wish_pois(diverse, result, target, geometry)
+    # Altijd minstens één plek per profiel-/wens-thema behouden als die bestaat.
+    diverse = _ensure_interest_coverage(
+        diverse,
+        result or near or route_candidates,
+        wish_interests,
+        note_interests=note_interests,
+        profile_interests=profile_only,
+        target=target,
+    )
     # Laatste redmiddel: als filtering alles weggooide, toon toch gevonden horeca/wens-kandidaten.
     if not diverse and near:
         diverse = pois_service.pick_diverse_pois(
@@ -1684,6 +2120,50 @@ async def _wish_pois_for_geometry(
         for poi in diverse:
             poi["on_route"] = _on_route_geometry(poi, geometry, max_m=max(corridor_keep_m, 9000))
     return diverse, wish_summary
+
+
+def _ensure_interest_coverage(
+    selected: list[dict[str, Any]],
+    pool: list[dict[str, Any]],
+    themes: list[str],
+    *,
+    note_interests: list[str] | None = None,
+    profile_interests: list[str] | None = None,
+    target: int = 12,
+) -> list[dict[str, Any]]:
+    """Zorg dat elk thema (wens + profiel) minstens één plek krijgt als beschikbaar."""
+    out = [dict(poi) for poi in selected]
+    have = {str(poi.get("id")) for poi in out if poi.get("id")}
+    present = {poi.get("interest") for poi in out}
+    note_set = set(note_interests or [])
+    profile_set = set(profile_interests or [])
+    for interest in pois_service._unique_interests(themes):
+        if interest in present:
+            continue
+        for poi in pool:
+            if poi.get("interest") != interest:
+                continue
+            pid = str(poi.get("id") or "")
+            if not pid or pid in have:
+                continue
+            tagged = dict(poi)
+            if interest in profile_set and interest not in note_set and not tagged.get("hint"):
+                tagged["hint"] = "uit je profiel"
+            elif interest in note_set and not tagged.get("hint"):
+                tagged["hint"] = "past bij je wens"
+            out.append(tagged)
+            have.add(pid)
+            present.add(interest)
+            break
+    if len(out) <= max(target, len(themes) + 2):
+        return out
+    # Behoud thema-dekking, trim overschot via diverse pick.
+    return pois_service.pick_diverse_pois(
+        out,
+        themes or ["geschiedenis"],
+        wanted=max(target, len(themes) + 2),
+        min_distance_m=300,
+    )
 
 
 def _route_progress(poi: dict[str, Any], geometry: list[list[float]]) -> float | None:
