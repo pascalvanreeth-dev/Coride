@@ -78,6 +78,9 @@ class PlanRequest(BaseModel):
     profile: RiderProfile | None = None
     adapt_reason: AdaptReason | None = None
     suggestion_id: str | None = None
+    # Magenta draft van de planner — hergebruik zodat Plan niet opnieuw traag routed.
+    route_geometry: list[list[float]] = Field(default_factory=list, max_length=25000)
+    route_duration_min: int | None = Field(default=None, ge=1, le=600)
 
 
 class Place(BaseModel):

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
-import { askAbout, fetchStopSummary, fetchSurroundings, reroute } from "../api.js";
+import { askAbout, fetchStopSummary, fetchSurroundings, fetchWishSuggestions, reroute } from "../api.js";
 import {
   bearingDeg,
   compassLabel,
@@ -59,6 +59,50 @@ const bikeIcon = L.divIcon({
   iconAnchor: [16, 16],
 });
 
+function sampleGeometryForWish(geometry, maxPoints = 40) {
+  if (!geometry?.length) return [];
+  if (geometry.length <= maxPoints) return geometry.map((pt) => [Number(pt[0]), Number(pt[1])]);
+  const out = [];
+  const step = (geometry.length - 1) / (maxPoints - 1);
+  for (let i = 0; i < maxPoints; i += 1) {
+    const pt = geometry[Math.min(geometry.length - 1, Math.round(i * step))];
+    out.push([Number(pt[0]), Number(pt[1])]);
+  }
+  return out;
+}
+
+function wishItemsToStops(suggestions, notes = "", interests = []) {
+  return (suggestions || []).slice(0, 16).map((poi, index) => ({
+    id: String(poi.id || `wish-${index}`),
+    name: poi.name || "Plek",
+    lat: Number(poi.lat),
+    lng: Number(poi.lng),
+    kind: poi.kind_label || poi.kind || "plek",
+    kind_label: poi.kind_label || null,
+    interest: poi.interest || interests[0] || "geschiedenis",
+    source: "OpenStreetMap",
+    summary: poi.hint || "Suggestie langs je route.",
+    approaching: `Je nadert ${poi.name || "deze plek"}.`,
+    arrived: `Je bent bij ${poi.name || "deze plek"}.`,
+    why: notes?.trim()
+      ? `Past bij je wens: ${notes.trim()}`
+      : poi.hint === "uit je profiel"
+        ? "Past bij je profiel."
+        : "Suggestie langs je route.",
+    wikipedia_url: null,
+    image_url: null,
+    wikipedia: null,
+    wikidata: null,
+    description: "",
+    place_name: null,
+    population: null,
+    local_fact: null,
+    side: null,
+    matches_wish: true,
+    on_route: Boolean(poi.on_route),
+  }));
+}
+
 export default function Ride({ plan, onPlanChange, onBack }) {
   const [map, setMap] = useState(null);
   const [mode, setMode] = useState("idle");
@@ -102,6 +146,9 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [surroundingsError, setSurroundingsError] = useState("");
   const [weatherOffer, setWeatherOffer] = useState(() => Boolean(plan.weather?.suggest_shorter));
   const [guideOpen, setGuideOpen] = useState(true);
+  const [wishLoadBusy, setWishLoadBusy] = useState(false);
+  const [wishLoadError, setWishLoadError] = useState("");
+  const wishLoadedForRef = useRef("");
   const guideOpenRef = useRef(true);
   guideOpenRef.current = guideOpen;
   const lastGps = useRef(null);
@@ -329,6 +376,55 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   useEffect(() => {
     guideSpeak(plan.intro);
   }, [plan.intro]);
+
+  // Als de plan-response geen wensstops heeft: alsnog ophalen (profiel + eventuele notes).
+  useEffect(() => {
+    const hasWish = (plan.stops || []).some((stop) => stop.matches_wish);
+    const notes = plan.notes || "";
+    const interests = plan.interests || [];
+    const key = `${plan.distance_km || 0}|${notes}|${(interests || []).join(",")}|${plan.geometry?.length || 0}`;
+    if (hasWish || !(notes.trim() || interests.length) || !(plan.geometry?.length > 1)) {
+      wishLoadedForRef.current = hasWish ? key : "";
+      setWishLoadBusy(false);
+      setWishLoadError("");
+      return undefined;
+    }
+    if (wishLoadedForRef.current === key) return undefined;
+    let cancelled = false;
+    wishLoadedForRef.current = key;
+    setWishLoadBusy(true);
+    setWishLoadError("");
+    fetchWishSuggestions({
+      notes,
+      interests,
+      geometry: sampleGeometryForWish(plan.geometry, 48),
+      nodes: plan.knooppunten || [],
+    })
+      .then((data) => {
+        if (cancelled) return;
+        const wishStops = wishItemsToStops(data?.suggestions, notes, interests);
+        if (!wishStops.length) {
+          setWishLoadError("Geen passende plekken gevonden voor je wens of profiel.");
+          return;
+        }
+        onPlanChange({
+          ...plan,
+          stops: [...wishStops, ...(plan.stops || []).filter((stop) => !stop.matches_wish)],
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          wishLoadedForRef.current = "";
+          setWishLoadError(err?.message || "Wenssuggesties konden niet geladen worden.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setWishLoadBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [plan, onPlanChange]);
 
   useEffect(() => {
     setGuideExpanded(false);
@@ -1156,6 +1252,16 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           )}
         </div>
         {rerouteError && <div className="error">{rerouteError}</div>}
+        {wishLoadBusy && (
+          <p className="sources" style={{ margin: "0 0 12px" }}>
+            Suggesties voor je wens/profiel worden geladen…
+          </p>
+        )}
+        {!wishLoadBusy && wishLoadError && (
+          <p className="sources" style={{ margin: "0 0 12px" }}>
+            {wishLoadError}
+          </p>
+        )}
         {suggestionStops.length > 0 && (
           <div className="poi-suggest-section">
             <strong>Suggesties</strong>

@@ -11,8 +11,8 @@ const PALETTE = {
 const SIZES = { idle: 24, route: 24, picked: 28, start: 32, end: 32 };
 const FONT_SIZES = { idle: 11, route: 11, picked: 12, start: 12, end: 12 };
 
-/** Knooppunten pas tonen vanaf redelijk ingezoomd niveau. */
-export const KNOOP_MARKER_MIN_ZOOM = 11;
+/** Knooppunten tonen vanaf stadsniveau (Gent-overzicht ≈ zoom 12). */
+export const KNOOP_MARKER_MIN_ZOOM = 10;
 
 export function knoopMarkersVisible(zoom) {
   return Number(zoom) >= KNOOP_MARKER_MIN_ZOOM;

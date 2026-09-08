@@ -18,16 +18,28 @@ export async function reverseGeocode(lat, lng) {
 }
 
 export async function planRoute(payload) {
-  const response = await apiFetch("/api/plan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(formatApiError(data.detail, "De route kon niet worden gepland."));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const response = await apiFetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(formatApiError(data.detail, "De route kon niet worden gepland."));
+    }
+    return data;
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new Error("Het plannen duurde te lang. Probeer minder kilometers of kies zelf knooppunten.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
 function formatApiError(detail, fallback) {
@@ -39,7 +51,18 @@ function formatApiError(detail, fallback) {
   return fallback;
 }
 
+export function isAbortError(err) {
+  if (!err) return false;
+  if (err.name === "AbortError" || err.code === 20) return true;
+  return /signal is aborted|aborted without reason|The operation was aborted|Verzoek afgebroken/i.test(
+    String(err.message || ""),
+  );
+}
+
 function networkErrorMessage(err, fallback) {
+  if (isAbortError(err)) {
+    return err.message || "Verzoek afgebroken.";
+  }
   const msg = String(err?.message || "");
   if (/failed to fetch|networkerror|load failed|fetch failed/i.test(msg)) {
     return "Geen verbinding met de server. Controleer of de backend draait en probeer opnieuw.";
@@ -51,6 +74,12 @@ async function apiFetch(url, options) {
   try {
     return await fetch(url, options);
   } catch (err) {
+    if (isAbortError(err)) {
+      const abortErr = new Error(err.message || "Aborted");
+      abortErr.name = "AbortError";
+      abortErr.cause = err;
+      throw abortErr;
+    }
     throw new Error(networkErrorMessage(err, "Netwerkfout."));
   }
 }
@@ -179,8 +208,42 @@ export async function fetchStopSummary({ name, lat, lng, wikipedia_url = null, w
   return data;
 }
 
-/** Magenta-leg via officieel knooppuntennetwerk (backend WFS-trajecten). */
+/** Snelle magenta-leg rechtstreeks via OSRM (Vite-proxy /osrm-bike). */
+export async function fetchOsrmBikeLeg(from, to) {
+  const coords = `${Number(from.lng).toFixed(6)},${Number(from.lat).toFixed(6)};${Number(to.lng).toFixed(6)},${Number(to.lat).toFixed(6)}`;
+  const url = `/osrm-bike/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=false&alternatives=false`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data?.code !== "Ok" || !data?.routes?.[0]) {
+      throw new Error("Geen fietsroute gevonden tussen deze knooppunten.");
+    }
+    const route = data.routes[0];
+    const geometry = (route.geometry?.coordinates || []).map(([lng, lat]) => [lat, lng]);
+    if (geometry.length < 2) {
+      throw new Error("Geen fietsroute gevonden tussen deze knooppunten.");
+    }
+    return {
+      geometry,
+      distance_km: Number((Number(route.distance || 0) / 1000).toFixed(2)),
+      duration_min: Math.max(1, Math.round(Number(route.duration || 0) / 60)),
+      steps: [],
+      via_knooppunten: [from, to],
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Magenta-leg: eerst OSRM (snel), anders officieel knooppuntennetwerk. */
 export async function fetchBikeLeg(from, to) {
+  try {
+    return await fetchOsrmBikeLeg(from, to);
+  } catch {
+    /* fall through to network */
+  }
   const response = await apiFetch("/api/bike-leg", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { fetchBikeLeg, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, reverseGeocode, reroute } from "../api.js";
+import { fetchBikeLeg, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, fetchWishSuggestions, isAbortError, reverseGeocode, reroute } from "../api.js";
 import {
   estimateRouteKm,
   formatDuration,
@@ -146,6 +146,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const [manualWishSummary, setManualWishSummary] = useState("");
   const [manualWishBusy, setManualWishBusy] = useState(false);
   const [manualWishError, setManualWishError] = useState("");
+  const [autoWishSuggestions, setAutoWishSuggestions] = useState([]);
+  const [autoWishSummary, setAutoWishSummary] = useState("");
+  const [autoWishBusy, setAutoWishBusy] = useState(false);
   const [loadedPreviewKey, setLoadedPreviewKey] = useState("");
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [startPickerOpen, setStartPickerOpen] = useState(false);
@@ -165,14 +168,16 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const selectedKeyRaw = selectedIds.join(ID_JOIN);
   const selectedKeyDebounced = useDebounced(selectedKeyRaw, 150);
   const selectedKey = buildMode === "manual" ? selectedKeyRaw : selectedKeyDebounced;
+  // Wens-tekst apart debouncen: anders herstart elke letter de 10–15s preview en blijven suggesties weg.
+  const debouncedNotes = useDebounced(notes, 900);
   const previewKey = useDebounced(
     origin &&
       ((buildMode === "suggest" && selectedSuggestionId) || buildMode === "auto")
       ? buildMode === "suggest"
-        ? `${selectedSuggestionId}|${distance}|${origin.lat}|${origin.lng}|${mode}|${notes}|${pickedWishKey}`
-        : `${distance}|${duration}|${budgetMode}|${origin.lat}|${origin.lng}|${mode}|${notes}|${pickedWishKey}`
+        ? `${selectedSuggestionId}|${distance}|${origin.lat}|${origin.lng}|${mode}|${debouncedNotes}|${pickedWishKey}`
+        : `${distance}|${duration}|${budgetMode}|${origin.lat}|${origin.lng}|${mode}|${debouncedNotes}|${pickedWishKey}`
       : "",
-    450,
+    500,
   );
   const previewDistanceKm =
     buildMode === "auto" && budgetMode === "time"
@@ -310,27 +315,48 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     return null;
   }, [buildMode, lastSelectedNode, viewFocus, origin, startChoice, center, here]);
 
+  // ~1 km grid: kleine pan/recenter mag de fetch niet steeds annuleren.
+  const nodeFocusBucket = useMemo(() => {
+    if ((buildMode !== "manual" && buildMode !== "auto") || !nodeFocus) return "";
+    return `${(Math.round(nodeFocus.lat * 100) / 100).toFixed(2)},${(Math.round(nodeFocus.lng * 100) / 100).toFixed(2)}`;
+  }, [buildMode, nodeFocus?.lat, nodeFocus?.lng]);
+  const nodeFocusBucketDebounced = useDebounced(nodeFocusBucket, MAP_KNOOP_LOAD_DEBOUNCE_MS);
+  const nodesLoadGenRef = useRef(0);
+
   useEffect(() => {
-    if ((buildMode !== "manual" && buildMode !== "auto") || !nodeFocus) return undefined;
+    if ((buildMode !== "manual" && buildMode !== "auto") || !nodeFocusBucketDebounced) {
+      setNodesBusy(false);
+      return undefined;
+    }
+    const [latS, lngS] = nodeFocusBucketDebounced.split(",");
+    const lat = Number(latS);
+    const lng = Number(lngS);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      setNodesBusy(false);
+      return undefined;
+    }
+    const loadId = ++nodesLoadGenRef.current;
     let cancelled = false;
     setNodesBusy(true);
-    fetchKnooppunten(nodeFocus.lat, nodeFocus.lng)
+    fetchKnooppunten(lat, lng)
       .then((next) => {
-        if (cancelled) return;
-        setNodes(next);
-        rememberNodes(...next);
+        if (cancelled || loadId !== nodesLoadGenRef.current) return;
+        setNodes(Array.isArray(next) ? next : []);
+        if (next?.length) rememberNodes(...next);
         setGeoError("");
       })
       .catch((err) => {
-        if (!cancelled) setGeoError(err.message);
+        if (!cancelled && loadId === nodesLoadGenRef.current && !isAbortError(err)) {
+          setGeoError(err.message);
+        }
       })
       .finally(() => {
-        if (!cancelled) setNodesBusy(false);
+        if (loadId === nodesLoadGenRef.current) setNodesBusy(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [buildMode, nodeFocus?.lat, nodeFocus?.lng]);
+  }, [buildMode, nodeFocusBucketDebounced]);
 
   useEffect(() => {
     if (buildMode !== "manual" || !selectedKey) {
@@ -515,8 +541,137 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   const activeInterests = profile?.interests?.length ? profile.interests : interests;
 
-  // Geen pre-plan wish-fetch: Overpass kan de backend blokkeren zodat /api/plan
-  // “geen verbinding” geeft. Extra wens gaat mee in de plan-request zelf.
+  // Manuele route: wens/profiel pas ná stabiele magenta — anders wordt elke
+  // geometry-update gecanceld en blijven suggesties de hele avond weg.
+  const manualWishKey = useDebounced(
+    buildMode === "manual" &&
+      !draftBusy &&
+      draft?.geometry?.length > 1 &&
+      (debouncedNotes.trim() || activeInterests.length > 0)
+      ? `${selectedKey}|${debouncedNotes.trim()}|${activeInterests.join(",")}`
+      : "",
+    400,
+  );
+
+  useEffect(() => {
+    if (buildMode !== "manual") {
+      setManualWishSuggestions([]);
+      setManualWishSummary("");
+      setManualWishBusy(false);
+      setManualWishError("");
+      return undefined;
+    }
+    if (!manualWishKey) {
+      // Tijdens magenta-herberekening bestaande suggesties behouden.
+      return undefined;
+    }
+    const draftNow = draftRef.current;
+    if (!draftNow?.geometry?.length) return undefined;
+    let cancelled = false;
+    setManualWishBusy(true);
+    setManualWishError("");
+    const geometry = sampleGeometryAlongRoute(draftNow.geometry, 48);
+    const nodes = (draftNow.knooppunten || []).map((node) => ({
+      id: node.id || "",
+      number: node.number,
+      lat: node.lat,
+      lng: node.lng,
+      network: node.network || null,
+      geoid: node.geoid ?? null,
+    }));
+    const interests =
+      activeInterests.length > 0 ? activeInterests : ["geschiedenis"];
+    fetchWishSuggestions({
+      notes: debouncedNotes.trim(),
+      interests,
+      geometry,
+      nodes,
+    })
+      .then((data) => {
+        if (cancelled) return;
+        const items = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        setManualWishSuggestions(items);
+        setManualWishSummary(data?.wish_summary || "");
+        setManualWishError(
+          items.length
+            ? ""
+            : "Geen passende plekken gevonden. Probeer “café” of “museum” in Extra wens.",
+        );
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setManualWishSuggestions([]);
+          setManualWishSummary("");
+          setManualWishError(err?.message || "Wenssuggesties konden niet geladen worden.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setManualWishBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [buildMode, manualWishKey]);
+
+  // Auto/suggest: magenta eerst, daarna apart wens/profiel-suggesties.
+  const autoWishKey = useDebounced(
+    (buildMode === "auto" || buildMode === "suggest") &&
+      !suggestionPreviewBusy &&
+      loadedPreviewKey &&
+      suggestionPreview?.geometry?.length > 1
+      ? `${loadedPreviewKey}|${debouncedNotes}|${activeInterests.join(",")}`
+      : "",
+    400,
+  );
+  const suggestionPreviewRef = useRef(suggestionPreview);
+  suggestionPreviewRef.current = suggestionPreview;
+
+  useEffect(() => {
+    if (buildMode !== "auto" && buildMode !== "suggest") {
+      setAutoWishSuggestions([]);
+      setAutoWishSummary("");
+      setAutoWishBusy(false);
+      return undefined;
+    }
+    if (!autoWishKey) return undefined;
+    const previewNow = suggestionPreviewRef.current;
+    if (!previewNow?.geometry?.length) return undefined;
+    let cancelled = false;
+    setAutoWishBusy(true);
+    const geometry = sampleGeometryAlongRoute(previewNow.geometry, 48);
+    const interests =
+      activeInterests.length > 0 ? activeInterests : ["geschiedenis"];
+    fetchWishSuggestions({
+      notes: debouncedNotes.trim(),
+      interests,
+      geometry,
+      nodes: (previewNow.knooppunten || []).map((node) => ({
+        id: node.id || "",
+        number: node.number,
+        lat: node.lat,
+        lng: node.lng,
+        network: node.network || null,
+        geoid: node.geoid ?? null,
+      })),
+    })
+      .then((data) => {
+        if (cancelled) return;
+        setAutoWishSuggestions(Array.isArray(data?.suggestions) ? data.suggestions : []);
+        setAutoWishSummary(data?.wish_summary || "");
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAutoWishSuggestions([]);
+          setAutoWishSummary("");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAutoWishBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [buildMode, autoWishKey]);
 
   useEffect(() => {
     if (buildMode !== "suggest") return undefined;
@@ -531,7 +686,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         setSelectedSuggestionId((current) => (current && next.some((item) => item.id === current) ? current : ""));
       })
       .catch((err) => {
-        if (!cancelled) setGeoError(err.message);
+        if (!cancelled && !isAbortError(err)) setGeoError(err.message);
       })
       .finally(() => {
         if (!cancelled) setSuggestionsBusy(false);
@@ -557,7 +712,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       lng: origin.lng,
       distance_km: previewDistanceKm,
       mode,
-      notes,
+      notes: debouncedNotes,
       interests: activeInterests,
       poi_picks: poiPicks.map((poi) => ({
         id: poi.id,
@@ -573,12 +728,16 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         if (!cancelled) {
           setSuggestionPreview(next);
           setLoadedPreviewKey(requestKey);
+          setGeoError("");
         }
       })
-      .catch(() => {
+      .catch((err) => {
         if (!cancelled) {
           setSuggestionPreview(null);
           setLoadedPreviewKey("");
+          if (buildMode === "auto" && !isAbortError(err)) {
+            setGeoError(err?.message || "Routevoorbeeld kon niet geladen worden.");
+          }
         }
       })
       .finally(() => {
@@ -651,21 +810,35 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   );
 
   const wishSuggestions = useMemo(() => {
-    if (!notes.trim()) return [];
-    return manualWishSuggestions;
-  }, [notes, manualWishSuggestions]);
+    if (buildMode === "manual") {
+      return notes.trim() || debouncedNotes.trim() || activeInterests.length
+        ? manualWishSuggestions
+        : [];
+    }
+    if (buildMode === "auto" || buildMode === "suggest") return autoWishSuggestions;
+    return [];
+  }, [buildMode, notes, debouncedNotes, activeInterests.length, manualWishSuggestions, autoWishSuggestions]);
 
-  const wishSummary = manualWishSummary;
+  const wishSummary =
+    buildMode === "manual" ? manualWishSummary : autoWishSummary;
 
-  const wishBusy = manualWishBusy;
+  const wishBusy =
+    buildMode === "manual" ? manualWishBusy : autoWishBusy || routePreviewBusy;
+
+  const panelError = useMemo(() => {
+    const shown = [error, geoError].find(
+      (msg) => msg && !isAbortError({ message: msg }),
+    );
+    return shown || "";
+  }, [error, geoError]);
 
   useEffect(() => {
+    // Nieuwe wens-tekst: focus resetten. Gekozen plekken wissen als wens leeg is.
+    // Suggesties zelf laten we aan de fetch-effecten (profiel blijft zichtbaar zonder tekst).
     setFocusedWishId("");
-    setPickedWishPois([]);
     setFocusPulse(null);
     setManualWishError("");
-    setManualWishSuggestions([]);
-    setManualWishSummary("");
+    if (!notes.trim()) setPickedWishPois([]);
   }, [notes]);
 
   const suggestInterests = useMemo(
@@ -783,6 +956,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setManualWishSummary("");
     setManualWishBusy(false);
     setManualWishError("");
+    setAutoWishSuggestions([]);
+    setAutoWishSummary("");
+    setAutoWishBusy(false);
     cancelRouteModePicker();
     cancelStartPicker();
 
@@ -813,6 +989,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setBuildMode(nextMode);
     if (nextMode === "manual") {
       setMode("punt");
+    }
+    if (nextMode === "auto") {
+      setMode("lus");
     }
     if (switching || !startChoice) {
       setStartPickerOpen(true);
@@ -1037,6 +1216,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   function submit(event) {
     event.preventDefault();
+    setGeoError("");
+    onClearError?.();
     if (buildMode !== "suggest" && !startChoice) {
       setGeoError("Kies eerst je startpunt.");
       setStartPickerOpen(true);
@@ -1056,6 +1237,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     }
     if (buildMode === "manual" && mode === "punt" && selectedNodes.length < 2) {
       setGeoError("Kies minstens twee knooppunten: het eerste is A, het laatste is B.");
+      return;
+    }
+    if (buildMode === "manual" && !(draft?.geometry?.length > 1)) {
+      setGeoError(
+        draftBusy
+          ? "De magenta route wordt nog berekend. Even wachten en opnieuw proberen."
+          : "Nog geen magenta route. Kies minstens twee knooppunten en wacht tot de lijn verschijnt.",
+      );
       return;
     }
     if (buildMode === "suggest" && !selectedSuggestion) {
@@ -1090,6 +1279,8 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         : mode === "punt"
           ? end || null
           : null;
+    const planKnoopNodes =
+      buildMode === "manual" && draft?.knooppunten?.length >= 2 ? draft.knooppunten : selectedNodes;
     onPlan({
       start: planStart,
       end: planEnd,
@@ -1104,7 +1295,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       suggestion_id: buildMode === "suggest" ? selectedSuggestionId : null,
       knooppunten:
         buildMode === "manual"
-          ? selectedNodes.map((node) => ({
+          ? planKnoopNodes.slice(0, 40).map((node) => ({
               id: node.id || "",
               number: node.number,
               lat: node.lat,
@@ -1122,6 +1313,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         kind_label: poi.kind_label || null,
         interest: poi.interest || "geschiedenis",
       })),
+      route_geometry:
+        buildMode === "manual" && draft?.geometry?.length > 1 ? draft.geometry : [],
+      route_duration_min:
+        buildMode === "manual" && draft?.duration_min ? Math.round(draft.duration_min) : null,
+      local_manual: buildMode === "manual" && draft?.geometry?.length > 1,
+      wish_suggestions: buildMode === "manual" ? wishSuggestions : [],
     });
   }
 
@@ -1171,7 +1368,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           </button>
         </div>
 
-          {geoError && <div className="error">{geoError}</div>}
+          {geoError && !isAbortError({ message: geoError }) && <div className="error">{geoError}</div>}
 
           {(buildMode === "manual" || buildMode === "auto") && startChoice && (
             <p className="sources start-status" style={{ margin: "0 0 12px" }}>
@@ -1332,7 +1529,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                       : mode === "punt"
                         ? "Klik knooppunt A, daarna B (en eventueel tussendoor). Overgeslagen knooppunten komen automatisch mee."
                         : "Klik eerst een startknooppunt, daarna volgende. Overgeslagen knooppunten komen automatisch mee."
-                    : "Nog geen knooppunten in beeld. Kies een startpositie."}
+                    : "Nog geen knooppunten in beeld. Zoom in of kies een startpositie."}
             </p>
             {routeNodes.length ? (
               <ol className="picked-list route-knoop-list">
@@ -1495,11 +1692,24 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             />
           </label>
           )}
+          {buildMode === "manual" && selectedNodes.length < 2 && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              Kies minstens twee knooppunten op de kaart. Daarna verschijnen hier plekken op basis van je
+              profiel en Extra wens.
+            </p>
+          )}
+          {buildMode === "manual" &&
+            selectedNodes.length >= 2 &&
+            draftBusy &&
+            !wishSuggestions.length && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              Magenta-route wordt berekend — suggesties volgen meteen daarna…
+            </p>
+          )}
 
           {(buildMode === "auto" ||
             buildMode === "manual" ||
             (buildMode === "suggest" && selectedSuggestion)) &&
-            notes.trim() &&
             wishSuggestions.length > 0 && (
             <div className="poi-suggest-section" id="suggestieoverzicht">
               <strong>Suggestieoverzicht</strong>
@@ -1547,6 +1757,44 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             </div>
           )}
 
+          {(buildMode === "auto" || buildMode === "manual" || (buildMode === "suggest" && selectedSuggestion)) &&
+            (notes.trim() || activeInterests.length > 0) &&
+            wishBusy &&
+            !wishSuggestions.length && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              {notes.trim()
+                ? "Plekken voor je wens worden gezocht…"
+                : "Suggesties op basis van je profiel worden geladen…"}
+            </p>
+          )}
+
+          {buildMode === "auto" &&
+            !routePreviewBusy &&
+            !autoWishBusy &&
+            !wishSuggestions.length &&
+            routePreview?.geometry?.length > 1 &&
+            (notes.trim() || activeInterests.length > 0) && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              {notes.trim()
+                ? "Geen passende plekken gevonden voor je wens. Probeer een andere formulering."
+                : "Nog geen profielsuggesties gevonden rond deze route."}
+            </p>
+          )}
+
+          {buildMode === "manual" &&
+            (notes.trim() || activeInterests.length > 0) &&
+            !manualWishBusy &&
+            draft?.geometry?.length > 1 &&
+            !wishSuggestions.length && (
+            <p className="sources" style={{ margin: "0 0 12px" }}>
+              {manualWishError
+                ? `Zoeken mislukt: ${manualWishError}`
+                : notes.trim()
+                  ? "Geen passende plekken gevonden voor je wens. Probeer “café” of “museum”, of even opnieuw zoeken."
+                  : "Nog geen profielsuggesties gevonden rond deze route."}
+            </p>
+          )}
+
           {buildMode === "suggest" && selectedSuggestion && (
           <label>
             Toelichting bij deze route
@@ -1561,13 +1809,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         </form>
 
         <div className="panel-footer">
-          {error && <div className="error">{error}</div>}
+          {panelError && <div className="error">{panelError}</div>}
 
           <button
             className="submit"
             type="submit"
             form="plan-form"
-            disabled={busy || (buildMode === "suggest" && !selectedSuggestion)}
+            disabled={
+              busy ||
+              draftBusy ||
+              (buildMode === "suggest" && !selectedSuggestion) ||
+              ((buildMode === "manual" || buildMode === "auto") && (!startChoice || !origin)) ||
+              (buildMode === "manual" && !(draft?.geometry?.length > 1))
+            }
           >
             {busy
               ? buildMode === "suggest"
@@ -1575,7 +1829,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                 : buildMode === "auto"
                   ? "Je tocht wordt samengesteld..."
                   : "Je knooppuntenroute wordt gepland..."
-              : buildMode === "manual"
+              : draftBusy && buildMode === "manual"
+                ? "Magenta route wordt berekend..."
+                : buildMode === "manual"
                 ? "Plan deze knooppuntenroute"
                 : buildMode === "suggest"
                   ? "Start deze route"

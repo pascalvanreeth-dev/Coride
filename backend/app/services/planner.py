@@ -56,27 +56,59 @@ async def _plan_user_knoop_route(
     request: PlanRequest,
     user_chain: list[dict[str, Any]],
     catalog_route: dict[str, Any] | None = None,
+    *,
+    start_place: Place | None = None,
+    end_place: Place | None = None,
 ) -> RoutePlan:
     """Snelle planning voor zelfgekozen knooppunten — geen zware Overpass/AI-wachttijd."""
     profile = request.profile
     first = user_chain[0]
     last = user_chain[-1]
-    start = _place_from_knoop(first)
-    end = _place_from_knoop(last) if request.mode == "punt" else start
+    start = start_place or _place_from_knoop(first)
+    end = end_place or (_place_from_knoop(last) if request.mode == "punt" else start)
 
     weather_raw = await _optional(weather_service.fetch_weather(start.lat, start.lng), None, 3)
     weather = WeatherInfo(**(weather_raw or {})) if isinstance(weather_raw, dict) else WeatherInfo()
 
     spine = _chain_spine(user_chain)
-    display_chain, route = await _build_knoop_route(
-        start.lat,
-        start.lng,
-        spine,
-        close_loop=request.mode != "punt",
-        end_lat=end.lat if request.mode == "punt" else None,
-        end_lng=end.lng if request.mode == "punt" else None,
-        poi_picks=request.poi_picks,
-    )
+    display_chain = list(spine)
+    if request.mode == "lus":
+        display_chain = knoop_service.close_chain_for_loop(display_chain)
+
+    # 1) Hergebruik magenta draft van de frontend (al berekend tijdens knoopkeuze).
+    draft_geom = [
+        [float(pt[0]), float(pt[1])]
+        for pt in (request.route_geometry or [])
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2
+    ]
+    if len(draft_geom) >= 2:
+        dist_km = _geometry_length_km(draft_geom)
+        if dist_km < 0.4:
+            dist_km = float(max(8, request.distance_km or 8))
+        duration_min = int(request.route_duration_min or max(1, round((dist_km / 16) * 60)))
+        route = {
+            "geometry": draft_geom,
+            "distance_m": dist_km * 1000.0,
+            "duration_s": max(60.0, duration_min * 60.0),
+            "steps": [],
+        }
+    else:
+        # 2) Snelle OSRM — geen trage WFS-fallback (die veroorzaakte timeouts).
+        try:
+            route = await _osrm_route_along_chain(
+                start.lat,
+                start.lng,
+                user_chain,
+                close_loop=request.mode != "punt",
+                end_lat=end.lat if request.mode == "punt" else None,
+                end_lng=end.lng if request.mode == "punt" else None,
+                timeout=20.0,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "De knooppuntenroute kon niet snel genoeg berekend worden. "
+                "Wacht tot de magenta lijn zichtbaar is en probeer opnieuw."
+            ) from exc
     chain = display_chain or list(user_chain)
     knoop_label = knoop_service.chain_label(
         knoop_service.close_chain_for_loop(chain) if request.mode == "lus" else chain
@@ -117,6 +149,7 @@ async def _plan_user_knoop_route(
     if profile and getattr(profile, "interests", None):
         profile_interests = list(dict.fromkeys([*profile_interests, *list(profile.interests)]))
     notes = (request.notes or "").strip()
+    # Wens- én/of profielsuggesties (Nominatim/Wikipedia — geen Overpass-hang).
     if route.get("geometry") and (notes or profile_interests):
         try:
             wish_pois, _ = await asyncio.wait_for(
@@ -219,6 +252,58 @@ async def _plan_user_knoop_route(
     )
 
 
+def _osrm_waypoints_for_chain(
+    start_lat: float,
+    start_lng: float,
+    chain: list[dict[str, Any]],
+    *,
+    close_loop: bool,
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+) -> list[tuple[float, float]]:
+    spine = _chain_spine(chain)
+    points: list[tuple[float, float]] = [(start_lat, start_lng)]
+    for node in spine:
+        pt = (float(node["lat"]), float(node["lng"]))
+        if haversine_m(points[-1][0], points[-1][1], pt[0], pt[1]) > 40:
+            points.append(pt)
+    if close_loop:
+        if haversine_m(points[-1][0], points[-1][1], start_lat, start_lng) > 40:
+            points.append((start_lat, start_lng))
+    elif end_lat is not None and end_lng is not None:
+        if haversine_m(points[-1][0], points[-1][1], end_lat, end_lng) > 40:
+            points.append((end_lat, end_lng))
+    return points
+
+
+async def _osrm_route_along_chain(
+    start_lat: float,
+    start_lng: float,
+    chain: list[dict[str, Any]],
+    *,
+    close_loop: bool,
+    end_lat: float | None = None,
+    end_lng: float | None = None,
+    timeout: float = 22.0,
+) -> dict[str, Any]:
+    points = _osrm_waypoints_for_chain(
+        start_lat,
+        start_lng,
+        chain,
+        close_loop=close_loop,
+        end_lat=end_lat,
+        end_lng=end_lng,
+    )
+    if len(points) < 2:
+        raise ValueError("Te weinig punten voor een fietsroute.")
+    try:
+        return await asyncio.wait_for(routing.bike_route_via_waypoints(points), timeout=timeout)
+    except TimeoutError as exc:
+        raise ValueError(
+            "De route duurde te lang. Probeer minder kilometers of een andere start."
+        ) from exc
+
+
 async def plan_route(request: PlanRequest) -> RoutePlan:
     catalog_route = suggestion_service.get_route_by_id(request.suggestion_id) if request.suggestion_id else None
     if catalog_route:
@@ -228,7 +313,7 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     if wish_interests:
         request.interests = list(dict.fromkeys([*request.interests, *wish_interests]))
 
-    # Zelf gekozen knooppunten: snelle route zonder zware Overpass/AI (voorkomt "geen verbinding").
+    # Zelf gekozen knooppunten: snelle route zonder zware Overpass/AI.
     user_chain = knoop_service.chain_from_user(
         [n.model_dump() for n in request.knooppunten],
         request.mode == "lus",
@@ -236,66 +321,51 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
     if user_chain:
         return await _plan_user_knoop_route(request, user_chain, catalog_route)
 
+    return await _plan_auto_knoop_route(request, catalog_route)
+
+
+async def _plan_auto_knoop_route(
+    request: PlanRequest,
+    catalog_route: dict[str, Any] | None = None,
+) -> RoutePlan:
+    """Snelle auto/suggest-planning op knooppunten + gekozen afstand (geen Overpass-hang)."""
     start = await geocoding.geocode_one(request.start)
     if request.mode == "punt":
-        if request.knooppunten and len(request.knooppunten) >= 2:
-            first = request.knooppunten[0]
-            last = request.knooppunten[-1]
-            start = await geocoding.geocode_one(f"{first.lat},{first.lng}")
-            end = await geocoding.geocode_one(f"{last.lat},{last.lng}")
-        elif not request.end:
-            raise ValueError("Kies minstens twee knooppunten voor Van A naar B, of kies een lus.")
-        else:
-            end = await geocoding.geocode_one(request.end)
+        if not request.end:
+            raise ValueError("Kies een eindpunt voor Van A naar B, of kies een lus.")
+        end = await geocoding.geocode_one(request.end)
     else:
         end = start
 
     profile = request.profile
-    weather = WeatherInfo(**await weather_service.fetch_weather(start.lat, start.lng))
+    weather_raw = await _optional(weather_service.fetch_weather(start.lat, start.lng), None, 3)
+    weather = WeatherInfo(**(weather_raw or {})) if isinstance(weather_raw, dict) else WeatherInfo()
     request.distance_km = _effective_distance(request, profile, weather)
+
+    if not (50.55 <= start.lat <= 51.55 and 2.35 <= start.lng <= 5.95):
+        raise ValueError(
+            "Kies een startpunt in Vlaanderen. Buiten het knooppuntennetwerk kan er geen tocht worden gepland."
+        )
 
     radius = _search_radius(request, start, end)
     extra = (end.lat, end.lng) if request.mode == "punt" else None
-    horeca_prefs = list(profile.horeca) if profile else []
-    want_horeca = pois_service.notes_want_horeca(request.notes, request.interests, horeca_prefs)
-    want_wiki = any(
-        item in request.interests
-        for item in ("geschiedenis", "oorlog", "architectuur", "natuur", "landbouw", "activiteiten", "evenementen")
-    )
     rider_notes = _profile_notes(profile, request.notes, request.adapt_reason, weather)
-    nodes, osm_pois, wiki_places, live_events, horeca = await asyncio.gather(
-        _optional(knoop_service.fetch_nodes(start.lat, start.lng, radius, extra), [], 14),
-        _optional(pois_service.fetch_pois(start.lat, start.lng, radius, request.interests, extra), [], 8),
-        _optional(wikipedia.places_for_route(start.lat, start.lng, min(radius, 10000), extra), [], 18),
-        _optional(
-            events_service.fetch_events(start.lat, start.lng, radius)
-            if "evenementen" in request.interests
-            else asyncio.sleep(0, result=[]),
+
+    nodes = await _optional(knoop_service.fetch_nodes(start.lat, start.lng, radius, extra), [], 12)
+    if not nodes:
+        raise ValueError(
+            "Geen knooppunten gevonden. Probeer een andere startlocatie in Vlaanderen."
+        )
+
+    if rider_notes.strip():
+        wiki_places = await _optional(
+            wikipedia.places_for_route(start.lat, start.lng, min(radius, 10000), extra),
             [],
             6,
-        ),
-        _optional(
-            pois_service.fetch_horeca(start.lat, start.lng, radius, extra, horeca_prefs) if want_horeca else asyncio.sleep(0, result=[]),
-            [],
-            10,
-        ),
-    )
-    if not want_wiki:
-        wiki_places = []
-    candidates = _merge(osm_pois, wiki_places, live_events, horeca)
-    knoop_service.attach_nearby(nodes, candidates)
-    knoop_service.score_nodes_for_notes(nodes, rider_notes)
-
-    user_chain = knoop_service.chain_from_user(
-        [n.model_dump() for n in request.knooppunten],
-        request.mode == "lus",
-    )
-    if user_chain:
-        seen = {n.get("id") for n in nodes}
-        for node in user_chain:
-            if node["id"] not in seen:
-                nodes.append(node)
-                seen.add(node["id"])
+        )
+        if wiki_places:
+            knoop_service.attach_nearby(nodes, wiki_places)
+            knoop_service.score_nodes_for_notes(nodes, rider_notes)
 
     geometric = knoop_service.plan_node_chain(nodes, start.lat, start.lng, request.distance_km, extra)
     noted = (
@@ -303,96 +373,101 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         if rider_notes.strip()
         else []
     )
-    chain = user_chain or noted or geometric
-    start_node = knoop_service.nearest_node(nodes, start.lat, start.lng) if nodes else None
-    ai_nodes = _nodes_for_ai(nodes, start_node) if nodes else []
+    chain = noted or geometric
 
-    ranked_all = _rank(candidates, start, end, request)
-    wiki_targets = pois_service.build_stop_pool(ranked_all, request.interests, limit=20)
-    if request.notes.strip():
-        for poi in ranked_all:
-            if pois_service.matches_notes(poi, request.notes) and poi not in wiki_targets:
-                wiki_targets.append(poi)
-        wiki_targets = wiki_targets[:24]
-    if wiki_targets:
-        wiki_results = await asyncio.gather(*(wikipedia.summary_for_poi(poi) for poi in wiki_targets))
-        for poi, wiki in zip(wiki_targets, wiki_results, strict=True):
-            poi["wiki"] = wiki
-            poi["summary"] = wiki.get("summary") or poi.get("description") or ""
-
-    ai_choice = await enrich_with_ai(
-        start.label,
-        request.interests,
-        rider_notes,
-        wiki_targets,
-        request.mode,
-        request.distance_km,
-        knoop_service.chain_label(chain) if chain else "",
-        ai_nodes if rider_notes.strip() else [],
-        profile,
-    )
-    route_reason = "Eigen knooppuntenroute" if user_chain else ""
-    if rider_notes.strip() and ai_choice and start_node and nodes and not user_chain:
-        ai_chain = knoop_service.resolve_chain(
-            ai_choice.get("knoop_ids") or [],
-            nodes,
-            start_node,
-            request.mode == "lus",
+    if rider_notes.strip() and chain:
+        start_node = knoop_service.nearest_node(nodes, start.lat, start.lng) if nodes else None
+        ai_nodes = _nodes_for_ai(nodes, start_node) if nodes else []
+        ai_choice = await _optional(
+            enrich_with_ai(
+                start.label,
+                request.interests,
+                rider_notes,
+                [],
+                request.mode,
+                request.distance_km,
+                knoop_service.chain_label(chain) if chain else "",
+                ai_nodes,
+                profile,
+            ),
+            None,
+            8,
         )
-        if ai_chain:
-            chain = ai_chain
-            route_reason = ai_choice.get("reason") or f"Route aangepast aan: {rider_notes}"
-    if rider_notes.strip() and (noted or (ai_choice or {}).get("knoop_ids")):
-        route_reason = route_reason or f"Knooppunten gekozen bij: {rider_notes}"
+        if ai_choice and start_node:
+            ai_chain = knoop_service.resolve_chain(
+                ai_choice.get("knoop_ids") or [],
+                nodes,
+                start_node,
+                request.mode == "lus",
+            )
+            if ai_chain:
+                chain = ai_chain
 
-    knoop_label = knoop_service.chain_label(chain) if chain else ""
-    if chain:
-        candidates = _near_chain(candidates, chain, request.notes)
-    ranked = _rank(candidates, start, end, request)
-    if not ranked and not chain:
+    if not chain:
         raise ValueError(
-            "Geen plekken of knooppunten gevonden. Probeer een andere startlocatie in Vlaanderen."
+            "Geen knooppuntenroute gevonden. Probeer een andere afstand of startlocatie."
         )
-    stop_pool = pois_service.build_stop_pool(ranked, request.interests)
-    wished = [poi for poi in ranked if pois_service.matches_notes(poi, request.notes)]
-    if wished:
-        seen = {str(poi.get("id")) for poi in stop_pool}
-        stop_pool = [poi for poi in wished if str(poi.get("id")) not in seen] + stop_pool
-    selected = _pick(stop_pool, ai_choice, request) if stop_pool else []
-    selected = _merge_user_pois(selected, request.poi_picks)
 
-    if chain:
-        spine = _chain_spine(chain)
-        display_chain, route = await _build_knoop_route(
+    # Snelle geometrie: OSRM langs de gekozen knooppunten (geen zware WFS-netwerkrouting).
+    try:
+        route = await _osrm_route_along_chain(
             start.lat,
             start.lng,
-            spine,
-            close_loop=request.mode != "punt",
+            chain,
+            close_loop=request.mode == "lus",
             end_lat=end.lat if request.mode == "punt" else None,
             end_lng=end.lng if request.mode == "punt" else None,
+            timeout=22.0,
         )
-        chain = display_chain
-        if request.notes.strip() and route.get("geometry"):
-            chain = knoop_service.supplement_chain_on_geometry(chain, nodes, route["geometry"], max_m=120)
-        knoop_label = knoop_service.chain_label(
-            knoop_service.close_chain_for_loop(chain) if request.mode == "lus" else chain
-        )
-        selected = _along_geometry(selected, route["geometry"])
-    elif request.mode == "lus":
-        order = await routing.round_trip_order((start.lat, start.lng), [(s["lat"], s["lng"]) for s in selected])
-        selected = [selected[i] for i in order]
-        route_points = [(start.lat, start.lng), *[(s["lat"], s["lng"]) for s in selected], (start.lat, start.lng)]
-        route = await routing.bike_route(route_points)
-    else:
-        selected = _along_corridor(selected, start, end)
-        route_points = [(start.lat, start.lng), *[(s["lat"], s["lng"]) for s in selected], (end.lat, end.lng)]
-        route = await routing.bike_route(route_points)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Kon geen fietsroute berekenen. Probeer opnieuw.") from exc
 
-    stops = []
+    display_chain = list(_chain_spine(chain))
+    if request.mode == "lus":
+        display_chain = knoop_service.close_chain_for_loop(display_chain)
+    knoop_label = knoop_service.chain_label(display_chain)
+
+    title = catalog_route["title"] if catalog_route else _title(request, start, end, knoop_label)
+    intro = (
+        suggestion_service.catalog_intro(
+            catalog_route,
+            request.interests,
+            round(float(route["distance_m"]) / 1000, 1),
+            start.label,
+        )
+        if catalog_route
+        else (
+            f"Je volgt de knooppunten {knoop_label}."
+            if knoop_label
+            else "Een knooppuntenlus op basis van je gekozen afstand."
+        )
+    )
+
+    knoop_models = [
+        Knooppunt(
+            id=n.get("id") or "",
+            number=str(n["number"]),
+            lat=float(n["lat"]),
+            lng=float(n["lng"]),
+            network=n.get("network"),
+            on_route=True,
+            geoid=n.get("geoid"),
+        )
+        for n in display_chain
+    ]
+
+    # Wens- én profielsuggesties meegeven aan de rit (snelle Nominatim/Wikipedia).
+    profile_interests = list(request.interests or [])
+    if profile and getattr(profile, "interests", None):
+        profile_interests = list(dict.fromkeys([*profile_interests, *list(profile.interests)]))
+    notes = (request.notes or "").strip()
+    stops: list[dict[str, Any]] = []
+    selected = _merge_user_pois([], request.poi_picks)
     for index, poi in enumerate(selected, start=1):
         wiki = poi.get("wiki") or {}
         scripts = fallback_scripts(poi, wiki, request.explanation_level)
-        ai_scripts = ((ai_choice or {}).get("scripts") or {}).get(poi["id"]) or {}
         stops.append(
             {
                 "id": poi["id"],
@@ -400,12 +475,12 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
                 "lat": poi["lat"],
                 "lng": poi["lng"],
                 "kind": poi.get("kind_label") or poi.get("kind") or "plek",
-                "interest": poi["interest"],
+                "interest": poi.get("interest") or "geschiedenis",
                 "source": poi.get("source") or "OpenStreetMap",
                 "summary": poi.get("summary") or scripts["summary"],
-                "approaching": ai_scripts.get("approaching") or scripts["approaching"],
-                "arrived": ai_scripts.get("arrived") or scripts["arrived"],
-                "why": ai_scripts.get("why") or scripts["why"],
+                "approaching": scripts["approaching"],
+                "arrived": scripts["arrived"],
+                "why": scripts["why"],
                 "wikipedia_url": wiki.get("url") or None,
                 "image_url": wiki.get("image") or None,
                 "wikipedia": poi.get("wikipedia"),
@@ -413,60 +488,27 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
                 "description": poi.get("description") or "",
                 "kind_label": poi.get("kind_label"),
                 "index": index,
-                "matches_wish": pois_service.matches_notes(poi, request.notes),
-                "on_route": False,
+                "matches_wish": True,
+                "on_route": True,
             }
         )
-
-    if request.notes.strip() and route.get("geometry"):
+    if route.get("geometry") and (notes or profile_interests):
         try:
             wish_pois, _ = await asyncio.wait_for(
-                _wish_pois_for_geometry(
-                    request.notes,
-                    candidates,
-                    ranked,
-                    chain or [],
+                _fast_wish_pois_for_manual(
+                    notes,
+                    display_chain,
                     route["geometry"],
-                    list(request.interests),
+                    profile_interests,
                 ),
-                timeout=35.0,
+                timeout=18.0,
             )
+            _merge_wish_into_stops(stops, wish_pois, request, route["geometry"])
         except TimeoutError:
-            wish_pois = []
-        _merge_wish_into_stops(stops, wish_pois, request, route["geometry"])
-
-    stops = await polish_scripts(stops, request.explanation_level)
-    stops = await places_service.enrich_stops_with_places(stops, request.interests)
-    stops = places_service.assign_sides(stops, route["geometry"])
-    for stop in stops:
-        place = stop.get("place_name") or ""
-        pop = stop.get("population")
-        fact = stop.get("local_fact") or ""
-        side = stop.get("side") or ""
-        extras = []
-        if place:
-            extras.append(f"in {place}" + (f" ({pop} inwoners)" if pop else ""))
-        if side and side not in {"langs de route", ""}:
-            extras.append(f"aan je {side}")
-        if fact and fact not in (stop.get("arrived") or ""):
-            extras.append(fact)
-        if extras and request.explanation_level != "kort":
-            stop["arrived"] = f"{stop['arrived']} {' · '.join(extras)}"
-        elif place and place not in (stop.get("approaching") or ""):
-            stop["approaching"] = f"{stop['approaching']} Je bent in {place}."
-
-    title = (ai_choice or {}).get("title") or (catalog_route["title"] if catalog_route else _title(request, start, end, knoop_label))
-    intro = (ai_choice or {}).get("intro") or (
-        suggestion_service.catalog_intro(
-            catalog_route,
-            request.interests,
-            round(route["distance_m"] / 1000, 1),
-            start.label,
-        )
-        if catalog_route
-        else _intro(request, start, selected, route, knoop_label, weather)
-    )
-
+            pass
+        except Exception:
+            pass
+    stops = places_service.assign_sides(stops, route["geometry"]) if route.get("geometry") else stops
     model_stops = [
         Stop(
             id=s["id"],
@@ -494,37 +536,10 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         )
         for s in stops
     ]
-    knoop_chain_display = (
-        knoop_service.close_chain_for_loop(chain)
-        if request.mode == "lus" and chain
-        else (chain or [])
-    )
-    knoop_models = [
-        Knooppunt(
-            id=n.get("id") or "",
-            number=n["number"],
-            lat=n["lat"],
-            lng=n["lng"],
-            network=n.get("network"),
-            on_route=True,
-            geoid=n.get("geoid"),
-        )
-        for n in knoop_chain_display
-    ]
-    chain_ids = {n.get("id") for n in chain if n.get("id")}
-    all_knoop = _unique_knooppunten(nodes, chain_ids)
-    localities = _localities_from_stops(model_stops)
-    if catalog_route:
-        localities = suggestion_service.merge_localities(catalog_route, localities)
-        if not route_reason:
-            route_reason = f"Route Top 10 · {catalog_route['title']}"
     sources = sorted(
         {stop.source for stop in model_stops}
-        | {n.get("source") or "Toerisme Vlaanderen" for n in chain}
-        | {"OpenStreetMap", "OSRM fietsrouting", "Wikipedia", "Fietsknooppuntennetwerk Vlaanderen", "Open-Meteo"}
+        | {"OpenStreetMap", "OSRM fietsrouting", "Fietsknooppuntennetwerk Vlaanderen", "Open-Meteo"}
     )
-    if weather.alert and not route_reason:
-        route_reason = weather.alert
     return RoutePlan(
         title=title,
         intro=intro,
@@ -533,23 +548,23 @@ async def plan_route(request: PlanRequest) -> RoutePlan:
         notes=(request.notes or "").strip(),
         start=start,
         end=end,
-        distance_km=round(route["distance_m"] / 1000, 1),
-        duration_min=max(1, round(route["duration_s"] / 60)),
+        distance_km=round(float(route["distance_m"]) / 1000, 1),
+        duration_min=max(1, round(float(route["duration_s"]) / 60)),
         geometry=route["geometry"],
         stops=model_stops,
         knooppunten=knoop_models,
-        all_knooppunten=all_knoop,
+        all_knooppunten=_unique_knooppunten(display_chain, {n.get("id") for n in display_chain if n.get("id")}),
         knoop_chain=knoop_label,
-        route_reason=route_reason,
+        route_reason="Route op basis van je afstand en knooppunten",
         steps=route.get("steps") or [],
         explanation_level=request.explanation_level,
         interaction=(profile.interaction if profile else "live"),
         weather=weather,
         budget_mode=request.budget_mode,
         duration_budget_min=request.duration_min,
-        localities=localities,
+        localities=_localities_from_stops(model_stops),
         sources=sources,
-        ai_used=bool(ai_choice),
+        ai_used=False,
     )
 
 
@@ -654,51 +669,9 @@ async def preview_route(
         radius = int(min(16000, max(5000, distance_km * 1000 / 2.2)))
 
     wish_interests = pois_service.wish_interests_for_notes(notes, profile_interests)
-    interpret_task = (
-        asyncio.create_task(interpret_wish_notes(notes, profile_interests))
-        if notes.strip() and has_ai()
-        else None
-    )
-    nodes_task = knoop_service.fetch_nodes(lat, lng, radius, extra)
-    pois_task = (
-        pois_service.fetch_pois(lat, lng, radius, wish_interests, extra)
-        if notes.strip() and wish_interests
-        else asyncio.sleep(0, result=[])
-    )
-    horeca_task = (
-        pois_service.fetch_horeca(lat, lng, radius, extra)
-        if notes.strip() and ("horeca" in wish_interests or pois_service.notes_want_horeca(notes))
-        else asyncio.sleep(0, result=[])
-    )
-    wiki_task = (
-        wikipedia.places_for_route(lat, lng, min(radius, 10000), extra)
-        if notes.strip()
-        else asyncio.sleep(0, result=[])
-    )
-    nodes, osm_pois, horeca, wiki_places, interpreted = await asyncio.gather(
-        _optional(nodes_task, [], 16),
-        _optional(pois_task, [], 24),
-        _optional(horeca_task, [], 24),
-        _optional(wiki_task, [], 18),
-        interpret_task if interpret_task else asyncio.sleep(0, result=None),
-    )
-    wish_summary = ""
-    if interpreted:
-        ai_interests = [item for item in interpreted.get("interests", []) if item]
-        merged_interests = list(dict.fromkeys([*wish_interests, *ai_interests]))
-        extra_interests = [item for item in ai_interests if item not in wish_interests]
-        if extra_interests:
-            more_pois = await _optional(
-                pois_service.fetch_pois(lat, lng, radius, extra_interests, extra),
-                [],
-                18,
-            )
-            osm_pois = _merge(osm_pois, more_pois)
-        wish_interests = merged_interests[:4] or wish_interests
-        wish_summary = str(interpreted.get("summary") or "").strip()
-    candidates = _merge(osm_pois, horeca, wiki_places)
-    if candidates:
-        knoop_service.attach_nearby(nodes, candidates)
+    # Preview blijft licht: alleen knooppunten + OSRM. Suggesties komen apart via /api/wish-suggestions.
+    nodes = await _optional(knoop_service.fetch_nodes(lat, lng, radius, extra), [], 16)
+    if nodes and notes.strip():
         knoop_service.score_nodes_for_notes(nodes, notes)
     geometric = knoop_service.plan_node_chain(nodes, lat, lng, distance_km, extra)
     noted = (
@@ -710,59 +683,17 @@ async def preview_route(
     if not chain:
         raise ValueError("Geen knooppunten gevonden voor een routevoorbeeld.")
 
-    display_chain, route = await _build_knoop_route(
+    # Snelle magenta-preview: OSRM langs knooppunten (geen trage WFS-netwerkrouting).
+    route = await _osrm_route_along_chain(
         lat,
         lng,
-        _chain_spine(chain),
+        chain,
         close_loop=mode == "lus",
         end_lat=end_lat if mode == "punt" else None,
         end_lng=end_lng if mode == "punt" else None,
-        poi_picks=poi_picks,
+        timeout=20.0,
     )
-    geometry = route["geometry"]
-    chain_candidates = list(candidates)
-    for node in display_chain:
-        nearby = [
-            poi
-            for poi in (node.get("nearby") or [])
-            if poi.get("lat") is not None and poi.get("lng") is not None and poi.get("name")
-        ]
-        chain_candidates = _merge(chain_candidates, nearby)
-    wish_pois, ranked_summary = await _wish_pois_for_geometry(
-        notes, chain_candidates, [], display_chain, geometry, profile_interests
-    )
-    if ranked_summary:
-        wish_summary = ranked_summary
-    if poi_picks:
-        picked_ids: set[str] = set()
-        for pick in poi_picks:
-            data = pick.model_dump() if hasattr(pick, "model_dump") else dict(pick)
-            picked_ids.add(str(data["id"]))
-        for poi in wish_pois:
-            if str(poi.get("id")) in picked_ids:
-                poi["on_route"] = True
-    suggestions = []
-    for poi in wish_pois:
-        try:
-            suggestions.append(
-                {
-                    "id": str(poi["id"]),
-                    "name": poi["name"],
-                    "lat": float(poi["lat"]),
-                    "lng": float(poi["lng"]),
-                    "kind": str(poi.get("kind") or "plek"),
-                    "kind_label": poi.get("kind_label"),
-                    "interest": poi.get("interest") or (
-                        pois_service.interests_from_notes(notes)[0]
-                        if pois_service.interests_from_notes(notes)
-                        else "geschiedenis"
-                    ),
-                    "on_route": bool(poi.get("on_route")),
-                    "hint": poi.get("hint"),
-                }
-            )
-        except Exception:
-            continue
+    display_chain = list(_chain_spine(chain))
     knoop_chain_display = (
         knoop_service.close_chain_for_loop(display_chain) if mode == "lus" else display_chain
     )
@@ -770,7 +701,7 @@ async def preview_route(
         "geometry": route["geometry"],
         "distance_km": round(route["distance_m"] / 1000, 1),
         "duration_min": max(1, round(route["duration_s"] / 60)),
-        "wish_summary": wish_summary or None,
+        "wish_summary": None,
         "knooppunten": [
             Knooppunt(
                 id=n.get("id") or "",
@@ -783,7 +714,7 @@ async def preview_route(
             for n in knoop_chain_display
         ],
         "knoop_chain": knoop_service.chain_label(knoop_chain_display),
-        "suggestions": suggestions,
+        "suggestions": [],
     }
 
 
@@ -826,7 +757,9 @@ async def wish_suggestions_along_route(
     profile_interests: list[str] | None = None,
 ) -> dict[str, Any]:
     """Suggesties voor een bestaande (manuele) knooppuntenroute op basis van extra wens."""
-    if not (notes or "").strip() or not geometry or len(geometry) < 2:
+    if not geometry or len(geometry) < 2:
+        return {"suggestions": [], "wish_summary": None}
+    if not (notes or "").strip() and not (profile_interests or []):
         return {"suggestions": [], "wish_summary": None}
     chain: list[dict[str, Any]] = []
     for node in nodes or []:
@@ -844,21 +777,22 @@ async def wish_suggestions_along_route(
             }
         )
     try:
+        # Snelle Nominatim/Wikipedia-path (geen Overpass) zodat manuele wensen niet vastlopen.
         wish_pois, wish_summary = await asyncio.wait_for(
-            _wish_pois_for_geometry(
-                notes,
-                [],
-                [],
+            _fast_wish_pois_for_manual(
+                notes or "",
                 chain,
                 geometry,
                 profile_interests,
             ),
-            timeout=40.0,
+            timeout=15.0,
         )
     except TimeoutError:
         return {"suggestions": [], "wish_summary": None}
+    except Exception:
+        return {"suggestions": [], "wish_summary": None}
     return {
-        "suggestions": _format_wish_suggestions(wish_pois, notes, profile_interests),
+        "suggestions": _format_wish_suggestions(wish_pois, notes or "", profile_interests),
         "wish_summary": wish_summary or None,
     }
 
@@ -1132,8 +1066,8 @@ async def _build_knoop_route(
     route_chain = knoop_service._display_chain_between_picks(spine_geo, by_geoid, adj)
     if len(route_chain) < len(spine_geo):
         route_chain = list(spine_geo)
-    # Route langs gebruikerspicks (spine): kortere, logische segmenten i.p.v. elke via-knoop apart.
-    must_visit = spine_geo if not close_loop else route_chain
+    # Altijd langs de picks (spine) routen — niet elke via-knoop apart (dat hangt bij 30–50 km).
+    must_visit = spine_geo
 
     # Eerst de zuivere knooppuntenroute; POI's daarna als lokale spur (geen A→POI→B).
     route = await _route_along_must_visit(
@@ -1163,9 +1097,7 @@ async def _build_knoop_route(
         display_chain = knoop_service.snap_chain_nodes_to_route_line(display_chain, geometry)
         return display_chain, route
 
-    geo_nodes_all, _ = await knoop_service.fetch_network_for_geometry(geometry, network=None)
-    network_nodes = knoop_service._merge_network_nodes(network_nodes, geo_nodes_all)
-    # Lijst = netwerkvolgorde tussen je picks (niet geometry-filter: mist tussenliggende knopen).
+    # Snelle weergave: netwerkvolgorde uit de graaf, zonder tweede WFS-ronde.
     display_chain = knoop_service.chain_for_display(
         route_chain,
         spine_geo,
@@ -1173,7 +1105,6 @@ async def _build_knoop_route(
         trajects=trajects,
     )
     display_chain = knoop_service.refresh_chain_coords(display_chain, network_nodes)
-    display_chain = knoop_service.ensure_corridor_knoop_76(display_chain, geometry, network_nodes)
     display_chain = knoop_service.snap_chain_nodes_to_route_line(display_chain, geometry)
     return display_chain, route
 
@@ -1671,8 +1602,8 @@ async def _fast_wish_pois_for_manual(
     if not wish_interests:
         return [], ""
     wish_set = set(wish_interests)
-    sample_points = _sample_route_points(geometry, 6)
-    for node in (chain or [])[:4]:
+    sample_points = _sample_route_points(geometry, 4)
+    for node in (chain or [])[:3]:
         try:
             sample_points.append((float(node["lat"]), float(node["lng"])))
         except (KeyError, TypeError, ValueError):
@@ -1686,24 +1617,24 @@ async def _fast_wish_pois_for_manual(
             asyncio.create_task(
                 _optional(
                     pois_service.fetch_horeca_nominatim_along_points(
-                        sample_points, max_points=3, per_point=5
+                        sample_points, max_points=2, per_point=4
                     ),
                     [],
-                    10,
+                    8,
                 )
             )
         )
         labels.append("horeca")
-    themes = [item for item in wish_interests if item != "horeca"][:4]
+    themes = [item for item in wish_interests if item != "horeca"][:3]
     if themes:
         tasks.append(
             asyncio.create_task(
                 _optional(
                     pois_service.fetch_theme_nominatim_along_points(
-                        sample_points, themes, max_points=3, per_point=4
+                        sample_points, themes, max_points=2, per_point=3
                     ),
                     [],
-                    10,
+                    8,
                 )
             )
         )
@@ -1720,7 +1651,7 @@ async def _fast_wish_pois_for_manual(
                     end_pt,
                 ),
                 [],
-                8,
+                7,
             )
         )
     )

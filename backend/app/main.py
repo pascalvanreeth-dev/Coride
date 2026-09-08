@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import httpx
 
 from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
@@ -196,7 +197,12 @@ async def plan_endpoint(request: PlanRequest) -> RoutePlan:
     if not request.interests:
         request.interests = ["geschiedenis"]
     try:
-        return await plan_route(request)
+        return await asyncio.wait_for(plan_route(request), timeout=70.0)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Het plannen duurde te lang. Probeer opnieuw of kies zelf knooppunten.",
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
