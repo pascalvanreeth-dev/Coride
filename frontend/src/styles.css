@@ -12,6 +12,12 @@
   --route-soft: #d9a99e;
   --blue: #7a9eb8;
   --blue-soft: rgba(122, 158, 184, 0.22);
+  --wish: #2563eb;
+  --wish-soft: rgba(37, 99, 235, 0.18);
+  --wish-ink: #1d4ed8;
+  --wish-search: #7c3aed;
+  --wish-search-soft: rgba(124, 58, 237, 0.18);
+  --wish-search-ink: #6d28d9;
   --warn-bg: #faf3ea;
   --warn-ink: #9a7355;
   --warn-line: rgba(201, 156, 110, 0.35);
@@ -244,11 +250,23 @@ button, input, textarea { font: inherit; color: inherit; }
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  background: #c70068;
+  background: var(--wish);
   display: grid;
   place-items: center;
   line-height: 0;
-  box-shadow: 0 0 0 2px rgba(199, 0, 104, 0.2);
+  box-shadow: 0 0 0 2px var(--wish-soft);
+}
+
+.poi-suggest-tile.from-wish .poi-suggest-glyph,
+.poi-suggest-glyph.from-wish {
+  background: var(--wish-search);
+  box-shadow: 0 0 0 2px var(--wish-search-soft);
+}
+
+.poi-suggest-tile.from-profile .poi-suggest-glyph,
+.poi-suggest-glyph.from-profile {
+  background: var(--wish);
+  box-shadow: 0 0 0 2px var(--wish-soft);
 }
 
 .poi-suggest-glyph svg {
@@ -263,8 +281,32 @@ button, input, textarea { font: inherit; color: inherit; }
   margin-right: 10px;
   vertical-align: -8px;
   border-radius: 50%;
-  background: #c70068;
+  background: var(--wish);
   line-height: 0;
+}
+
+.wish-picker-glyph.from-wish {
+  background: var(--wish-search);
+}
+
+.wish-picker-glyph.from-profile {
+  background: var(--wish);
+}
+
+.poi-suggest-tile.from-wish {
+  border-color: color-mix(in srgb, var(--wish-search) 45%, var(--line));
+}
+
+.poi-suggest-tile.from-profile {
+  border-color: color-mix(in srgb, var(--wish) 45%, var(--line));
+}
+
+.poi-suggest-tile.from-wish .poi-suggest-kind {
+  color: var(--wish-search-ink);
+}
+
+.poi-suggest-tile.from-profile .poi-suggest-kind {
+  color: var(--wish-ink);
 }
 
 .wish-picker-glyph svg {
@@ -278,13 +320,23 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 
 .poi-suggest-tile.on {
-  border-color: #4f8f43;
-  background: rgba(79, 143, 67, 0.08);
+  border-color: var(--wish);
+  background: var(--wish-soft);
+}
+
+.poi-suggest-tile.from-wish.on {
+  border-color: var(--wish-search);
+  background: var(--wish-search-soft);
 }
 
 .poi-suggest-tile.focus {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
+  border-color: var(--wish-ink);
+  box-shadow: 0 0 0 2px var(--wish-soft);
+}
+
+.poi-suggest-tile.from-wish.focus {
+  border-color: var(--wish-search-ink);
+  box-shadow: 0 0 0 2px var(--wish-search-soft);
 }
 
 .poi-suggest-kind {
@@ -311,16 +363,16 @@ button, input, textarea { font: inherit; color: inherit; }
   gap: 10px;
   align-items: start;
   padding: 10px 12px;
-  border: 1px solid rgba(199, 0, 104, 0.35);
+  border: 1px solid color-mix(in srgb, var(--wish) 40%, transparent);
   border-radius: 12px;
-  background: rgba(199, 0, 104, 0.08);
+  background: var(--wish-soft);
   text-align: left;
   cursor: pointer;
 }
 
 .wish-on-route.focus {
-  border-color: #c70068;
-  box-shadow: 0 0 0 2px rgba(199, 0, 104, 0.18);
+  border-color: var(--wish);
+  box-shadow: 0 0 0 2px var(--wish-soft);
 }
 
 .wish-on-route strong {
@@ -339,9 +391,9 @@ button, input, textarea { font: inherit; color: inherit; }
   height: 12px;
   margin-top: 4px;
   border-radius: 50%;
-  background: #c70068;
+  background: var(--wish);
   border: 2px solid #fff;
-  box-shadow: 0 0 0 2px rgba(199, 0, 104, 0.25);
+  box-shadow: 0 0 0 2px var(--wish-soft);
 }
 
 .poi-picker-actions {
@@ -1415,7 +1467,14 @@ input, textarea {
 
 .stop.active { border-color: var(--accent); }
 .stop.on-route { border-color: var(--green, #4f8f43); background: color-mix(in srgb, var(--green, #4f8f43) 12%, var(--panel-2)); }
-.stop.wish { border-color: #9a7355; background: color-mix(in srgb, #9a7355 10%, var(--panel-2)); }
+.stop.wish.from-profile {
+  border-color: var(--wish);
+  background: color-mix(in srgb, var(--wish) 12%, var(--panel-2));
+}
+.stop.wish.from-wish {
+  border-color: var(--wish-search);
+  background: color-mix(in srgb, var(--wish-search) 12%, var(--panel-2));
+}
 .stop.wish-off-route { border-style: dashed; }
 
 .num {
@@ -1432,8 +1491,16 @@ input, textarea {
 
 .num.wish-num {
   border-radius: 50%;
-  background: #c70068;
+  background: var(--wish);
   line-height: 0;
+}
+
+.num.wish-num.from-profile {
+  background: var(--wish);
+}
+
+.num.wish-num.from-wish {
+  background: var(--wish-search);
 }
 
 .num.wish-num svg {

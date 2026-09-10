@@ -81,7 +81,7 @@ KIND_LABELS = {
     "concert_hall": "concertzaal",
     "stadium": "stadion",
     "cafe": "café",
-    "pub": "café/pub",
+    "pub": "taverne",
     "bar": "bar",
     "restaurant": "restaurant",
     "ice_cream": "ijssalon",
@@ -195,6 +195,7 @@ NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
             "cafe", "café", "cafetje", "cafetjes", "koffie", "koffi", "coffee", "pub", "bar", "bier",
             "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs", "drank",
             "bakker", "brouwerij", "taart", "brasserie", "frituur", "snack",
+            "taverne", "tavern", "herberg", "estaminet", "bistro",
         ),
     ),
     (
@@ -220,6 +221,24 @@ NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
     ("activiteiten", ("uitzicht", "uitkijk", "attractie", "zwem", "speeltuin", "wandel", "recreatie")),
     ("evenementen", ("markt", "festival", "evenement", "theater", "concert", "optreden")),
 ]
+
+
+def infer_interest(poi: dict[str, Any], allowed: list[str] | None = None) -> str | None:
+    """Raad het thema van een plek uit naam/soort, beperkt tot gekozen interesses."""
+    blob = (
+        f"{poi.get('name', '')} {poi.get('kind', '')} {poi.get('kind_label', '')} "
+        f"{poi.get('description', '')} {poi.get('interest', '')}"
+    ).lower()
+    allowed_set = set(allowed) if allowed else None
+    for interest, keys in NOTE_INTEREST_KEYS:
+        if allowed_set is not None and interest not in allowed_set:
+            continue
+        if any(key in blob for key in keys):
+            return interest
+    current = poi.get("interest")
+    if current and (allowed_set is None or current in allowed_set):
+        return str(current)
+    return None
 
 
 def wish_interests_for_notes(notes: str, fallback: list[str] | None = None) -> list[str]:
@@ -433,7 +452,7 @@ async def fetch_pois_along_points(
     try:
         return await asyncio.wait_for(
             _fetch_pois_along_points_impl(sampled, radius_m, interests),
-            timeout=18.0,
+            timeout=8.0,
         )
     except TimeoutError as exc:
         raise RuntimeError("Overpass API reageerde niet: timeout") from exc
@@ -489,6 +508,7 @@ def notes_want_horeca(notes: str, interests: list[str] | None = None, prefs: lis
     keys = (
         "cafe", "café", "cafetje", "cafetjes", "koffie", "koffi", "coffee", "pub", "bar", "bier",
         "terras", "restaurant", "eten", "lunch", "eetcafe", "eetcafé", "ijs",
+        "taverne", "tavern", "herberg", "estaminet", "bistro",
     )
     return any(key in text for key in keys)
 
@@ -565,6 +585,38 @@ async def fetch_horeca(
         data = await _overpass(_horeca_query(points, radius_m, filters, require_name=True))
         if not data.get("elements"):
             data = await _overpass(_horeca_query(points, min(radius_m + 1500, 16000), filters, require_name=False))
+    except Exception:
+        return []
+    return _parse_horeca_elements(data.get("elements") or [])
+
+
+async def fetch_cafes_fast(
+    points: list[tuple[float, float]],
+    radius_m: int = 7000,
+) -> list[dict[str, Any]]:
+    """Snelle café/taverne-zoektocht: één Overpass-query, geen volledige themascan."""
+    radius_m = max(4000, min(int(radius_m), 10000))
+    cleaned: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append((float(lat), float(lng)))
+        if len(cleaned) >= 3:
+            break
+    if not cleaned:
+        return []
+    clauses: list[str] = []
+    for lat, lng in cleaned:
+        around = f"around:{radius_m},{lat:.5f},{lng:.5f}"
+        clauses.append(f'nwr["amenity"~"cafe|pub|bar|biergarten"]["name"]({around});')
+    query = f"[out:json][timeout:8];({''.join(clauses)});out center 80;"
+    try:
+        data = await _overpass_fast(query, timeout_s=9.0)
     except Exception:
         return []
     return _parse_horeca_elements(data.get("elements") or [])
@@ -713,6 +765,8 @@ async def fetch_horeca_photon_along_points(
     *,
     max_points: int = 10,
     per_point: int = 12,
+    queries: tuple[str, ...] | None = None,
+    osm_tags: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Horeca via Photon (Komoot) als Overpass niet meewerkt."""
     cleaned: list[tuple[float, float]] = []
@@ -734,8 +788,8 @@ async def fetch_horeca_photon_along_points(
             spaced.append(cleaned[-1])
         cleaned = spaced[:max_points]
 
-    tags = ("amenity:cafe", "amenity:pub", "amenity:bar", "amenity:restaurant", "amenity:biergarten")
-    queries = ("café", "cafe", "restaurant", "pub")
+    tags = osm_tags or ("amenity:cafe", "amenity:pub")
+    search_queries = queries or ("café", "taverne", "pub")
     merged: dict[str, dict[str, Any]] = {}
 
     async def _one(lat: float, lng: float, query: str, osm_tag: str) -> list[dict[str, Any]]:
@@ -748,7 +802,7 @@ async def fetch_horeca_photon_along_points(
                         "lat": lat,
                         "lon": lng,
                         "limit": per_point,
-                        "lang": "nl",
+                        "lang": "en",
                         "osm_tag": osm_tag,
                         "bbox": "2.3,49.45,6.45,51.55",
                     },
@@ -792,7 +846,7 @@ async def fetch_horeca_photon_along_points(
 
     tasks = []
     for lat, lng in cleaned:
-        for query, tag in zip(queries, tags, strict=False):
+        for query, tag in zip(search_queries, tags, strict=False):
             tasks.append(_one(lat, lng, query, tag))
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:
@@ -1029,6 +1083,7 @@ _THEME_NOMINATIM_QUERIES: dict[str, tuple[str, ...]] = {
     "oorlog": ("oorlogsmonument", "memorial", "fort"),
     "activiteiten": ("uitzicht", "attractie"),
     "evenementen": ("theater", "cultuurcentrum"),
+    "horeca": ("café", "restaurant", "bakkerij"),
 }
 
 
@@ -1120,14 +1175,15 @@ async def fetch_theme_nominatim_along_points(
                 "heritage": "",
             }
 
-    jobs = [
-        _one(lat, lng, interest, query)
+    specs = [
+        (lat, lng, interest, query)
         for lat, lng in cleaned
         for interest in themes
-        for query in _THEME_NOMINATIM_QUERIES[interest][:2]
+        for query in _THEME_NOMINATIM_QUERIES[interest][:1]
     ]
-    for index in range(0, len(jobs), 4):
-        await asyncio.gather(*jobs[index : index + 4], return_exceptions=True)
-        if index + 4 < len(jobs):
-            await asyncio.sleep(0.75)
+    for index in range(0, len(specs), 6):
+        await asyncio.gather(
+            *[_one(*spec) for spec in specs[index : index + 6]],
+            return_exceptions=True,
+        )
     return list(merged.values())

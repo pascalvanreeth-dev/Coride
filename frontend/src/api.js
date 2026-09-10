@@ -1,11 +1,24 @@
 export async function geocode(q) {
-  const response = await apiFetch(`/api/geocode?q=${encodeURIComponent(q)}`);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = typeof data.detail === "string" ? data.detail : "Zoeken mislukt.";
-    throw new Error(detail);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await apiFetch(`/api/geocode?q=${encodeURIComponent(q)}`, {
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = typeof data.detail === "string" ? data.detail : "Zoeken mislukt.";
+      throw new Error(detail);
+    }
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new Error("Zoeken duurde te lang. Probeer opnieuw.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return Array.isArray(data) ? data : [];
 }
 
 export async function reverseGeocode(lat, lng) {
@@ -124,17 +137,29 @@ export async function fetchRoutePreview(payload) {
   return data;
 }
 
-export async function fetchWishSuggestions(payload) {
-  const response = await apiFetch("/api/wish-suggestions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.detail || "Wenssuggesties konden niet geladen worden.");
+export async function fetchWishSuggestions(payload, { timeoutMs = 16_000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await apiFetch("/api/wish-suggestions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(formatApiError(data.detail, "Wenssuggesties konden niet geladen worden."));
+    }
+    return data;
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new Error("Zoeken naar plekken duurde te lang.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
 export async function fetchRouteSuggestions(lat, lng, interests = [], used = []) {
@@ -163,16 +188,22 @@ export async function fetchPoiSuggestions(lat, lng, interests = [], { radius = 7
     params.append("sample_lat", String(point.lat));
     params.append("sample_lng", String(point.lng));
   }
-  const response = await apiFetch(`/api/poi-suggestions?${params}`);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    let message = typeof data.detail === "string" ? data.detail : "Suggesties konden niet geladen worden.";
-    if (/overpass/i.test(message)) {
-      message = "Kaartdata (OpenStreetMap) is tijdelijk niet bereikbaar. Probeer het over een minuut opnieuw.";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await apiFetch(`/api/poi-suggestions?${params}`, { signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      let message = typeof data.detail === "string" ? data.detail : "Suggesties konden niet geladen worden.";
+      if (/overpass/i.test(message)) {
+        message = "Kaartdata (OpenStreetMap) is tijdelijk niet bereikbaar. Probeer het over een minuut opnieuw.";
+      }
+      throw new Error(message);
     }
-    throw new Error(message);
+    return Array.isArray(data) ? data : [];
+  } finally {
+    clearTimeout(timer);
   }
-  return Array.isArray(data) ? data : [];
 }
 
 export async function fetchKnooppunten(lat, lng, radius = 12000) {
@@ -185,6 +216,21 @@ export async function fetchKnooppunten(lat, lng, radius = 12000) {
   const data = await response.json().catch(() => []);
   if (!response.ok) {
     throw new Error(data.detail || "Knooppunten konden niet geladen worden.");
+  }
+  return data;
+}
+
+/** Traject-netwerk voor viewport — lokale magenta-kleuring. */
+export async function fetchBikeNetwork(lat, lng, radius = 12000) {
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    radius: String(radius),
+  });
+  const response = await apiFetch(`/api/bike-network?${params}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.detail || "Knooppuntennetwerk kon niet geladen worden.");
   }
   return data;
 }
@@ -208,58 +254,69 @@ export async function fetchStopSummary({ name, lat, lng, wikipedia_url = null, w
   return data;
 }
 
-/** Snelle magenta-leg rechtstreeks via OSRM (Vite-proxy /osrm-bike). */
-export async function fetchOsrmBikeLeg(from, to) {
-  const coords = `${Number(from.lng).toFixed(6)},${Number(from.lat).toFixed(6)};${Number(to.lng).toFixed(6)},${Number(to.lat).toFixed(6)}`;
-  const url = `/osrm-bike/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=false&alternatives=false`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12_000);
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || data?.code !== "Ok" || !data?.routes?.[0]) {
-      throw new Error("Geen fietsroute gevonden tussen deze knooppunten.");
-    }
-    const route = data.routes[0];
-    const geometry = (route.geometry?.coordinates || []).map(([lng, lat]) => [lat, lng]);
-    if (geometry.length < 2) {
-      throw new Error("Geen fietsroute gevonden tussen deze knooppunten.");
-    }
-    return {
-      geometry,
-      distance_km: Number((Number(route.distance || 0) / 1000).toFixed(2)),
-      duration_min: Math.max(1, Math.round(Number(route.duration || 0) / 60)),
-      steps: [],
-      via_knooppunten: [from, to],
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Magenta-leg: eerst OSRM (snel), anders officieel knooppuntennetwerk. */
+/** Magenta-segment via officieel knooppuntennetwerk (`/api/bike-leg`). */
 export async function fetchBikeLeg(from, to) {
-  try {
-    return await fetchOsrmBikeLeg(from, to);
-  } catch {
-    /* fall through to network */
-  }
   const response = await apiFetch("/api/bike-leg", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      from_lat: from.lat,
-      from_lng: from.lng,
-      to_lat: to.lat,
-      to_lng: to.lng,
       from_id: from.id || "",
       from_number: String(from.number ?? ""),
+      from_lat: from.lat,
+      from_lng: from.lng,
       from_geoid: from.geoid ?? null,
       from_network: from.network || null,
       to_id: to.id || "",
       to_number: String(to.number ?? ""),
+      to_lat: to.lat,
+      to_lng: to.lng,
       to_geoid: to.geoid ?? null,
       to_network: to.network || null,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof data.detail === "string"
+        ? data.detail
+        : "Geen officiële knooppuntenroute tussen deze knooppunten.",
+    );
+  }
+  return data;
+}
+
+/** Prefetch netwerk rond knoop/gebied — fire-and-forget. */
+export function warmBikeNetwork({ lat, lng, geoid } = {}) {
+  const params = new URLSearchParams();
+  if (Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))) {
+    params.set("lat", String(lat));
+    params.set("lng", String(lng));
+  }
+  if (geoid != null && String(geoid) !== "") params.set("geoid", String(geoid));
+  if (![...params.keys()].length) return;
+  apiFetch(`/api/bike-warm?${params}`, { method: "POST" }).catch(() => {});
+}
+
+/** Volledige magenta-route + profiel/wens-suggesties in één ronde. */
+export async function fetchBikeRoute(nodes, closeLoop = false, extra = {}) {
+  if (!Array.isArray(nodes) || nodes.length < 2) {
+    throw new Error("Kies minstens twee knooppunten.");
+  }
+  const response = await apiFetch("/api/bike-route", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      close_loop: Boolean(closeLoop),
+      notes: extra.notes || "",
+      interests: extra.interests || [],
+      nodes: nodes.map((node) => ({
+        id: node.id || "",
+        number: String(node.number ?? ""),
+        lat: node.lat,
+        lng: node.lng,
+        geoid: node.geoid ?? null,
+        network: node.network || null,
+      })),
     }),
   });
   const data = await response.json().catch(() => ({}));

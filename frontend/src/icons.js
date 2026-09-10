@@ -180,18 +180,42 @@ export function wishPoiGlyph(interest, kind, name = "") {
   return wishPoiSvg(interest, kind, name, 18);
 }
 
-export function wishPoiIcon({ interest, kind, name = "", focused = false, selected = false } = {}) {
+/** Extra wens (zoekveld) = paars; profielsuggestie = blauw. */
+export function isWishSearchPoi(item) {
+  if (!item) return false;
+  const origin = item.wish_source || item.source;
+  if (origin === "wish") return true;
+  if (origin === "profile") return false;
+  if (item.hint === "past bij je wens") return true;
+  if (item.hint === "uit je profiel") return false;
+  return false;
+}
+
+export function wishOriginClass(item) {
+  return isWishSearchPoi(item) ? "from-wish" : "from-profile";
+}
+
+export function wishPoiIcon({
+  interest,
+  kind,
+  name = "",
+  focused = false,
+  selected = false,
+  source = "profile",
+  hint = null,
+} = {}) {
   const size = focused ? 34 : selected ? 30 : 28;
   const iconSize = Math.round(size * 0.55);
-  const bg = selected ? "#4f8f43" : "#c70068";
+  const isWish = isWishSearchPoi({ source, hint });
+  const bg = selected ? (isWish ? "#6d28d9" : "#1d4ed8") : isWish ? "#7c3aed" : "#2563eb";
   const ring = focused
-    ? `0 0 0 4px rgba(79, 143, 67, 0.35)`
+    ? `0 0 0 4px ${isWish ? "rgba(124, 58, 237, 0.35)" : "rgba(37, 99, 235, 0.35)"}`
     : selected
-      ? "0 0 0 3px rgba(79, 143, 67, 0.32)"
-      : "0 0 0 3px rgba(199, 0, 104, 0.28)";
+      ? `0 0 0 3px ${isWish ? "rgba(109, 40, 217, 0.32)" : "rgba(29, 78, 216, 0.32)"}`
+      : `0 0 0 3px ${isWish ? "rgba(124, 58, 237, 0.28)" : "rgba(37, 99, 235, 0.28)"}`;
   const glyph = wishPoiSvg(interest, kind, name, iconSize);
   return L.divIcon({
-    className: "wish-poi-marker",
+    className: `wish-poi-marker ${isWish ? "from-wish" : "from-profile"}`,
     html: `<div class="wish-poi-marker-inner" style="
       width:${size}px;
       height:${size}px;

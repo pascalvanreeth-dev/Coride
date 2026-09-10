@@ -1,0 +1,34 @@
+---
+description: Vaste producteisen uit eerdere gebruikersvragen — niet opnieuw heronderhandelen
+alwaysApply: true
+---
+
+# Veloverhaal — niet opnieuw ontwerpen
+
+De gebruiker heeft dit tientallen keren gevraagd. Nieuwe chats bouwen hierop verder. Geen “probeer opnieuw” als de UI leeg is.
+
+## Zelf knooppunten kiezen
+
+- Magenta volgt het **officiële knooppuntennetwerk** (`/api/bike-leg` per klik-segment, cache; optioneel `/api/bike-route` op de achtergrond). **Geen** vrije OSRM-routes.
+- Eerst stub of cache (lijn **meteen** zichtbaar bij elke klik), daarna officiële trajecten die stelselmatig meegroeien. `draftBusy` mag **wensen niet blokkeren**.
+- Geen “magenta wordt berekend”-knoptekst; Plan mag met stub.
+
+## Wensen en suggesties
+
+- Vanaf **twee knooppunten** zoeken, parallel met de lijn (mee met bike-route én apart), met knooppuntcoördinaten als de geometrie nog stub is.
+- Extra wens **café / taverne / koffie** → eigen horeca-zoekpad (Photon + snelle café-Overpass), **plus** profielsuggesties ernaast. Geen Wikipedia-kerken *in de plaats van* cafés.
+- Lege lijst is een bug tot er plekken of een echte foutmelding is.
+
+## Stad zoeken
+
+- Vergrootglas: kaart naar die plaats, **blijft daar**. Niet terugvliegen naar GPS/start (`MapFlyTo` gebruikt `viewFocus`).
+
+## Na Plan deze knooppuntenroute
+
+- Suggesties/wensen moeten op het **rit-scherm** staan: linkerlijst **bovenaan** (direct onder Start route) én markers op de kaart.
+- Als de planner nog geen wensen had: bij Plan of op Ride alsnog ophalen. Geen stille lege lijst.
+- “Nieuwe route” / terug mag de planner-draft niet stil wissen zonder dat de gebruiker dat wil — knooppunten en wensen behouden waar mogelijk.
+
+## Klaar = in de UI gezien
+
+Niet afronden op API-200 of theorie. Flow: twee knopen → officiële magenta → Extra wens “café” → tegels → Plan → lijst + kaartmarkers. Stad zoeken → kaart blijft op die stad.

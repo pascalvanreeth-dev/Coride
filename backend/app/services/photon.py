@@ -60,7 +60,7 @@ async def search(query: str, limit: int = 5) -> list[dict[str, Any]]:
             params={
                 "q": query,
                 "limit": max(limit, 5),
-                "lang": "nl",
+                "lang": "en",
                 "bbox": BELGIUM_BBOX,
             },
         )

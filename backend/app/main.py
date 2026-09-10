@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import httpx
 
-from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
+from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, BikeRouteRequest, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
 from app.services.ai import answer_about_stop
 from app.services.geocoding import geocode, reverse
 from app.services import knooppunten as knoop_service
@@ -31,7 +31,9 @@ async def health() -> dict[str, str]:
 @app.get("/api/geocode", response_model=list[GeocodeHit])
 async def geocode_endpoint(q: str = Query(min_length=2, max_length=200)) -> list[GeocodeHit]:
     try:
-        hits = await geocode(q)
+        hits = await asyncio.wait_for(geocode(q), timeout=6.0)
+    except TimeoutError:
+        return []
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=502,
@@ -75,9 +77,37 @@ async def knooppunten_endpoint(
             lat=float(node["lat"]),
             lng=float(node["lng"]),
             network=node.get("network"),
+            geoid=node.get("geoid"),
         )
         for node in nodes
     ]
+
+
+@app.post("/api/bike-warm")
+async def bike_warm_endpoint(
+    lat: float | None = Query(default=None, ge=49.0, le=52.0),
+    lng: float | None = Query(default=None, ge=2.0, le=7.0),
+    geoid: int | None = Query(default=None),
+) -> dict[str, str]:
+    """Prefetch netwerk rond een knoop/gebied zodat magenta-legs lokaal zijn."""
+    if geoid is not None:
+        asyncio.create_task(knoop_service.prefetch_geoid_star(geoid))
+    if lat is not None and lng is not None:
+        asyncio.create_task(knoop_service.warm_area_network(lat, lng, 12000))
+    return {"status": "warming"}
+
+
+@app.get("/api/bike-network")
+async def bike_network_endpoint(
+    lat: float = Query(ge=49.0, le=52.0),
+    lng: float = Query(ge=2.0, le=7.0),
+    radius: int = Query(default=12000, ge=2000, le=16000),
+) -> dict:
+    """Volledig knooppuntennetwerk (nodes + trajecten) voor lokale magenta-kleuring."""
+    try:
+        return await knoop_service.fetch_viewport_network(lat, lng, radius)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/poi-suggestions", response_model=list[PoiHit])
@@ -90,15 +120,14 @@ async def poi_suggestions_endpoint(
     sample_lng: list[float] = Query(default=[]),
 ) -> list[PoiHit]:
     wanted = pois_service._unique_interests(interests)
-    points: list[tuple[float, float]] = [(lat, lng)]
-    for slat, slng in zip(sample_lat, sample_lng, strict=False):
-        if 49.0 <= slat <= 52.0 and 2.0 <= slng <= 7.0:
-            points.append((slat, slng))
+    extra = None
+    if sample_lat and sample_lng:
+        extra = (float(sample_lat[-1]), float(sample_lng[-1]))
     try:
-        if len(points) > 1:
-            pois = await pois_service.fetch_pois_along_points(points, radius, wanted)
-        else:
-            pois = await pois_service.fetch_pois(lat, lng, radius, wanted)
+        pois = await asyncio.wait_for(
+            pois_service.fetch_pois(lat, lng, radius, wanted, extra),
+            timeout=8.0,
+        )
     except Exception as exc:  # noqa: BLE001
         detail = str(exc)
         if "overpass" in detail.lower():
@@ -179,12 +208,18 @@ async def route_preview_endpoint(request: RoutePreviewRequest) -> RoutePreviewRe
 @app.post("/api/wish-suggestions", response_model=WishSuggestionsResponse)
 async def wish_suggestions_endpoint(request: WishSuggestionsRequest) -> WishSuggestionsResponse:
     try:
-        data = await wish_suggestions_along_route(
-            request.notes,
-            request.geometry,
-            request.nodes,
-            list(request.interests),
+        data = await asyncio.wait_for(
+            wish_suggestions_along_route(
+                request.notes,
+                request.geometry,
+                request.nodes,
+                list(request.interests),
+            ),
+            timeout=14.0,
         )
+    except TimeoutError:
+        # Liever leeg + client-retry dan hang tot browser-abort ("duurde te lang").
+        return WishSuggestionsResponse(suggestions=[], wish_summary=None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -275,6 +310,82 @@ async def ask_endpoint(request: AskRequest) -> AskResponse:
         return AskResponse(answer=answer)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/bike-route", response_model=BikeLegResponse)
+async def bike_route_endpoint(request: BikeRouteRequest) -> BikeLegResponse:
+    """Magenta-route langs gekozen knooppunten, zonder heen-en-terug over hetzelfde pad."""
+    chain = [
+        {
+            "id": node.id or "",
+            "number": node.number,
+            "lat": node.lat,
+            "lng": node.lng,
+            "geoid": node.geoid,
+            "network": node.network,
+        }
+        for node in request.nodes
+    ]
+    try:
+        route_task = asyncio.create_task(
+            knoop_service.network_route(chain, close_loop=request.close_loop)
+        )
+        stub_geometry = [[float(node["lat"]), float(node["lng"])] for node in chain]
+        async def _pois() -> dict:
+            if not request.interests and not (request.notes or "").strip():
+                return {"suggestions": [], "wish_summary": None}
+            return await wish_suggestions_along_route(
+                request.notes or "",
+                stub_geometry,
+                chain,
+                list(request.interests),
+            )
+
+        pois_task = asyncio.create_task(_pois())
+        route_result, wish_result = await asyncio.gather(
+            route_task, pois_task, return_exceptions=True
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc) or "Geen officiële knooppuntenroute tussen deze knooppunten.",
+        ) from exc
+    if isinstance(route_result, BaseException):
+        detail = str(route_result) or "Geen officiële knooppuntenroute tussen deze knooppunten."
+        raise HTTPException(status_code=502, detail=detail) from route_result
+    route = route_result
+    wish = wish_result if isinstance(wish_result, dict) else {"suggestions": [], "wish_summary": None}
+    geometry = list(route.get("geometry") or [])
+    if len(geometry) < 2:
+        raise HTTPException(
+            status_code=502,
+            detail="Geen officiële knooppuntenroute tussen deze knooppunten.",
+        )
+    via_raw = route.get("via_knooppunten") or []
+    via = [
+        Knooppunt(
+            id=str(node.get("id") or ""),
+            number=str(node.get("number") or ""),
+            lat=float(node["lat"]),
+            lng=float(node["lng"]),
+            network=node.get("network"),
+            geoid=node.get("geoid"),
+            on_route=True,
+        )
+        for node in via_raw
+        if node.get("number") is not None and node.get("lat") is not None
+    ]
+    return BikeLegResponse(
+        geometry=geometry,
+        distance_km=round(float(route["distance_m"]) / 1000, 2),
+        duration_min=max(1, round(float(route["duration_s"]) / 60)),
+        steps=[],
+        via_knooppunten=via,
+        suggestions=list(wish.get("suggestions") or []),
+        wish_summary=wish.get("wish_summary"),
+    )
 
 
 @app.post("/api/bike-leg", response_model=BikeLegResponse)

@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 Interest = Literal[
@@ -61,6 +61,8 @@ class PoiHit(BaseModel):
     interest: Interest
     on_route: bool = False
     hint: str | None = None
+    # "wish" = Extra wens (zoekveld); "profile" = profielsuggestie
+    source: str | None = None
 
 
 class PlanRequest(BaseModel):
@@ -115,6 +117,9 @@ class Stop(BaseModel):
     side: str | None = None
     matches_wish: bool = False
     on_route: bool = False
+    # "wish" = Extra wens (paars); "profile" = profiel (blauw)
+    hint: str | None = None
+    wish_source: str | None = None
 
 
 class Knooppunt(BaseModel):
@@ -262,6 +267,13 @@ class RerouteResponse(BaseModel):
     weather: WeatherInfo | None = None
 
 
+class BikeRouteRequest(BaseModel):
+    nodes: list[KnoopPick] = Field(min_length=2, max_length=40)
+    close_loop: bool = False
+    notes: str = Field(default="", max_length=500)
+    interests: list[Interest] = Field(default_factory=list)
+
+
 class BikeLegRequest(BaseModel):
     from_lat: float = Field(ge=49.0, le=52.0)
     from_lng: float = Field(ge=2.0, le=7.0)
@@ -284,6 +296,8 @@ class BikeLegResponse(BaseModel):
     duration_min: int
     steps: list[Step] = Field(default_factory=list)
     via_knooppunten: list[Knooppunt] = Field(default_factory=list)
+    suggestions: list[PoiHit] = Field(default_factory=list)
+    wish_summary: str | None = None
 
 
 class RoutePreviewRequest(BaseModel):
@@ -308,11 +322,70 @@ class RoutePreviewResponse(BaseModel):
     wish_summary: str | None = None
 
 
+class WishKnoop(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = ""
+    number: str = ""
+    lat: float
+    lng: float
+    network: str | None = None
+    on_route: bool = False
+    geoid: int | str | None = None
+
+    @field_validator("number", mode="before")
+    @classmethod
+    def _number_str(cls, value: Any) -> str:
+        return "" if value is None else str(value)
+
+    @field_validator("geoid", mode="before")
+    @classmethod
+    def _geoid_str(cls, value: Any) -> str | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list)):
+            return None
+        return str(value)
+
+
 class WishSuggestionsRequest(BaseModel):
     notes: str = Field(default="", max_length=500)
-    interests: list[Interest] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
     geometry: list[list[float]] = Field(default_factory=list)
-    nodes: list[Knooppunt] = Field(default_factory=list)
+    nodes: list[WishKnoop] = Field(default_factory=list)
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def _known_interests(cls, value: Any) -> list[str]:
+        allowed = {
+            "geschiedenis",
+            "natuur",
+            "landbouw",
+            "horeca",
+            "oorlog",
+            "architectuur",
+            "activiteiten",
+            "evenementen",
+        }
+        return [item for item in (value or []) if item in allowed]
+
+    @field_validator("geometry", mode="before")
+    @classmethod
+    def _clean_geometry(cls, value: Any) -> list[list[float]]:
+        out: list[list[float]] = []
+        for point in value or []:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                continue
+            try:
+                lat = float(point[0])
+                lng = float(point[1])
+            except (TypeError, ValueError):
+                continue
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                continue
+            out.append([lat, lng])
+            if len(out) >= 80:
+                break
+        return out
 
 
 class WishSuggestionsResponse(BaseModel):

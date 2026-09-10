@@ -12,7 +12,7 @@ function placeFromNode(node, fallbackLabel = "Startknooppunt") {
   };
 }
 
-function sampleGeometry(geometry, maxPoints = 4000) {
+export function samplePlanGeometry(geometry, maxPoints = 4000) {
   if (!geometry?.length) return [];
   if (geometry.length <= maxPoints) return geometry.map((pt) => [Number(pt[0]), Number(pt[1])]);
   const out = [];
@@ -22,6 +22,66 @@ function sampleGeometry(geometry, maxPoints = 4000) {
     out.push([Number(pt[0]), Number(pt[1])]);
   }
   return out;
+}
+
+export function stopsFromWishPois(wishSuggestions, notes = "", interests = ["geschiedenis"], poiPicks = []) {
+  const pickedIds = new Set((poiPicks || []).map((poi) => String(poi.id)));
+  const mergedPois = [];
+  const seen = new Set();
+  for (const poi of wishSuggestions || []) {
+    if (!poi || !Number.isFinite(Number(poi.lat)) || !Number.isFinite(Number(poi.lng))) continue;
+    const id = String(poi.id || `${poi.name}|${poi.lat}|${poi.lng}`);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    mergedPois.push(poi);
+  }
+  return mergedPois.slice(0, 16).map((poi, index) => {
+    const id = String(poi.id || `wish-${index}`);
+    const picked = pickedIds.has(id);
+    const wishSource =
+      poi.wish_source === "wish" ||
+      poi.wish_source === "profile"
+        ? poi.wish_source
+        : poi.source === "wish" || poi.hint === "past bij je wens"
+          ? "wish"
+          : poi.source === "profile" || poi.hint === "uit je profiel"
+            ? "profile"
+            : notes?.trim()
+              ? "wish"
+              : "profile";
+    return {
+      id,
+      name: poi.name || "Plek",
+      lat: Number(poi.lat),
+      lng: Number(poi.lng),
+      kind: poi.kind_label || poi.kind || "plek",
+      interest: poi.interest || interests[0] || "geschiedenis",
+      source: wishSource,
+      wish_source: wishSource,
+      hint:
+        poi.hint ||
+        (wishSource === "wish" ? "past bij je wens" : "uit je profiel"),
+      summary: poi.hint || (picked ? "Gekozen langs je route." : "Suggestie langs je route."),
+      approaching: `Je nadert ${poi.name || "deze plek"}.`,
+      arrived: `Je bent bij ${poi.name || "deze plek"}.`,
+      why: notes?.trim()
+        ? `Past bij je wens: ${notes.trim()}`
+        : wishSource === "profile"
+          ? "Past bij je profiel."
+          : "Suggestie langs je knooppuntenroute.",
+      wikipedia_url: null,
+      image_url: null,
+      wikipedia: null,
+      wikidata: null,
+      description: "",
+      place_name: null,
+      population: null,
+      local_fact: null,
+      side: null,
+      matches_wish: true,
+      on_route: Boolean(picked || poi.on_route),
+    };
+  });
 }
 
 export function buildManualPlanFromDraft({
@@ -39,7 +99,7 @@ export function buildManualPlanFromDraft({
   const chain = (knooppunten || []).filter(
     (node) => node && Number.isFinite(node.lat) && Number.isFinite(node.lng) && node.number != null,
   );
-  const geom = sampleGeometry(geometry);
+  const geom = samplePlanGeometry(geometry);
   if (chain.length < 1 || geom.length < 2) {
     throw new Error("Nog geen magenta route. Kies knooppunten en wacht tot de lijn verschijnt.");
   }
@@ -62,7 +122,6 @@ export function buildManualPlanFromDraft({
     geoid: node.geoid ?? null,
   }));
 
-  const pickedIds = new Set((poiPicks || []).map((poi) => String(poi.id)));
   const mergedPois = [];
   const seen = new Set();
   for (const poi of [...(poiPicks || []), ...(wishSuggestions || [])]) {
@@ -73,38 +132,7 @@ export function buildManualPlanFromDraft({
     mergedPois.push(poi);
   }
 
-  const stops = mergedPois.slice(0, 16).map((poi, index) => {
-    const id = String(poi.id || `wish-${index}`);
-    const picked = pickedIds.has(id);
-    return {
-      id,
-      name: poi.name || "Plek",
-      lat: Number(poi.lat),
-      lng: Number(poi.lng),
-      kind: poi.kind_label || poi.kind || "plek",
-      interest: poi.interest || interests[0] || "geschiedenis",
-      source: "OpenStreetMap",
-      summary: poi.hint || (picked ? "Gekozen langs je route." : "Suggestie langs je route."),
-      approaching: `Je nadert ${poi.name || "deze plek"}.`,
-      arrived: `Je bent bij ${poi.name || "deze plek"}.`,
-      why: notes?.trim()
-        ? `Past bij je wens: ${notes.trim()}`
-        : poi.hint === "uit je profiel"
-          ? "Past bij je profiel."
-          : "Suggestie langs je knooppuntenroute.",
-      wikipedia_url: null,
-      image_url: null,
-      wikipedia: null,
-      wikidata: null,
-      description: "",
-      place_name: null,
-      population: null,
-      local_fact: null,
-      side: null,
-      matches_wish: true,
-      on_route: Boolean(picked || poi.on_route),
-    };
-  });
+  const stops = stopsFromWishPois(mergedPois, notes, interests, poiPicks);
 
   return {
     title: label ? `Knooppuntenroute ${label}` : "Jouw knooppuntenroute",

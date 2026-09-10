@@ -12,6 +12,49 @@ BELGIUM = {"min_lng": 2.3, "min_lat": 49.45, "max_lng": 6.45, "max_lat": 51.55}
 COORD_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
+# Offline vangnet als Open-Meteo/Photon niet antwoorden.
+LOCAL_PLACES: list[tuple[str, float, float]] = [
+    ("Aalst", 50.9372, 4.0403),
+    ("Antwerpen", 51.2194, 4.4025),
+    ("Brugge", 51.2093, 3.2247),
+    ("Brussel", 50.8503, 4.3517),
+    ("Gent", 51.0543, 3.7174),
+    ("Hasselt", 50.9307, 5.3325),
+    ("Ieper", 50.8510, 2.8856),
+    ("Knokke-Heist", 51.3460, 3.2877),
+    ("Kortrijk", 50.8279, 3.2649),
+    ("Leuven", 50.8798, 4.7005),
+    ("Lier", 51.1311, 4.5697),
+    ("Lokeren", 51.1036, 3.9934),
+    ("Mechelen", 51.0259, 4.4776),
+    ("Oostende", 51.2300, 2.9167),
+    ("Roeselare", 50.9445, 3.1229),
+    ("Sint-Niklaas", 51.1651, 4.1437),
+    ("Tongeren", 50.7805, 5.4648),
+    ("Turnhout", 51.3227, 4.9495),
+]
+
+
+def _local_search(query: str, limit: int = 5) -> list[dict]:
+    needle = query.strip().lower()
+    if len(needle) < 2:
+        return []
+    rows: list[dict] = []
+    for name, lat, lng in LOCAL_PLACES:
+        if needle not in name.lower() and not name.lower().startswith(needle):
+            continue
+        rows.append(
+            {
+                "lat": lat,
+                "lon": lng,
+                "display_name": f"{name}, België",
+                "importance": 0.85 if name.lower().startswith(needle) else 0.7,
+                "place_rank": 16,
+            }
+        )
+    rows.sort(key=lambda row: -float(row["importance"]))
+    return rows[:limit]
+
 
 def in_belgium(lat: float, lng: float) -> bool:
     return (
@@ -97,19 +140,16 @@ async def _open_meteo_search(query: str, limit: int = 5) -> list[dict]:
 
 
 async def _search_rows(query: str, limit: int = 5) -> list[dict]:
-    # 1) Open-Meteo eerst (snel & betrouwbaar)
     rows = await _open_meteo_search(query, limit=limit)
     if rows:
         return rows
-
-    # 2) Photon met korte timeout (Nominatim vermijden: kan de globale lock vastzetten)
     try:
         rows = await asyncio.wait_for(photon.search(query, limit=limit), timeout=3.0)
         if rows:
             return rows
     except Exception:
         pass
-    return []
+    return _local_search(query, limit=limit)
 
 
 async def geocode(query: str, limit: int = 5) -> list[GeocodeHit]:

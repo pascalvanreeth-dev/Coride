@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
 import { askAbout, fetchStopSummary, fetchSurroundings, fetchWishSuggestions, reroute } from "../api.js";
+import { samplePlanGeometry, stopsFromWishPois } from "../manualPlan.js";
 import {
   bearingDeg,
   compassLabel,
@@ -29,7 +30,7 @@ import {
   uniqueChainIds,
   userPickedRouteIndexes,
 } from "../geo.js";
-import { nodeIcon, wishPoiSvg, wishPoiIcon } from "../icons.js";
+import { nodeIcon, wishPoiSvg, wishPoiIcon, isWishSearchPoi, wishOriginClass } from "../icons.js";
 import { useDebounced } from "../hooks.js";
 import { interestLabels } from "../profile.js";
 import FocusPulse from "./FocusPulse.jsx";
@@ -58,50 +59,6 @@ const bikeIcon = L.divIcon({
   iconSize: [32, 32],
   iconAnchor: [16, 16],
 });
-
-function sampleGeometryForWish(geometry, maxPoints = 40) {
-  if (!geometry?.length) return [];
-  if (geometry.length <= maxPoints) return geometry.map((pt) => [Number(pt[0]), Number(pt[1])]);
-  const out = [];
-  const step = (geometry.length - 1) / (maxPoints - 1);
-  for (let i = 0; i < maxPoints; i += 1) {
-    const pt = geometry[Math.min(geometry.length - 1, Math.round(i * step))];
-    out.push([Number(pt[0]), Number(pt[1])]);
-  }
-  return out;
-}
-
-function wishItemsToStops(suggestions, notes = "", interests = []) {
-  return (suggestions || []).slice(0, 16).map((poi, index) => ({
-    id: String(poi.id || `wish-${index}`),
-    name: poi.name || "Plek",
-    lat: Number(poi.lat),
-    lng: Number(poi.lng),
-    kind: poi.kind_label || poi.kind || "plek",
-    kind_label: poi.kind_label || null,
-    interest: poi.interest || interests[0] || "geschiedenis",
-    source: "OpenStreetMap",
-    summary: poi.hint || "Suggestie langs je route.",
-    approaching: `Je nadert ${poi.name || "deze plek"}.`,
-    arrived: `Je bent bij ${poi.name || "deze plek"}.`,
-    why: notes?.trim()
-      ? `Past bij je wens: ${notes.trim()}`
-      : poi.hint === "uit je profiel"
-        ? "Past bij je profiel."
-        : "Suggestie langs je route.",
-    wikipedia_url: null,
-    image_url: null,
-    wikipedia: null,
-    wikidata: null,
-    description: "",
-    place_name: null,
-    population: null,
-    local_fact: null,
-    side: null,
-    matches_wish: true,
-    on_route: Boolean(poi.on_route),
-  }));
-}
 
 export default function Ride({ plan, onPlanChange, onBack }) {
   const [map, setMap] = useState(null);
@@ -144,11 +101,11 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [surroundings, setSurroundings] = useState(null);
   const [surroundingsBusy, setSurroundingsBusy] = useState(false);
   const [surroundingsError, setSurroundingsError] = useState("");
+  const [wishBusy, setWishBusy] = useState(false);
+  const [wishError, setWishError] = useState("");
+  const [wishRetryTick, setWishRetryTick] = useState(0);
   const [weatherOffer, setWeatherOffer] = useState(() => Boolean(plan.weather?.suggest_shorter));
   const [guideOpen, setGuideOpen] = useState(true);
-  const [wishLoadBusy, setWishLoadBusy] = useState(false);
-  const [wishLoadError, setWishLoadError] = useState("");
-  const wishLoadedForRef = useRef("");
   const guideOpenRef = useRef(true);
   guideOpenRef.current = guideOpen;
   const lastGps = useRef(null);
@@ -168,6 +125,102 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   surroundingsOnRef.current = surroundingsOn;
   modeRef.current = mode;
   planRef.current = plan;
+
+  const wishFetchStartedRef = useRef(false);
+  useEffect(() => {
+    wishFetchStartedRef.current = false;
+  }, [wishRetryTick]);
+
+  useEffect(() => {
+    if (wishFetchStartedRef.current) return;
+    const current = planRef.current;
+    const notes = (current.notes || "").trim();
+    const wishStopsNow = (current.stops || []).filter((stop) => stop.matches_wish);
+    // Planner/App had al tegels → klaar, geen lange herzoektocht.
+    if (wishStopsNow.length > 0) {
+      wishFetchStartedRef.current = true;
+      return undefined;
+    }
+
+    const nodes = (current.knooppunten || []).map((node) => ({
+      id: node.id || "",
+      number: String(node.number ?? ""),
+      lat: node.lat,
+      lng: node.lng,
+      network: node.network || null,
+    }));
+    const nodeGeom = nodes
+      .filter((node) => Number.isFinite(Number(node.lat)) && Number.isFinite(Number(node.lng)))
+      .map((node) => [Number(node.lat), Number(node.lng)]);
+    const geom =
+      nodeGeom.length >= 2 ? nodeGeom : samplePlanGeometry(current.geometry, 24);
+    if (geom.length < 2) {
+      wishFetchStartedRef.current = true;
+      setWishError("Geen routepunten om suggesties te zoeken.");
+      return undefined;
+    }
+
+    const interests = [...(current.interests || [])];
+    const needHoreca =
+      /caf[eéè]|taverne|tavern|herberg|koffie|pub|\bbar\b|brasserie|estaminet|bistro/i.test(notes);
+    if (needHoreca && !interests.includes("horeca")) interests.push("horeca");
+    if (!notes && !interests.length) {
+      wishFetchStartedRef.current = true;
+      return undefined;
+    }
+    if (!interests.length) interests.push("geschiedenis");
+
+    wishFetchStartedRef.current = true;
+    setWishBusy(true);
+    setWishError("");
+
+    const payload = { notes, interests, geometry: geom, nodes };
+
+    async function loadOnce(body, timeoutMs) {
+      const data = await fetchWishSuggestions(body, { timeoutMs });
+      return Array.isArray(data?.suggestions) ? data.suggestions : [];
+    }
+
+    async function tryLoad(body, timeoutMs) {
+      try {
+        return await loadOnce(body, timeoutMs);
+      } catch {
+        return null;
+      }
+    }
+
+    function applyItems(items) {
+      const extra = stopsFromWishPois(items, notes, interests);
+      if (!extra.length) return false;
+      const latest = planRef.current;
+      const kept = (latest.stops || []).filter((stop) => !stop.matches_wish);
+      onPlanChange({ ...latest, stops: [...extra, ...kept] });
+      if (extra[0]) setActiveId((id) => id || extra[0].id);
+      setWishError("");
+      return true;
+    }
+
+    (async () => {
+      try {
+        // Server cap ~14s; client iets ruimer. Eén fallback op profiel — geen 45s-ketting.
+        let items = notes ? await tryLoad(payload, 16_000) : null;
+        if (!items?.length) {
+          items = await tryLoad({ notes: "", interests, geometry: geom, nodes }, 12_000);
+        }
+        if (!items?.length) {
+          setWishError("Suggesties laden lukte niet. Tik om opnieuw te proberen.");
+          return;
+        }
+        if (!applyItems(items)) {
+          setWishError("Geen plekken gevonden langs deze route.");
+        }
+      } finally {
+        setWishBusy(false);
+      }
+    })();
+
+    return undefined;
+  }, [onPlanChange, wishRetryTick]);
 
   const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
   const suggestionStops = useMemo(() => {
@@ -376,55 +429,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   useEffect(() => {
     guideSpeak(plan.intro);
   }, [plan.intro]);
-
-  // Als de plan-response geen wensstops heeft: alsnog ophalen (profiel + eventuele notes).
-  useEffect(() => {
-    const hasWish = (plan.stops || []).some((stop) => stop.matches_wish);
-    const notes = plan.notes || "";
-    const interests = plan.interests || [];
-    const key = `${plan.distance_km || 0}|${notes}|${(interests || []).join(",")}|${plan.geometry?.length || 0}`;
-    if (hasWish || !(notes.trim() || interests.length) || !(plan.geometry?.length > 1)) {
-      wishLoadedForRef.current = hasWish ? key : "";
-      setWishLoadBusy(false);
-      setWishLoadError("");
-      return undefined;
-    }
-    if (wishLoadedForRef.current === key) return undefined;
-    let cancelled = false;
-    wishLoadedForRef.current = key;
-    setWishLoadBusy(true);
-    setWishLoadError("");
-    fetchWishSuggestions({
-      notes,
-      interests,
-      geometry: sampleGeometryForWish(plan.geometry, 48),
-      nodes: plan.knooppunten || [],
-    })
-      .then((data) => {
-        if (cancelled) return;
-        const wishStops = wishItemsToStops(data?.suggestions, notes, interests);
-        if (!wishStops.length) {
-          setWishLoadError("Geen passende plekken gevonden voor je wens of profiel.");
-          return;
-        }
-        onPlanChange({
-          ...plan,
-          stops: [...wishStops, ...(plan.stops || []).filter((stop) => !stop.matches_wish)],
-        });
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          wishLoadedForRef.current = "";
-          setWishLoadError(err?.message || "Wenssuggesties konden niet geladen worden.");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setWishLoadBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [plan, onPlanChange]);
 
   useEffect(() => {
     setGuideExpanded(false);
@@ -1175,6 +1179,95 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               ? "Demo: de fiets rijdt de route af met navigatie en uitleg."
               : "Start route voor GPS-begeleiding. De blauwe punt is jouw locatie."}
         </p>
+        {(suggestionStops.length > 0 || wishBusy || wishError || plan.notes?.trim() || (plan.interests || []).length > 0) && (
+          <div className="poi-suggest-section">
+            <strong>Suggesties</strong>
+            {wishBusy ? (
+              <p className="sources" style={{ margin: "6px 0 10px" }}>
+                Plekken voor je wens worden gezocht…
+              </p>
+            ) : wishError && suggestionStops.length === 0 ? (
+              <button
+                type="button"
+                className="error"
+                style={{
+                  margin: "6px 0 10px",
+                  display: "block",
+                  width: "100%",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  font: "inherit",
+                }}
+                onClick={() => {
+                  setWishError("");
+                  setWishRetryTick((tick) => tick + 1);
+                }}
+              >
+                {wishError}
+              </button>
+            ) : plan.notes?.trim() ? (
+              <p className="sources" style={{ margin: "6px 0 10px" }}>
+                Op basis van je wens: {plan.notes.trim()}
+              </p>
+            ) : suggestionStops.length > 0 ? (
+              <p className="sources" style={{ margin: "6px 0 10px" }}>
+                Op basis van je profiel.
+              </p>
+            ) : null}
+            {suggestionStops.length > 0 ? (
+            <div className="stop-list">
+              {suggestionStops.map((stop, index) => (
+                <button
+                  key={stop.id}
+                  type="button"
+                  className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""} ${stop.matches_wish ? `wish ${wishOriginClass(stop)}` : ""} ${stop.matches_wish && !stop.on_route ? "wish-off-route" : ""}`}
+                  onClick={() => openStopSuggestion(stop)}
+                >
+                  {stop.matches_wish ? (
+                    <span
+                      className={`num wish-num ${wishOriginClass(stop)}`}
+                      aria-hidden="true"
+                      dangerouslySetInnerHTML={{
+                        __html: wishPoiSvg(
+                          stop.interest,
+                          stop.kind_label || stop.kind,
+                          stop.name,
+                          16,
+                        ),
+                      }}
+                    />
+                  ) : (
+                    <span className="num" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                  )}
+                  <span>
+                    <strong>{stop.name}</strong>
+                    <br />
+                    <small>
+                      {isWishSearchPoi(stop)
+                        ? "Wens · "
+                        : stop.matches_wish
+                          ? "Profielsuggestie · "
+                          : ""}
+                      {interestLabels([stop.interest])[0] || stop.interest} · {stop.kind}
+                    </small>
+                  </span>
+                </button>
+              ))}
+            </div>
+            ) : !wishBusy && !wishError ? (
+              <p className="sources" style={{ margin: "6px 0 0" }}>
+                Suggesties verschijnen hier en op de kaart.
+              </p>
+            ) : null}
+          </div>
+        )}
+        {plan.notes?.trim() && wishStops.some((stop) => stop.on_route) && suggestionStops.length === 0 && (
+          <p className="sources" style={{ margin: "0 0 12px" }}>
+            Je wens ligt op de route — zie het pictogram op de kaart.
+          </p>
+        )}
         {plan.interaction !== "passief" && surroundingsOn && (
           <div className="context-card surroundings-card">
             <div className="kicker">Omgeving · 350 m</div>
@@ -1252,69 +1345,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
           )}
         </div>
         {rerouteError && <div className="error">{rerouteError}</div>}
-        {wishLoadBusy && (
-          <p className="sources" style={{ margin: "0 0 12px" }}>
-            Suggesties voor je wens/profiel worden geladen…
-          </p>
-        )}
-        {!wishLoadBusy && wishLoadError && (
-          <p className="sources" style={{ margin: "0 0 12px" }}>
-            {wishLoadError}
-          </p>
-        )}
-        {suggestionStops.length > 0 && (
-          <div className="poi-suggest-section">
-            <strong>Suggesties</strong>
-            {plan.notes?.trim() ? (
-              <p className="sources" style={{ margin: "6px 0 10px" }}>
-                Op basis van je wens: {plan.notes.trim()}
-              </p>
-            ) : null}
-            <div className="stop-list">
-              {suggestionStops.map((stop, index) => (
-                <button
-                  key={stop.id}
-                  type="button"
-                  className={`stop ${stop.id === activeId ? "active" : ""} ${routePoiIds.includes(stop.id) ? "on-route" : ""} ${stop.matches_wish ? "wish" : ""} ${stop.matches_wish && !stop.on_route ? "wish-off-route" : ""}`}
-                  onClick={() => openStopSuggestion(stop)}
-                >
-                  {stop.matches_wish ? (
-                    <span
-                      className="num wish-num"
-                      aria-hidden="true"
-                      dangerouslySetInnerHTML={{
-                        __html: wishPoiSvg(
-                          stop.interest,
-                          stop.kind_label || stop.kind,
-                          stop.name,
-                          16,
-                        ),
-                      }}
-                    />
-                  ) : (
-                    <span className="num" aria-hidden="true">
-                      {index + 1}
-                    </span>
-                  )}
-                  <span>
-                    <strong>{stop.name}</strong>
-                    <br />
-                    <small>
-                      {stop.matches_wish ? "Suggestie voor je wens · " : ""}
-                      {interestLabels([stop.interest])[0] || stop.interest} · {stop.kind}
-                      {stop.source ? ` · ${stop.source}` : ""}
-                    </small>
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-        {plan.notes?.trim() && wishStops.some((stop) => stop.on_route) && suggestionStops.length === 0 && (
-          <p className="sources" style={{ margin: "0 0 12px" }}>
-            Je wens ligt op de route — zie het pictogram op de kaart.
-          </p>
-        )}
         {plan.interaction !== "passief" && (
           <form className="ask" onSubmit={submitQuestion}>
             <strong>Live vraag aan de gids</strong>
@@ -1391,6 +1421,8 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                 kind: stop.kind_label || stop.kind,
                 name: stop.name,
                 selected: Boolean(stop.on_route) || routePoiIds.includes(stop.id),
+                source: stop.wish_source || stop.source,
+                hint: stop.hint,
               })}
               zIndexOffset={1500}
               eventHandlers={{
@@ -1403,7 +1435,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               <Popup>
                 <strong>{stop.name}</strong>
                 <p style={{ margin: "6px 0 0" }}>
-                  Past bij je wens
+                  {isWishSearchPoi(stop) ? "Past bij je wens" : "Past bij je profiel"}
                   {stop.on_route || routePoiIds.includes(stop.id) ? " · op je route" : ""}
                   {stop.kind_label || stop.kind ? ` · ${stop.kind_label || stop.kind}` : ""}
                 </p>
