@@ -1,3 +1,5 @@
+import { fetchWishSuggestionsLocal, filterPoisNearRoute, WISH_ROUTE_CORRIDOR_M } from "./wishLocal.js";
+
 export async function geocode(q) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
@@ -137,9 +139,35 @@ export async function fetchRoutePreview(payload) {
   return data;
 }
 
-export async function fetchWishSuggestions(payload, { timeoutMs = 16_000 } = {}) {
+export async function fetchWishSuggestions(payload, { timeoutMs = 8_000, signal } = {}) {
+  // 1) Photon via Vite-proxy — snelle tegels, max. 2 km van de route.
+  try {
+    const local = await fetchWishSuggestionsLocal(payload, {
+      timeoutMs: Math.min(4000, timeoutMs),
+      maxDistanceM: WISH_ROUTE_CORRIDOR_M,
+    });
+    if (Array.isArray(local?.suggestions) && local.suggestions.length > 0) {
+      return local;
+    }
+  } catch {
+    /* val terug op backend */
+  }
+
+  // 2) Backend-fallback, daarna zelfde 2 km-corridorfilter.
+  const backendMs = Math.min(4000, timeoutMs);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), backendMs);
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) {
+      clearTimeout(timer);
+      const cancelled = new Error("cancelled");
+      cancelled.name = "AbortError";
+      cancelled.code = "WISH_CANCELLED";
+      throw cancelled;
+    }
+    signal.addEventListener("abort", onExternalAbort, { once: true });
+  }
   try {
     const response = await apiFetch("/api/wish-suggestions", {
       method: "POST",
@@ -151,14 +179,34 @@ export async function fetchWishSuggestions(payload, { timeoutMs = 16_000 } = {})
     if (!response.ok) {
       throw new Error(formatApiError(data.detail, "Wenssuggesties konden niet geladen worden."));
     }
-    return data;
+    const filtered = filterPoisNearRoute(
+      data?.suggestions || [],
+      payload.geometry,
+      payload.nodes,
+      WISH_ROUTE_CORRIDOR_M,
+    );
+    return {
+      ...data,
+      suggestions: filtered,
+      wish_summary:
+        filtered.length > 0
+          ? data?.wish_summary || "Plekken binnen 2 km van je knooppuntenroute."
+          : data?.wish_summary || null,
+    };
   } catch (err) {
     if (isAbortError(err)) {
-      throw new Error("Zoeken naar plekken duurde te lang.");
+      if (signal?.aborted || err?.code === "WISH_CANCELLED") {
+        const cancelled = new Error("cancelled");
+        cancelled.name = "AbortError";
+        cancelled.code = "WISH_CANCELLED";
+        throw cancelled;
+      }
+      return { suggestions: [], wish_summary: null, timed_out: true };
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onExternalAbort);
   }
 }
 
@@ -173,6 +221,23 @@ export async function fetchRouteSuggestions(lat, lng, interests = [], used = [])
   const data = await response.json().catch(() => []);
   if (!response.ok) {
     throw new Error(data.detail || "Route Top 10 kon niet geladen worden.");
+  }
+  return data;
+}
+
+export async function fetchIcoonrouteStretch(routeId, lat, lng, targetKm = 50) {
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    target_km: String(targetKm),
+  });
+  const response = await apiFetch(`/api/icoonroute/${encodeURIComponent(routeId)}?${params}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      (typeof data.detail === "string" && data.detail) ||
+        "Icoonroute kon niet geladen worden.",
+    );
   }
   return data;
 }

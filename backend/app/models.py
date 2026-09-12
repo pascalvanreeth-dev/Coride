@@ -399,6 +399,13 @@ class GeocodeHit(BaseModel):
     lng: float
 
 
+class RouteSuggestionLocality(BaseModel):
+    name: str
+    lat: float
+    lng: float
+    fact: str = ""
+
+
 class RouteSuggestion(BaseModel):
     rank: int = 0
     id: str
@@ -413,8 +420,28 @@ class RouteSuggestion(BaseModel):
     distance_km: int = Field(ge=8, le=90)
     interests: list[Interest] = Field(default_factory=list)
     municipalities: list[str] = Field(default_factory=list)
+    localities: list[RouteSuggestionLocality] = Field(default_factory=list)
     match_score: int = 0
     notes: str = ""
     distance_from_you_km: float | None = None
     used_before: bool = False
     swapped_from: str | None = None
+    source: str | None = None
+
+
+class IcoonrouteStretch(BaseModel):
+    id: str
+    title: str
+    highlight: str = ""
+    start: str = ""
+    start_label: str = ""
+    lat: float
+    lng: float
+    mode: RouteMode = "punt"
+    distance_km: float = Field(ge=1, le=120)
+    interests: list[Interest] = Field(default_factory=list)
+    notes: str = ""
+    knooppunten: list[Knooppunt] = Field(default_factory=list)
+    geometry: list[list[float]] = Field(default_factory=list)
+    legs: list[dict[str, Any]] = Field(default_factory=list)
+    source: str = "Toerisme Vlaanderen icoonroutes"

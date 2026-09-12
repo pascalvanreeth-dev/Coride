@@ -57,7 +57,7 @@ def _wish_poi_cache_key(
     knoop = "|".join(
         str(n.get("geoid") or n.get("number") or "") for n in (chain or [])[:4]
     )
-    return f"{round(float(mid[0]), 2)}:{round(float(mid[1]), 2)}|{interests}|{note}|{knoop}"
+    return f"v3|{round(float(mid[0]), 2)}:{round(float(mid[1]), 2)}|{interests}|{note}|{knoop}"
 
 
 def _place_from_knoop(node: dict[str, Any]) -> Place:
@@ -330,7 +330,11 @@ async def _osrm_route_along_chain(
 
 
 async def plan_route(request: PlanRequest) -> RoutePlan:
-    catalog_route = suggestion_service.get_route_by_id(request.suggestion_id) if request.suggestion_id else None
+    catalog_route = (
+        await suggestion_service.get_route_by_id(request.suggestion_id)
+        if request.suggestion_id
+        else None
+    )
     if catalog_route:
         request.interests = suggestion_service.merge_interests(catalog_route, request.interests)
         request.notes = suggestion_service.merge_notes(catalog_route, request.notes)
@@ -866,26 +870,28 @@ async def wish_suggestions_along_route(
     except Exception:
         wish_pois, wish_summary = [], None
     if not wish_pois and chain:
-        # Noodpad: Photon rond de knooppunten — nooit stil leeg als er knopen zijn.
+        # Noodpad: alleen Nominatim (kort) — geen Wikipedia (DNS-hang).
         try:
-            pts = [(float(n["lat"]), float(n["lng"])) for n in chain[:4]]
-            cafe = await pois_service.fetch_horeca_photon_along_points(
-                pts,
-                max_points=min(4, len(pts)),
-                per_point=8,
-                queries=("café", "taverne"),
-                osm_tags=("amenity:cafe", "amenity:pub"),
-            )
-            wiki = await _optional(
-                wikipedia.places_for_route(pts[0][0], pts[0][1], 8000, pts[-1] if len(pts) > 1 else None),
+            pts = [(float(n["lat"]), float(n["lng"])) for n in chain[:3]]
+            cafe = await _optional(
+                pois_service.fetch_horeca_nominatim_along_points(pts, max_points=2, per_point=6),
                 [],
-                5,
+                3.0,
             )
-            for poi in wiki or []:
-                if profile_interests:
-                    poi["interest"] = profile_interests[0]
-                    poi["hint"] = poi.get("hint") or "uit je profiel"
-            wish_pois = _merge(cafe or [], wiki or [])
+            themes = list(profile_interests or [])[:3] or ["geschiedenis"]
+            themed = await _optional(
+                pois_service.fetch_theme_nominatim_along_points(pts, themes, max_points=2, per_point=5),
+                [],
+                3.0,
+            )
+            for poi in cafe or []:
+                poi["interest"] = "horeca"
+                poi["hint"] = "past bij je wens" if (notes or "").strip() else "uit je profiel"
+                poi["source"] = "wish" if (notes or "").strip() else "profile"
+            for poi in themed or []:
+                poi["hint"] = poi.get("hint") or "uit je profiel"
+                poi["source"] = "profile"
+            wish_pois = _merge(cafe or [], themed or [])
             if wish_pois:
                 wish_summary = "Plekken langs je knooppunten (noodzoektocht)."
         except Exception:
@@ -1693,7 +1699,10 @@ async def _fast_wish_pois_for_manual(
     geometry: list[list[float]],
     profile_interests: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Suggesties voor knooproutes: snelle bronnen eerst, daarna profiel; met cache."""
+    """Snelle suggesties: Nominatim/Photon alleen, harde deadline, nooit Wikipedia-hang.
+
+    Eén golf (~3.5s). Liever 5 snelle hits dan 0 na 18s timeout.
+    """
     if not geometry or len(geometry) < 2:
         return [], ""
 
@@ -1709,76 +1718,79 @@ async def _fast_wish_pois_for_manual(
     ]
     wish_set = set(wish_interests)
     sample_points = _sample_route_points(geometry, 3)
-    for node in (chain or [])[:2]:
+    for node in (chain or [])[:3]:
         try:
             sample_points.append((float(node["lat"]), float(node["lng"])))
         except (KeyError, TypeError, ValueError):
             continue
+    uniq: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in sample_points:
+        key = (round(lat, 3), round(lng, 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        uniq.append((lat, lng))
+        if len(uniq) >= 3:
+            break
+    sample_points = uniq or sample_points[:3]
     want_horeca = pois_service.notes_want_horeca(notes, wish_interests)
-    start_pt = sample_points[0]
-    extra_pt = sample_points[-1] if len(sample_points) > 1 else None
     cafe_focus = want_horeca and bool((notes or "").strip())
-
-    fast_tasks: list[asyncio.Task] = []
-    slow_tasks: list[asyncio.Task] = []
-    if want_horeca:
-        fast_tasks.append(
-            asyncio.create_task(
-                _optional(pois_service.fetch_cafes_fast(sample_points, 7500), [], 3.5)
-            )
-        )
-        fast_tasks.append(
-            asyncio.create_task(
-                _optional(
-                    pois_service.fetch_horeca_photon_along_points(
-                        sample_points[:2],
-                        max_points=2,
-                        per_point=8,
-                        queries=("café", "taverne"),
-                        osm_tags=("amenity:cafe", "amenity:pub"),
-                    ),
-                    [],
-                    3.0,
-                )
-            )
-        )
     profile_themes = [item for item in profile_only if item != "horeca"] or (
         [] if cafe_focus else [item for item in wish_interests if item != "horeca"]
     )
     if not profile_themes and not cafe_focus:
         profile_themes = list(wish_interests)
-    if profile_themes:
-        slow_tasks.append(
+
+    tasks: list[asyncio.Task] = []
+    if cafe_focus or want_horeca:
+        tasks.append(
             asyncio.create_task(
                 _optional(
-                    pois_service.fetch_pois(
-                        start_pt[0],
-                        start_pt[1],
-                        6500,
-                        profile_themes,
-                        extra_pt,
+                    pois_service.fetch_horeca_photon_along_points(
+                        sample_points[:2],
+                        max_points=2,
+                        per_point=6,
+                        queries=("café", "taverne"),
+                        osm_tags=("amenity:cafe", "amenity:pub"),
                     ),
                     [],
-                    3.5,
+                    2.8,
                 )
             )
         )
-        slow_tasks.append(
+        tasks.append(
             asyncio.create_task(
                 _optional(
-                    wikipedia.places_for_route(start_pt[0], start_pt[1], 6000, extra_pt),
+                    pois_service.fetch_horeca_nominatim_along_points(
+                        sample_points[:2],
+                        max_points=2,
+                        per_point=6,
+                    ),
                     [],
-                    2.5,
+                    2.8,
+                )
+            )
+        )
+    if profile_themes:
+        tasks.append(
+            asyncio.create_task(
+                _optional(
+                    pois_service.fetch_theme_nominatim_along_points(
+                        sample_points[:2],
+                        profile_themes[:3],
+                        max_points=2,
+                        per_point=5,
+                    ),
+                    [],
+                    2.8,
                 )
             )
         )
 
     groups: list[list[dict[str, Any]]] = []
-
-    async def _drain(tasks: list[asyncio.Task], timeout: float) -> None:
-        if not tasks:
-            return
-        done, pending = await asyncio.wait(set(tasks), timeout=timeout)
+    if tasks:
+        done, pending = await asyncio.wait(set(tasks), timeout=3.2)
         for task in pending:
             task.cancel()
         for task in done:
@@ -1787,62 +1799,9 @@ async def _fast_wish_pois_for_manual(
             except Exception:
                 groups.append([])
 
-    # Horeca/wens én profiel parallel — kort genoeg om onder de API-timeout te blijven.
-    await asyncio.gather(
-        _drain(fast_tasks, 4.0),
-        _drain(slow_tasks, 4.0),
-    )
-
     merged: list[dict[str, Any]] = []
     for group in groups:
         merged = _merge(merged, group or [])
-
-    # Café-wens zonder horeca-hits: één snelle Photon-poging (geen tweede lange golf).
-    if cafe_focus:
-        has_cafe = any(
-            "cafe" in f"{p.get('kind', '')} {p.get('kind_label', '')} {p.get('name', '')}".lower()
-            or "café" in f"{p.get('name', '')}".lower()
-            or "taverne" in f"{p.get('name', '')}".lower()
-            or p.get("interest") == "horeca"
-            for p in merged
-            if "kerk" not in f"{p.get('name', '')} {p.get('kind', '')}".lower()
-        )
-        if not has_cafe:
-            cafe_retry = await _optional(
-                pois_service.fetch_horeca_photon_along_points(
-                    sample_points[:3],
-                    max_points=3,
-                    per_point=10,
-                    queries=("café", "cafe", "taverne", "pub"),
-                    osm_tags=("amenity:cafe", "amenity:pub", "amenity:bar"),
-                ),
-                [],
-                3.0,
-            )
-            for poi in cafe_retry or []:
-                poi["interest"] = "horeca"
-                poi["hint"] = "past bij je wens"
-            merged = _merge(cafe_retry or [], merged)
-
-    if not merged:
-        wiki_extra = await _optional(
-            wikipedia.places_for_route(start_pt[0], start_pt[1], 8000, extra_pt),
-            [],
-            2.0,
-        )
-        merged = _merge(merged, wiki_extra or [])
-    elif cafe_focus and profile_themes and len(merged) < 3:
-        has_profile_hit = any(
-            (p.get("hint") == "uit je profiel") or (p.get("interest") in set(profile_themes))
-            for p in merged
-        )
-        if not has_profile_hit:
-            wiki_extra = await _optional(
-                wikipedia.places_for_route(start_pt[0], start_pt[1], 8000, extra_pt),
-                [],
-                1.5,
-            )
-            merged = _merge(merged, wiki_extra or [])
 
     for poi in merged:
         inferred = pois_service.infer_interest(poi, wish_interests)
@@ -1850,18 +1809,18 @@ async def _fast_wish_pois_for_manual(
             poi["interest"] = inferred
         elif not poi.get("interest"):
             poi["interest"] = profile_only[0] if profile_only else wish_interests[0]
-        if cafe_focus and pois_service.matches_notes(poi, notes):
-            poi["interest"] = poi.get("interest") or "horeca"
-            poi.pop("hint", None)
-        elif profile_only and (
-            poi.get("interest") in set(profile_only)
-            or (poi.get("source") or "").lower().startswith("wikipedia")
-            or not pois_service.matches_notes(poi, notes)
+        if cafe_focus and (
+            poi.get("interest") == "horeca" or pois_service.matches_notes(poi, notes)
         ):
-            if not pois_service.matches_notes(poi, notes):
-                if poi.get("interest") not in set(profile_only) and profile_only:
-                    poi["interest"] = profile_only[0]
-                poi["hint"] = poi.get("hint") or "uit je profiel"
+            poi["interest"] = "horeca"
+            poi["hint"] = "past bij je wens"
+            poi["source"] = "wish"
+        elif profile_themes and poi.get("interest") in set(profile_themes):
+            poi["hint"] = poi.get("hint") or "uit je profiel"
+            poi["source"] = "profile"
+        elif profile_only and not cafe_focus:
+            poi["hint"] = poi.get("hint") or "uit je profiel"
+            poi["source"] = "profile"
 
     kept: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1871,31 +1830,32 @@ async def _fast_wish_pois_for_manual(
             if profile_only:
                 poi["interest"] = profile_only[0]
                 poi["hint"] = poi.get("hint") or "uit je profiel"
-                interest = poi["interest"]
+                poi["source"] = "profile"
             else:
                 continue
         key = str(poi.get("id") or "") or unique_key(poi.get("name") or "", poi["lat"], poi["lng"])
         if key in seen:
             continue
         if not (
-            _on_route_geometry(poi, geometry, max_m=12000)
-            or any(haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < 8000 for n in chain)
+            _on_route_geometry(poi, geometry, max_m=14000)
+            or any(haversine_m(poi["lat"], poi["lng"], n["lat"], n["lng"]) < 9000 for n in chain)
         ):
             continue
         seen.add(key)
         tagged = dict(poi)
-        tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=3500)
+        tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=4000)
         kept.append(tagged)
 
     if not kept and merged:
-        for poi in merged:
+        for poi in merged[:16]:
             key = str(poi.get("id") or "") or unique_key(poi.get("name") or "", poi["lat"], poi["lng"])
             if key in seen:
                 continue
             seen.add(key)
             tagged = dict(poi)
-            tagged["on_route"] = _on_route_geometry(poi, geometry, max_m=3500)
+            tagged["on_route"] = False
             tagged["hint"] = poi.get("hint") or "in de buurt"
+            tagged["source"] = tagged.get("source") or ("wish" if cafe_focus else "profile")
             kept.append(tagged)
 
     def _looks_like_horeca(poi: dict[str, Any]) -> bool:
@@ -1919,61 +1879,67 @@ async def _fast_wish_pois_for_manual(
             item["hint"] = "past bij je wens"
             item["source"] = "wish"
             wish_hits.append(item)
-        elif (
-            (notes or "").strip()
-            and pois_service.matches_notes(item, notes)
-            and not any(
-                bad in f"{item.get('kind', '')} {item.get('kind_label', '')} {item.get('name', '')}".lower()
-                for bad in ("kerk", "church", "begraaf", "kapel", "museum", "station")
-            )
+        elif item.get("source") == "wish" or (
+            (notes or "").strip() and pois_service.matches_notes(item, notes)
         ):
             item["hint"] = item.get("hint") or "past bij je wens"
             item["source"] = "wish"
             wish_hits.append(item)
-        elif item.get("hint") == "uit je profiel" or (
-            profile_only and item.get("interest") in set(profile_only) and not _looks_like_horeca(item)
+        elif item.get("source") == "profile" or item.get("hint") == "uit je profiel" or (
+            profile_only and item.get("interest") in set(profile_only)
         ):
-            if profile_only and item.get("interest") not in set(profile_only):
-                item["interest"] = profile_only[0]
             item["hint"] = item.get("hint") or "uit je profiel"
             item["source"] = "profile"
             profile_hits.append(item)
         else:
-            if (notes or "").strip():
-                item["source"] = item.get("source") or "wish"
-                item["hint"] = item.get("hint") or "past bij je wens"
-            else:
-                item["source"] = "profile"
-                item["hint"] = item.get("hint") or "uit je profiel"
+            item["source"] = "profile" if not (notes or "").strip() else item.get("source") or "wish"
+            item["hint"] = item.get("hint") or (
+                "uit je profiel" if item["source"] == "profile" else "past bij je wens"
+            )
             other_hits.append(item)
-    ordered = [*wish_hits, *profile_hits, *other_hits]
-    diverse = pois_service.pick_diverse_pois(
-        ordered,
-        wish_interests,
-        wanted=min(16, max(10, len(wish_interests) * 3)),
-        min_distance_m=180 if cafe_focus else 350,
-    )
-    if not diverse and ordered:
-        diverse = ordered[:16]
-    if not diverse and kept:
-        diverse = kept[:16]
+
+    if cafe_focus and (wish_hits or profile_hits):
+        wish_pick = wish_hits[:8]
+        profile_pick = profile_hits[:8]
+        seen_ids = {str(p.get("id") or "") for p in wish_pick}
+        diverse = list(wish_pick)
+        for poi in profile_pick:
+            pid = str(poi.get("id") or "")
+            if pid and pid in seen_ids:
+                continue
+            diverse.append(poi)
+            if pid:
+                seen_ids.add(pid)
+        for poi in other_hits:
+            if len(diverse) >= 14:
+                break
+            pid = str(poi.get("id") or "")
+            if pid and pid in seen_ids:
+                continue
+            diverse.append(poi)
+            if pid:
+                seen_ids.add(pid)
+    else:
+        ordered = [*wish_hits, *profile_hits, *other_hits]
+        diverse = pois_service.pick_diverse_pois(
+            ordered,
+            wish_interests,
+            wanted=min(14, max(8, len(wish_interests) * 3)),
+            min_distance_m=250,
+        ) or ordered[:14]
+
     labels = [
         suggestion_service.INTEREST_LABELS.get(item, item)
         for item in (profile_only or wish_interests)[:4]
     ]
-    summary = ""
-    if cafe_focus and (wish_hits and profile_hits):
-        summary = "Plekken langs je route op basis van je extra wens én je profiel."
-    elif cafe_focus and labels:
+    if cafe_focus and wish_hits and profile_hits:
         summary = "Plekken langs je route op basis van je extra wens én je profiel."
     elif cafe_focus:
-        summary = "Cafés, tavernes en profielsuggesties langs je knooppunten."
-    elif labels and not (notes or "").strip():
-        summary = f"Plekken langs je route op basis van je profiel: {', '.join(labels)}."
+        summary = "Cafés/tavernes en profielsuggesties langs je knooppunten."
     elif labels:
-        summary = "Plekken langs je route op basis van je extra wens én je profiel."
-    if cafe_focus and profile_hits and wish_hits:
-        summary = "Plekken langs je route op basis van je extra wens én je profiel."
+        summary = f"Plekken langs je route op basis van je profiel: {', '.join(labels)}."
+    else:
+        summary = "Plekken langs je knooppunten."
 
     _WISH_POI_CACHE[cache_key] = (time.monotonic(), (list(diverse), summary))
     if len(_WISH_POI_CACHE) > 80:
@@ -1981,6 +1947,7 @@ async def _fast_wish_pois_for_manual(
         for key, _ in oldest:
             _WISH_POI_CACHE.pop(key, None)
     return diverse, summary
+
 
 
 async def _wish_pois_for_geometry(
@@ -2750,5 +2717,5 @@ def _profile_notes(profile, notes: str, adapt_reason: str | None = None, weather
 async def _optional(task, fallback, timeout: float = 8):
     try:
         return await asyncio.wait_for(task, timeout=timeout)
-    except Exception:
+    except (TimeoutError, asyncio.CancelledError, Exception):
         return fallback

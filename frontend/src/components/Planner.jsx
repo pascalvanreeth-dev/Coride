@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { fetchBikeLeg, fetchBikeNetwork, fetchKnooppunten, fetchRoutePreview, fetchRouteSuggestions, fetchWishSuggestions, isAbortError, reverseGeocode, reroute, warmBikeNetwork } from "../api.js";
+import { fetchBikeLeg, fetchBikeNetwork, fetchIcoonrouteStretch, fetchKnooppunten, fetchRouteSuggestions, fetchWishSuggestions, isAbortError, reverseGeocode, reroute, warmBikeNetwork } from "../api.js";
 import { createBikeNetworkStore, ingestBikeNetwork, legFromLocalNetwork } from "../bikeNetwork.js";
 import {
   estimateRouteKm,
@@ -24,9 +24,12 @@ import {
   geometryProgressIndex,
   nodeId,
   poiId,
+  routeLength,
 } from "../geo.js";
+import { planAutoNodeChain } from "../planNodeChain.js";
 import { useDebounced } from "../hooks.js";
 import { nodeIcon, startIcon, wishPoiSvg, wishPoiIcon, isWishSearchPoi, wishOriginClass } from "../icons.js";
+import { filterPoisNearRoute, WISH_ROUTE_CORRIDOR_M } from "../wishLocal.js";
 import { profileSummary, suggestedDistance, suggestedMinutes, toApiProfile, mergeInterests, interestLabels, THEMES } from "../profile.js";
 import { MAP_SOURCES, MAP_TILE } from "../mapTiles.js";
 import { getUsedRouteIds } from "../routeHistory.js";
@@ -155,14 +158,17 @@ function applyLegDraft(legs, picked) {
     geoid: node.geoid ?? null,
     on_route: true,
   }));
+  // Altijd de echte magentalijn: som van segmenten én lengte van de polyline.
+  const fromLegs = legs.reduce((sum, leg) => sum + Number(leg.distance_km || 0), 0);
+  const fromGeom = routeLength(geometry) / 1000;
+  const distanceKm = Math.max(fromLegs, fromGeom);
+  const durationFromLegs = legs.reduce((sum, leg) => sum + Number(leg.duration_min || 0), 0);
   return {
     geometry,
-    distance_km: Number(
-      legs.reduce((sum, leg) => sum + Number(leg.distance_km || 0), 0).toFixed(1),
-    ),
+    distance_km: Number(distanceKm.toFixed(1)),
     duration_min: Math.max(
       1,
-      Math.round(legs.reduce((sum, leg) => sum + Number(leg.duration_min || 0), 0)),
+      Math.round(durationFromLegs || (distanceKm / 16) * 60),
     ),
     knooppunten,
     knoop_chain: knooppunten.map((node) => node.number).join(" → "),
@@ -182,7 +188,8 @@ function sanitizeWishGeometry(geometry) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
     out.push([lat, lng]);
   }
-  return sampleGeometryAlongRoute(out, 24);
+  // Dichter bemonsteren: corridor-filter volgt de magenta lijn beter.
+  return sampleGeometryAlongRoute(out, 80);
 }
 
 function sanitizeWishNodes(nodes) {
@@ -247,21 +254,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   const wishQueryRef = useRef({ notes: "", interests: [] });
   const routeBuildGenRef = useRef(0);
   const wishFetchGenRef = useRef(0);
+  const suggestLoadGenRef = useRef(0);
+  const stretchCacheRef = useRef(new Map()); // routeId -> stretch
   draftRef.current = draft;
   selectedIdsRef.current = selectedIds;
   const [suggestions, setSuggestions] = useState([]);
   const [suggestionsBusy, setSuggestionsBusy] = useState(false);
   const [selectedSuggestionId, setSelectedSuggestionId] = useState("");
-  const [suggestionPreview, setSuggestionPreview] = useState(null);
-  const [suggestionPreviewBusy, setSuggestionPreviewBusy] = useState(false);
   const [manualWishSuggestions, setManualWishSuggestions] = useState([]);
   const [manualWishSummary, setManualWishSummary] = useState("");
   const [manualWishBusy, setManualWishBusy] = useState(false);
   const [manualWishError, setManualWishError] = useState("");
-  const [autoWishSuggestions, setAutoWishSuggestions] = useState([]);
-  const [autoWishSummary, setAutoWishSummary] = useState("");
-  const [autoWishBusy, setAutoWishBusy] = useState(false);
-  const [loadedPreviewKey, setLoadedPreviewKey] = useState("");
+  const manualWishSuggestionsRef = useRef([]);
+  manualWishSuggestionsRef.current = manualWishSuggestions;
   const [modePickerOpen, setModePickerOpen] = useState(false);
   const [startPickerOpen, setStartPickerOpen] = useState(false);
   const [pendingStartChoice, setPendingStartChoice] = useState(null); // "map" | "gps"
@@ -276,25 +281,25 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   );
   originRef.current = origin;
   const reverseKeyRef = useRef("");
-  // Zelf kiezen: meteen per knooppunt; andere modes: korte debounce.
   const selectedKeyRaw = selectedIds.join(ID_JOIN);
   const selectedKeyDebounced = useDebounced(selectedKeyRaw, 150);
-  const selectedKey = buildMode === "manual" ? selectedKeyRaw : selectedKeyDebounced;
-  // Wens-tekst apart debouncen: anders herstart elke letter de 10–15s preview en blijven suggesties weg.
+  const usesOfficialDraft =
+    buildMode === "manual" ||
+    buildMode === "auto" ||
+    (buildMode === "suggest" && Boolean(selectedSuggestionId));
+  // Zelf kiezen / auto / Top 10 (na keuze): meteen per knooppunt.
+  const selectedKey = usesOfficialDraft ? selectedKeyRaw : selectedKeyDebounced;
+  // Wens-tekst apart debouncen: anders herstart elke letter de zoektocht.
   const debouncedNotes = useDebounced(notes, 900);
   // Café/taverne: niet 900ms wachten — anders blijven geschiedenis-tegels staan.
   const wishSearchNotes = notesWantHoreca(notes) ? notes.trim() : debouncedNotes.trim();
-  // Wensen: korte debounce — lange wachttijd vóór de API maakt zoeken traag aanvoelen.
-  const wishSelectedKey = useDebounced(selectedKey, 280);
-  const previewKey = useDebounced(
-    origin &&
-      ((buildMode === "suggest" && selectedSuggestionId) || buildMode === "auto")
-      ? buildMode === "suggest"
-        ? `${selectedSuggestionId}|${distance}|${origin.lat}|${origin.lng}|${mode}|${debouncedNotes}|${pickedWishKey}`
-        : `${distance}|${duration}|${budgetMode}|${origin.lat}|${origin.lng}|${mode}|${debouncedNotes}|${pickedWishKey}`
-      : "",
-    500,
-  );
+  // Wensen: minimale debounce — blauwe tegels meteen naast magenta.
+  // Auto/Top 10: iets langer zodat de knooppuntenketen kan settelen i.p.v. herhaald annuleren.
+  const wishSelectedKeyFast = useDebounced(selectedKey, 80);
+  const wishSelectedKeySlow = useDebounced(selectedKey, 320);
+  // Icoonroutes: zelfde snelle wensen als zelf kiezen (keten komt in één keer).
+  const wishSelectedKey =
+    buildMode === "auto" ? wishSelectedKeySlow : wishSelectedKeyFast;
   const previewDistanceKm =
     buildMode === "auto" && budgetMode === "time"
       ? Math.min(90, Math.max(8, Math.round((Number(duration) / 60) * 16)))
@@ -341,12 +346,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     () =>
       mergeMapKnooppunten(
         nodes,
-        // Zelf kiezen: geen via-netwerk-knopen als “op route” op de kaart markeren.
-        buildMode === "manual" ? selectedNodes : routeNodes,
+        // Officiële draft (zelf/auto/Top 10): geen via-netwerk-knopen als “op route” markeren.
+        usesOfficialDraft ? selectedNodes : routeNodes,
         selectedNodes,
-        buildMode === "manual" ? null : draft?.geometry || suggestionPreview?.geometry,
+        null,
       ),
-    [buildMode, nodes, routeNodes, selectedNodes, draft?.geometry, suggestionPreview?.geometry],
+    [usesOfficialDraft, nodes, routeNodes, selectedNodes],
   );
 
   const estimateKm = estimateRouteKm(origin, selectedNodes, mode !== "punt");
@@ -355,15 +360,15 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
   // Magenta: alleen officiële netwerkgeometrie (geen stub/vogelvlucht).
   const manualRouteLine = useMemo(() => {
-    if (buildMode !== "manual" || !(draft?.geometry?.length > 1)) return null;
+    if (!usesOfficialDraft || !(draft?.geometry?.length > 1)) return null;
     return { positions: draft.geometry, provisional: false };
-  }, [buildMode, draft?.geometry]);
+  }, [usesOfficialDraft, draft?.geometry]);
 
   const nodeLookupRef = useRef(nodeLookup);
   nodeLookupRef.current = nodeLookup;
 
   function paintMagentaFromCache() {
-    if (buildMode !== "manual") return { missing: 0, drawn: 0 };
+    if (!usesOfficialDraft) return { missing: 0, drawn: 0 };
     const liveLookup = nodeLookupRef.current;
     const livePicked = selectedIdsRef.current.map((id) => liveLookup.get(id)).filter(Boolean);
     if (livePicked.length < 2) {
@@ -528,14 +533,21 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     [selectedNodes],
   );
 
-  const panFocusActive = buildMode === "manual" || buildMode === "auto";
+  const panFocusActive =
+    buildMode === "manual" ||
+    buildMode === "auto" ||
+    buildMode === "suggest";
 
   const nodeFocus = useMemo(() => {
+    // Gekozen icoonroute: knooppunten rond route-start.
+    if (buildMode === "suggest" && selectedSuggestionId && origin) {
+      return { lat: origin.lat, lng: origin.lng };
+    }
     // Zoek/pan-focus: knooppunten laden rond wat de gebruiker bekijkt.
-    if ((buildMode === "manual" || buildMode === "auto") && viewFocus) {
+    if (panFocusActive && viewFocus) {
       return viewFocus;
     }
-    if ((buildMode === "manual" || buildMode === "auto") && lastSelectedNode) {
+    if (panFocusActive && lastSelectedNode) {
       return { lat: lastSelectedNode.lat, lng: lastSelectedNode.lng };
     }
     if (origin) return { lat: origin.lat, lng: origin.lng };
@@ -544,22 +556,38 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     }
     if (here) return { lat: here.lat, lng: here.lng };
     return null;
-  }, [buildMode, lastSelectedNode, viewFocus, origin, startChoice, center, here]);
+  }, [
+    buildMode,
+    selectedSuggestionId,
+    panFocusActive,
+    lastSelectedNode,
+    viewFocus,
+    origin,
+    startChoice,
+    center,
+    here,
+  ]);
 
   // ~1 km grid: kleine pan/recenter mag de fetch niet steeds annuleren.
+  // Top 10: ook suggestion-id in de key zodat wisselen van route knopen herlaadt.
   const nodeFocusBucket = useMemo(() => {
-    if ((buildMode !== "manual" && buildMode !== "auto") || !nodeFocus) return "";
-    return `${(Math.round(nodeFocus.lat * 100) / 100).toFixed(2)},${(Math.round(nodeFocus.lng * 100) / 100).toFixed(2)}`;
-  }, [buildMode, nodeFocus?.lat, nodeFocus?.lng]);
+    if (!panFocusActive || !nodeFocus) return "";
+    const base = `${(Math.round(nodeFocus.lat * 100) / 100).toFixed(2)},${(Math.round(nodeFocus.lng * 100) / 100).toFixed(2)}`;
+    if (buildMode === "suggest" && selectedSuggestionId) {
+      return `${base}|${selectedSuggestionId}`;
+    }
+    return base;
+  }, [panFocusActive, nodeFocus?.lat, nodeFocus?.lng, buildMode, selectedSuggestionId]);
   const nodeFocusBucketDebounced = useDebounced(nodeFocusBucket, MAP_KNOOP_LOAD_DEBOUNCE_MS);
   const nodesLoadGenRef = useRef(0);
 
   useEffect(() => {
-    if ((buildMode !== "manual" && buildMode !== "auto") || !nodeFocusBucketDebounced) {
+    if (!panFocusActive || !nodeFocusBucketDebounced) {
       setNodesBusy(false);
       return undefined;
     }
-    const [latS, lngS] = nodeFocusBucketDebounced.split(",");
+    const [coordPart] = nodeFocusBucketDebounced.split("|");
+    const [latS, lngS] = coordPart.split(",");
     const lat = Number(latS);
     const lng = Number(lngS);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -569,11 +597,43 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     const loadId = ++nodesLoadGenRef.current;
     let cancelled = false;
     setNodesBusy(true);
-    fetchKnooppunten(lat, lng)
-      .then((next) => {
+
+    const suggestMode = buildMode === "suggest" && Boolean(selectedSuggestionId);
+    const radius = suggestMode ? 18000 : 12000;
+    const centers = [{ lat, lng }];
+    if (suggestMode) {
+      const suggestion = suggestions.find((item) => item.id === selectedSuggestionId);
+      for (const loc of suggestion?.localities || []) {
+        if (!Number.isFinite(Number(loc?.lat)) || !Number.isFinite(Number(loc?.lng))) continue;
+        if (haversine({ lat, lng }, loc) > 40_000) continue;
+        centers.push({ lat: Number(loc.lat), lng: Number(loc.lng) });
+      }
+    }
+
+    Promise.all(centers.map((c) => fetchKnooppunten(c.lat, c.lng, radius)))
+      .then((batches) => {
         if (cancelled || loadId !== nodesLoadGenRef.current) return;
-        setNodes(Array.isArray(next) ? next : []);
-        if (next?.length) rememberNodes(...next);
+        const byId = new Map();
+        for (const batch of batches) {
+          for (const node of batch || []) {
+            if (!node) continue;
+            byId.set(nodeId(node), node);
+          }
+        }
+        const next = Array.from(byId.values());
+        if (suggestMode && selectedIdsRef.current.length >= 2) {
+          // Officiële icoonroute-keten behouden; viewport-knopen alleen bijmixen.
+          if (next.length) rememberNodes(...next);
+          setNodes((prev) => {
+            const map = new Map();
+            for (const node of prev || []) map.set(nodeId(node), node);
+            for (const node of next) map.set(nodeId(node), node);
+            return Array.from(map.values());
+          });
+        } else {
+          setNodes(next);
+          if (next.length) rememberNodes(...next);
+        }
         setGeoError("");
       })
       .catch((err) => {
@@ -584,12 +644,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       .finally(() => {
         if (loadId === nodesLoadGenRef.current) setNodesBusy(false);
       });
+
     // Trajecten voor viewport: magenta kleuren lokaal i.p.v. WFS per klik.
-    fetchBikeNetwork(lat, lng)
-      .then((net) => {
+    Promise.all(centers.map((c) => fetchBikeNetwork(c.lat, c.lng, Math.min(radius, 16000))))
+      .then((nets) => {
         if (cancelled || loadId !== nodesLoadGenRef.current) return;
-        ingestBikeNetwork(bikeNetworkRef.current, net);
-        // Netwerk net binnen: open gaten meteen lokaal inkleuren.
+        for (const net of nets) {
+          if (net) ingestBikeNetwork(bikeNetworkRef.current, net);
+        }
         const lookup = nodeLookupRef.current;
         const picked = selectedIdsRef.current.map((id) => lookup.get(id)).filter(Boolean);
         for (let index = 0; index < picked.length - 1; index += 1) {
@@ -603,10 +665,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     return () => {
       cancelled = true;
     };
-  }, [buildMode, nodeFocusBucketDebounced]);
+  }, [panFocusActive, nodeFocusBucketDebounced, buildMode, selectedSuggestionId, suggestions]);
 
   useEffect(() => {
-    if (buildMode !== "manual" || !selectedKey) {
+    if (!usesOfficialDraft || !selectedKey) {
       setDraft(null);
       setDraftBusy(false);
       manualRouteIdsRef.current = [];
@@ -699,7 +761,73 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       cancelled = true;
       window.clearTimeout(retryTimer);
     };
-  }, [buildMode, selectedKey]);
+  }, [usesOfficialDraft, selectedKey]);
+
+  // Plan mijn tocht + Route Top 10: knooppuntenketen lokaal (zelfde magenta-pad als zelf kiezen).
+  const networkChainKey = useMemo(() => {
+    if (!origin) return "";
+    if (buildMode === "auto") {
+      const endMatch = typeof end === "string" ? end.match(COORD_QUERY) : null;
+      const endPart = endMatch
+        ? `${Number(endMatch[1]).toFixed(4)},${Number(endMatch[2]).toFixed(4)}`
+        : mode === "punt"
+          ? "open"
+          : "lus";
+      return [
+        "auto",
+        origin.lat.toFixed(4),
+        origin.lng.toFixed(4),
+        mode,
+        endPart,
+        previewDistanceKm,
+        nodes.length >= 5 ? "ok" : `n${nodes.length}`,
+      ].join("|");
+    }
+    // Top 10 / icoonroutes: keten komt van /api/icoonroute (geen lokale generator).
+    return "";
+  }, [
+    buildMode,
+    origin?.lat,
+    origin?.lng,
+    mode,
+    end,
+    previewDistanceKm,
+    nodes.length,
+  ]);
+
+  useEffect(() => {
+    if (!networkChainKey || !origin || nodes.length < 5) return undefined;
+    if (buildMode !== "auto") return undefined;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      const pool = Array.from(nodeLookupRef.current.values());
+      const radiusM = Math.max(22_000, previewDistanceKm * 700);
+      const nearby = pool.filter((node) => haversine(origin, node) <= radiusM);
+      const usePool = nearby.length >= 5 ? nearby : pool;
+      if (usePool.length < 5) return;
+
+      const endMatch = typeof end === "string" ? end.match(COORD_QUERY) : null;
+      const endPoint =
+        mode === "punt" && endMatch
+          ? { lat: Number(endMatch[1]), lng: Number(endMatch[2]) }
+          : null;
+
+      const chain = planAutoNodeChain(usePool, origin, previewDistanceKm, endPoint);
+      if (cancelled || chain.length < 2) return;
+
+      let ids = chain.map((node) => nodeId(node));
+      if (mode !== "punt" && ids[0] !== ids[ids.length - 1]) {
+        ids = [...ids, ids[0]];
+      }
+      rememberNodes(...chain);
+      setSelectedIds((prev) => (prev.join(ID_JOIN) === ids.join(ID_JOIN) ? prev : ids));
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [buildMode, networkChainKey]);
 
   useEffect(() => {
     if (profile?.interests?.length) setInterests(profile.interests);
@@ -716,20 +844,41 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   };
 
   // Suggesties starten meteen bij 2 knooppunten (niet wachten tot magenta klaar is).
-  // Café-wens: horeca erbij, profiel blijft meegaan.
+  // Café-wens: horeca erbij, profiel + Top 10-thema's blijven meegaan.
   const wishInterestKey = mergeInterests(
     activeInterests.length > 0 ? activeInterests : ["geschiedenis"],
+    interests,
     profile?.horeca?.length ? ["horeca"] : [],
     notesWantHoreca(wishSearchNotes) ? ["horeca"] : [],
   ).join(",");
 
   useLayoutEffect(() => {
-    if (buildMode !== "manual" || wishSelectedKey.split(ID_JOIN).filter(Boolean).length < 2) return;
+    if (!usesOfficialDraft || wishSelectedKey.split(ID_JOIN).filter(Boolean).length < 2) return;
     if (notesWantHoreca(notes) || activeInterests.length > 0) setManualWishBusy(true);
-  }, [buildMode, wishSelectedKey, notes, activeInterests.length]);
+  }, [usesOfficialDraft, wishSelectedKey, notes, activeInterests.length]);
+
+  // Extra wens “café”: bestaande horeca-tegels meteen paars (wens), niet blauw (profiel) laten staan.
+  useEffect(() => {
+    if (!usesOfficialDraft || !notesWantHoreca(notes)) return undefined;
+    setManualWishSuggestions((prev) => {
+      if (!prev.length) return prev;
+      let changed = false;
+      const next = prev.map((poi) => {
+        const blob = `${poi.kind || ""} ${poi.kind_label || ""} ${poi.name || ""}`.toLowerCase();
+        const horeca =
+          poi.interest === "horeca" ||
+          /cafe|café|taverne|pub|\bbar\b|herberg|bistro|restaurant/.test(blob);
+        if (!horeca || poi.source === "wish") return poi;
+        changed = true;
+        return { ...poi, source: "wish", hint: "past bij je wens", interest: "horeca" };
+      });
+      return changed ? next : prev;
+    });
+    return undefined;
+  }, [usesOfficialDraft, notes]);
 
   useEffect(() => {
-    if (buildMode !== "manual") {
+    if (!usesOfficialDraft) {
       setManualWishSuggestions([]);
       setManualWishSummary("");
       setManualWishBusy(false);
@@ -737,23 +886,34 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       return undefined;
     }
     const lookup = nodeLookupRef.current;
-    const picked = wishSelectedKey
+    const pickedRaw = wishSelectedKey
       .split(ID_JOIN)
       .filter(Boolean)
       .map((id) => lookup.get(id))
       .filter(Boolean);
+    // Lus sluit met startknoop: unieke knopen tellen voor “≥2”.
+    const seenIds = new Set();
+    const picked = [];
+    for (const node of pickedRaw) {
+      const id = nodeId(node);
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      picked.push(node);
+    }
     if (picked.length < 2) {
-      setManualWishSuggestions([]);
-      setManualWishSummary("");
+      // Auto/Top 10: tijdelijk gat tijdens herplannen — tegels niet wissen.
+      if (buildMode === "manual") {
+        setManualWishSuggestions([]);
+        setManualWishSummary("");
+        setManualWishError("");
+      }
       setManualWishBusy(false);
-      setManualWishError("");
       return undefined;
     }
-    const draftNow = draftRef.current;
-    const geometry = sanitizeWishGeometry(
-      draftNow?.geometry?.length > 1 ? draftNow.geometry : picked.map((node) => [node.lat, node.lng]),
-    );
-    const nodes = sanitizeWishNodes(draftNow?.knooppunten?.length >= 2 ? draftNow.knooppunten : picked);
+    // Altijd knooppuntenketen voor zoeken: magenta groeit nog (auto/Top 10) —
+    // anders zoek je alleen op een kort prefix en blijven blauwe tegels weg.
+    const geometry = sanitizeWishGeometry(picked.map((node) => [node.lat, node.lng]));
+    const nodes = sanitizeWishNodes(picked);
     if (geometry.length < 2) {
       return undefined;
     }
@@ -762,127 +922,57 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     const fetchId = ++wishFetchGenRef.current;
     setManualWishBusy(true);
     setManualWishError("");
-    // Geen lange delay: magenta is lokaal; wensen parallel met de lijn (contract).
-    const loadWish = (body, timeoutMs) =>
-      fetchWishSuggestions(body, { timeoutMs }).then((data) => ({
-        items: Array.isArray(data?.suggestions) ? data.suggestions : [],
-        summary: data?.wish_summary || "",
-      }));
 
     (async () => {
       try {
-        let result = await loadWish(
+        const data = await fetchWishSuggestions(
           {
             notes: wishSearchNotes,
             interests: wishInterests,
             geometry,
             nodes,
           },
-          16_000,
+          8_000,
         );
-        if (fetchId !== wishFetchGenRef.current) return;
-        if (!result.items.length && wishSearchNotes) {
-          // Timeout/leeg: nog één snelle profielpoging i.p.v. harde “duurde te lang”.
-          try {
-            result = await loadWish(
-              { notes: "", interests: wishInterests, geometry, nodes },
-              12_000,
-            );
-          } catch {
-            /* fall through */
-          }
+        const items = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        const summary = data?.wish_summary || "";
+        const timedOut = Boolean(data?.timed_out);
+        // Stale fetch: toch toepassen als er nog geen tegels zijn (voorkomt “blijft hangen”).
+        if (fetchId !== wishFetchGenRef.current && manualWishSuggestionsRef.current.length) {
+          return;
         }
-        if (fetchId !== wishFetchGenRef.current) return;
-        setManualWishSuggestions(result.items);
-        setManualWishSummary(result.summary);
-        if (!result.items.length) {
-          setManualWishError(
-            wishSearchNotes
-              ? "Geen plekken gevonden voor je wens. Probeer “café” of een andere term."
-              : "Nog geen profielsuggesties gevonden rond deze route.",
-          );
-        } else {
+        if (items.length) {
+          setManualWishSuggestions(items);
+          setManualWishSummary(summary);
           setManualWishError("");
+        } else if (!manualWishSuggestionsRef.current.length) {
+          setManualWishSummary(summary || "");
+          setManualWishError(
+            timedOut
+              ? "Suggesties laden lukte niet. Tik Plan opnieuw of pas Extra wens aan."
+              : wishSearchNotes
+                ? "Geen plekken gevonden voor je wens. Probeer “café” of een andere term."
+                : "Nog geen profielsuggesties gevonden rond deze route.",
+          );
         }
       } catch (err) {
-        if (fetchId !== wishFetchGenRef.current) return;
+        if (fetchId !== wishFetchGenRef.current && manualWishSuggestionsRef.current.length) return;
         const timedOut = /duurde te lang/i.test(err?.message || "");
-        setManualWishError(
-          timedOut
-            ? "Suggesties laden lukte niet. Tik Plan opnieuw of pas Extra wens aan."
-            : err?.message || "Wenssuggesties konden niet geladen worden.",
-        );
+        if (!manualWishSuggestionsRef.current.length) {
+          setManualWishError(
+            timedOut
+              ? "Suggesties laden lukte niet. Tik Plan opnieuw of pas Extra wens aan."
+              : err?.message || "Wenssuggesties konden niet geladen worden.",
+          );
+        }
       } finally {
-        if (fetchId === wishFetchGenRef.current) setManualWishBusy(false);
+        if (fetchId === wishFetchGenRef.current || !manualWishSuggestionsRef.current.length) {
+          setManualWishBusy(false);
+        }
       }
     })();
     return undefined;
-  }, [buildMode, wishSelectedKey, wishSearchNotes, wishInterestKey]);
-
-  // Auto/suggest: magenta eerst, daarna apart wens/profiel-suggesties.
-  const autoWishKey = useDebounced(
-    (buildMode === "auto" || buildMode === "suggest") &&
-      !suggestionPreviewBusy &&
-      loadedPreviewKey &&
-      suggestionPreview?.geometry?.length > 1
-      ? `${loadedPreviewKey}|${debouncedNotes}|${activeInterests.join(",")}`
-      : "",
-    400,
-  );
-  const suggestionPreviewRef = useRef(suggestionPreview);
-  suggestionPreviewRef.current = suggestionPreview;
-
-  useEffect(() => {
-    if (buildMode !== "auto" && buildMode !== "suggest") {
-      setAutoWishSuggestions([]);
-      setAutoWishSummary("");
-      setAutoWishBusy(false);
-      return undefined;
-    }
-    if (!autoWishKey) return undefined;
-    const previewNow = suggestionPreviewRef.current;
-    if (!previewNow?.geometry?.length) return undefined;
-    if (Array.isArray(previewNow.suggestions)) {
-      setAutoWishBusy(false);
-      return undefined;
-    }
-    let cancelled = false;
-    setAutoWishBusy(true);
-    const geometry = sampleGeometryAlongRoute(previewNow.geometry, 48);
-    const wishInterests =
-      activeInterests.length > 0
-        ? mergeInterests(activeInterests, profile?.horeca?.length ? ["horeca"] : [])
-        : ["geschiedenis"];
-    fetchWishSuggestions({
-      notes: debouncedNotes.trim(),
-      interests: wishInterests,
-      geometry,
-      nodes: (previewNow.knooppunten || []).map((node) => ({
-        id: node.id || "",
-        number: String(node.number ?? ""),
-        lat: node.lat,
-        lng: node.lng,
-        network: node.network || null,
-      })),
-    })
-      .then((data) => {
-        if (cancelled) return;
-        setAutoWishSuggestions(Array.isArray(data?.suggestions) ? data.suggestions : []);
-        setAutoWishSummary(data?.wish_summary || "");
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setAutoWishSuggestions([]);
-          setAutoWishSummary("");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setAutoWishBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [buildMode, autoWishKey]);
+  }, [usesOfficialDraft, buildMode, wishSelectedKey, wishSearchNotes, wishInterestKey]);
 
   useEffect(() => {
     if (buildMode !== "suggest") return undefined;
@@ -890,11 +980,57 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     const lng = origin?.lng ?? here?.lng ?? 3.72;
     let cancelled = false;
     setSuggestionsBusy(true);
+    // Alvast knooppunten + netwerk warmen rond jouw positie (zoals zelf kiezen).
+    warmBikeNetwork({ lat, lng });
+    fetchBikeNetwork(lat, lng, 16000)
+      .then((net) => {
+        if (!cancelled && net) ingestBikeNetwork(bikeNetworkRef.current, net);
+      })
+      .catch(() => {});
+    fetchKnooppunten(lat, lng, 18000)
+      .then((next) => {
+        if (cancelled || !Array.isArray(next) || !next.length) return;
+        rememberNodes(...next);
+        setNodes((prev) => {
+          if (selectedIdsRef.current.length >= 2) {
+            const map = new Map((prev || []).map((n) => [nodeId(n), n]));
+            for (const n of next) map.set(nodeId(n), n);
+            return Array.from(map.values());
+          }
+          return next;
+        });
+      })
+      .catch(() => {});
+
     fetchRouteSuggestions(lat, lng, activeInterests, getUsedRouteIds())
       .then((next) => {
         if (cancelled) return;
         setSuggestions(next);
-        setSelectedSuggestionId((current) => (current && next.some((item) => item.id === current) ? current : ""));
+        setSelectedSuggestionId((current) =>
+          current && next.some((item) => item.id === current) ? current : "",
+        );
+        // Prefetch dichtstbijzijnde icoonroutes: stretch + netwerk klaar vóór klik.
+        const focusLat = lat;
+        const focusLng = lng;
+        for (const item of (next || []).slice(0, 4)) {
+          if (!item?.id) continue;
+          warmBikeNetwork({ lat: item.lat, lng: item.lng });
+          fetchBikeNetwork(item.lat, item.lng, 16000)
+            .then((net) => {
+              if (!cancelled && net) ingestBikeNetwork(bikeNetworkRef.current, net);
+            })
+            .catch(() => {});
+          if (stretchCacheRef.current.has(item.id)) continue;
+          fetchIcoonrouteStretch(item.id, focusLat, focusLng, item.distance_km || 50)
+            .then((stretch) => {
+              if (cancelled || !stretch?.knooppunten?.length) return;
+              stretchCacheRef.current.set(item.id, stretch);
+              if (Array.isArray(stretch.knooppunten)) {
+                rememberNodes(...stretch.knooppunten);
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch((err) => {
         if (!cancelled && !isAbortError(err)) setGeoError(err.message);
@@ -907,60 +1043,180 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     };
   }, [buildMode, origin?.lat, origin?.lng, here?.lat, here?.lng, activeInterests.join("|")]);
 
-  useEffect(() => {
-    if ((buildMode !== "suggest" && buildMode !== "auto") || !previewKey || !origin) {
-      setSuggestionPreview(null);
-      setSuggestionPreviewBusy(false);
-      setLoadedPreviewKey("");
-      return undefined;
+  function seedIcoonrouteLegs(chain, legs) {
+    if (!Array.isArray(chain) || chain.length < 2) return 0;
+    let seeded = 0;
+    if (Array.isArray(legs) && legs.length) {
+      for (let i = 0; i < chain.length - 1; i += 1) {
+        const from = chain[i];
+        const to = chain[i + 1];
+        const leg = legs[i];
+        if (!leg?.geometry?.length) continue;
+        const official = {
+          geometry: leg.geometry,
+          distance_m: Number(leg.distance_m) || 0,
+          duration_s: Number(leg.duration_s) || 60,
+          official: true,
+          via_knooppunten: [from, to],
+        };
+        legCacheRef.current.set(legCacheKey(from, to), official);
+        seeded += 1;
+      }
     }
-    const requestKey = previewKey;
-    let cancelled = false;
-    setSuggestionPreviewBusy(true);
-    const poiPicks = pickedWishPois;
-    fetchRoutePreview({
-      lat: origin.lat,
-      lng: origin.lng,
-      distance_km: previewDistanceKm,
-      mode,
-      notes: debouncedNotes,
-      interests: activeInterests,
-      poi_picks: poiPicks.map((poi) => ({
-        id: poi.id,
-        name: poi.name,
-        lat: poi.lat,
-        lng: poi.lng,
-        kind: poi.kind,
-        kind_label: poi.kind_label || null,
-        interest: poi.interest || "geschiedenis",
-      })),
-    })
-      .then((next) => {
-        if (!cancelled) {
-          setSuggestionPreview(next);
-          setLoadedPreviewKey(requestKey);
-          setAutoWishSuggestions(Array.isArray(next.suggestions) ? next.suggestions : []);
-          setAutoWishSummary(next.wish_summary || "");
-          setAutoWishBusy(false);
-          setGeoError("");
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setSuggestionPreview(null);
-          setLoadedPreviewKey("");
-          if (buildMode === "auto" && !isAbortError(err)) {
-            setGeoError(err?.message || "Routevoorbeeld kon niet geladen worden.");
+    return seeded;
+  }
+
+  function applyIcoonrouteStretch(suggestion, stretch) {
+    const chain = Array.isArray(stretch?.knooppunten) ? stretch.knooppunten : [];
+    if (chain.length < 2) {
+      throw new Error("Deze icoonroute leverde geen knooppuntenketen op.");
+    }
+    rememberNodes(...chain);
+    setNodes((prev) => {
+      const map = new Map((prev || []).map((n) => [nodeId(n), n]));
+      for (const n of chain) map.set(nodeId(n), n);
+      return Array.from(map.values());
+    });
+    const ids = chain.map((node) => nodeId(node));
+    selectedIdsRef.current = ids;
+    setSelectedIds(ids);
+    seedIcoonrouteLegs(chain, stretch.legs);
+    // Meteen magenta uit WFS-icoonroute-geometrie (zelfde gevoel als lokale legs).
+    queueMicrotask(() => {
+      const painted = paintMagentaFromCache();
+      if (painted.drawn === 0 && stretch.geometry?.length > 1) {
+        setDraft({
+          geometry: stretch.geometry,
+          distance_km: Number(stretch.distance_km) || estimateRouteKm(null, chain, false),
+          duration_min: Math.max(1, Math.round(((Number(stretch.distance_km) || 50) / 16) * 60)),
+          knooppunten: chain.map((node) => ({
+            id: node.id || "",
+            number: node.number,
+            lat: node.lat,
+            lng: node.lng,
+            network: node.network || null,
+            geoid: node.geoid ?? null,
+            on_route: true,
+          })),
+          knoop_chain: chain.map((node) => node.number).join(" → "),
+          steps: [],
+          reason: "",
+          weather: null,
+        });
+        setDraftBusy(false);
+      }
+      // Ontbrekende segmenten bijwerken via lokaal netwerk / bike-leg.
+      for (let i = 0; i < chain.length - 1; i += 1) {
+        ensureOfficialLeg(chain[i], chain[i + 1]).catch(() => {});
+      }
+    });
+
+    const startNode = chain[0];
+    setOrigin({
+      lat: Number(stretch.lat) || startNode.lat,
+      lng: Number(stretch.lng) || startNode.lng,
+      source: "route",
+    });
+    setViewFocus({
+      lat: Number(stretch.lat) || startNode.lat,
+      lng: Number(stretch.lng) || startNode.lng,
+    });
+    setStart(stretch.start_label || stretch.start || suggestion.title);
+    setMode(stretch.mode || "punt");
+    const km = Math.max(8, Math.round(Number(stretch.distance_km) || suggestion.distance_km || 50));
+    setDistance(km);
+    setDuration(Math.round((km / 16) * 60));
+    if (stretch.notes) setNotes(stretch.notes);
+    if (Array.isArray(stretch.interests) && stretch.interests.length) {
+      setInterests(stretch.interests);
+    }
+    setLocateTick((tick) => tick + 1);
+    onPreview({
+      lat: Number(stretch.lat) || startNode.lat,
+      lng: Number(stretch.lng) || startNode.lng,
+      zoom: 12,
+    });
+    warmBikeNetwork({
+      lat: Number(stretch.lat) || startNode.lat,
+      lng: Number(stretch.lng) || startNode.lng,
+    });
+    // Extra netwerk rond start/midden/eind voor snelle legs.
+    const mid = chain[Math.floor(chain.length / 2)];
+    const end = chain[chain.length - 1];
+    for (const point of [startNode, mid, end]) {
+      if (!point) continue;
+      fetchBikeNetwork(point.lat, point.lng, 16000)
+        .then((net) => {
+          if (net) {
+            ingestBikeNetwork(bikeNetworkRef.current, net);
+            paintMagentaRef.current();
           }
+        })
+        .catch(() => {});
+    }
+  }
+
+  async function applySuggestion(suggestion) {
+    if (!Number.isFinite(suggestion.lat) || !Number.isFinite(suggestion.lng)) {
+      setGeoError("Deze route heeft geen geldig startpunt. Probeer opnieuw te laden.");
+      return;
+    }
+    const loadId = ++suggestLoadGenRef.current;
+    setSelectedSuggestionId(suggestion.id);
+    setStart(shortPlaceLabel(suggestion.start) || suggestion.start);
+    setStartChoice("map");
+    setEnd(suggestion.end || "");
+    setMode(suggestion.mode || "punt");
+    setInterests(suggestion.interests || []);
+    setDistance(suggestion.distance_km || 50);
+    setDuration(Math.round(((suggestion.distance_km || 50) / 16) * 60));
+    setBudgetMode("distance");
+    setNotes(suggestion.notes || "");
+    setSelectedIds([]);
+    selectedIdsRef.current = [];
+    setDraft(null);
+    setDraftBusy(true);
+    setManualWishSuggestions([]);
+    setManualWishSummary("");
+    setManualWishError("");
+    setGeoError("");
+    setViewFocus({ lat: suggestion.lat, lng: suggestion.lng });
+    // Behoud voorgewarmd netwerk/catalogus — niet wissen zoals vroeger.
+    legInflightRef.current.clear();
+    manualRouteIdsRef.current = [];
+
+    const focusLat = Number.isFinite(here?.lat) ? here.lat : suggestion.lat;
+    const focusLng = Number.isFinite(here?.lng) ? here.lng : suggestion.lng;
+    setOrigin({ lat: suggestion.lat, lng: suggestion.lng, source: "route" });
+    setLocateTick((tick) => tick + 1);
+    onPreview({ lat: suggestion.lat, lng: suggestion.lng, zoom: 12 });
+    warmBikeNetwork({ lat: suggestion.lat, lng: suggestion.lng });
+
+    try {
+      let stretch = stretchCacheRef.current.get(suggestion.id);
+      if (!stretch?.knooppunten?.length) {
+        stretch = await fetchIcoonrouteStretch(
+          suggestion.id,
+          focusLat,
+          focusLng,
+          suggestion.distance_km || 50,
+        );
+        if (stretch?.knooppunten?.length) {
+          stretchCacheRef.current.set(suggestion.id, stretch);
         }
-      })
-      .finally(() => {
-        if (!cancelled) setSuggestionPreviewBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [buildMode, previewKey, origin?.lat, origin?.lng, pickedWishKey]);
+      }
+      if (loadId !== suggestLoadGenRef.current) return;
+      applyIcoonrouteStretch(suggestion, stretch);
+      setGeoError("");
+    } catch (err) {
+      if (loadId !== suggestLoadGenRef.current) return;
+      setGeoError(err?.message || "Icoonroute kon niet geladen worden.");
+      setSelectedIds([]);
+      selectedIdsRef.current = [];
+      setDraft(null);
+      setDraftBusy(false);
+    }
+  }
 
   function openWishPicker(poi) {
     if (!poi) return;
@@ -988,52 +1244,26 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     closeWishPicker();
   }
 
-  const routePreview = suggestionPreview;
-  const routePreviewBusy = suggestionPreviewBusy;
-
-  useEffect(() => {
-    if (!routePreview?.knooppunten?.length) return;
-    rememberNodes(...routePreview.knooppunten);
-  }, [routePreview?.knooppunten]);
-
-  const previewRefreshing =
-    Boolean(previewKey) && routePreviewBusy && loadedPreviewKey !== previewKey;
-
   const selectedSuggestion = useMemo(
     () => suggestions.find((item) => item.id === selectedSuggestionId) || null,
     [suggestions, selectedSuggestionId],
   );
 
-  function previewKnooppuntenFor(chain, isLoop) {
-    const base = chain || [];
-    if (!base.length) return [];
-    return displayLoopNodes(base, isLoop);
-  }
-
-  const previewKnooppunten = useMemo(
-    () => previewKnooppuntenFor(routePreview?.knooppunten, mode !== "punt"),
-    [routePreview?.knooppunten, mode],
-  );
-  const suggestPreviewKnooppunten = useMemo(
-    () =>
-      previewKnooppuntenFor(
-        suggestionPreview?.knooppunten,
-        (selectedSuggestion?.mode || mode) !== "punt",
-      ),
-    [suggestionPreview?.knooppunten, selectedSuggestion?.mode, mode],
-  );
-
   const wishSuggestions = useMemo(() => {
-    if (buildMode === "manual") return manualWishSuggestions;
-    if (buildMode === "auto" || buildMode === "suggest") return autoWishSuggestions;
-    return [];
-  }, [buildMode, manualWishSuggestions, autoWishSuggestions]);
+    const raw = usesOfficialDraft ? manualWishSuggestions : [];
+    if (!raw.length) return [];
+    const knoopGeom = selectedNodes.map((n) => [n.lat, n.lng]);
+    const geom =
+      draft?.geometry?.length > 1 && !draftBusy
+        ? draft.geometry
+        : knoopGeom.length >= 2
+          ? knoopGeom
+          : draft?.geometry || [];
+    return filterPoisNearRoute(raw, geom, selectedNodes, WISH_ROUTE_CORRIDOR_M);
+  }, [usesOfficialDraft, manualWishSuggestions, draft?.geometry, draftBusy, selectedNodes]);
 
-  const wishSummary =
-    buildMode === "manual" ? manualWishSummary : autoWishSummary;
-
-  const wishBusy =
-    buildMode === "manual" ? manualWishBusy : autoWishBusy || routePreviewBusy;
+  const wishSummary = manualWishSummary;
+  const wishBusy = manualWishBusy;
 
   const panelError = useMemo(() => {
     const shown = [error, geoError].find(
@@ -1043,8 +1273,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   }, [error, geoError]);
 
   useEffect(() => {
-    // Nieuwe wens-tekst: focus resetten. Gekozen plekken wissen als wens leeg is.
-    // Suggesties zelf laten we aan de fetch-effecten (profiel blijft zichtbaar zonder tekst).
     setFocusedWishId("");
     setFocusPulse(null);
     setManualWishError("");
@@ -1058,31 +1286,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         : activeInterests,
     [buildMode, selectedSuggestion, activeInterests],
   );
-
-  function applySuggestion(suggestion) {
-    if (!Number.isFinite(suggestion.lat) || !Number.isFinite(suggestion.lng)) {
-      setGeoError("Deze route heeft geen geldig startpunt. Probeer opnieuw te laden.");
-      return;
-    }
-    setSelectedSuggestionId(suggestion.id);
-    setStart(shortPlaceLabel(suggestion.start) || suggestion.start);
-    setStartChoice("map");
-    setEnd(suggestion.end || "");
-    setMode(suggestion.mode);
-    setInterests(suggestion.interests);
-    setDistance(suggestion.distance_km);
-    setDuration(Math.round((suggestion.distance_km / 16) * 60));
-    setBudgetMode("distance");
-    setNotes(suggestion.notes || "");
-    setSelectedIds([]);
-    setSuggestionPreview(null);
-    setGeoError("");
-    const startPoint = { lat: suggestion.lat, lng: suggestion.lng };
-    setHere(startPoint);
-    setOrigin({ lat: suggestion.lat, lng: suggestion.lng, source: "route" });
-    setLocateTick((tick) => tick + 1);
-    onPreview({ lat: suggestion.lat, lng: suggestion.lng, zoom: 11 });
-  }
 
   async function setFromCoords(next, source, label) {
     setOrigin({ lat: next.lat, lng: next.lng, source });
@@ -1161,14 +1364,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     const switching = buildMode !== nextMode;
     setGeoError("");
     setSelectedSuggestionId("");
-    setSuggestionPreview(null);
     setManualWishSuggestions([]);
     setManualWishSummary("");
     setManualWishBusy(false);
     setManualWishError("");
-    setAutoWishSuggestions([]);
-    setAutoWishSummary("");
-    setAutoWishBusy(false);
     cancelRouteModePicker();
     cancelStartPicker();
 
@@ -1179,8 +1378,26 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         setStart("");
         setSelectedIds([]);
         setDraft(null);
+        setDraftBusy(false);
+        stretchCacheRef.current.clear();
       }
       setBuildMode("suggest");
+      // Knooppunten + netwerk al warmen rond GPS (vóór een route kiezen).
+      const lat = here?.lat ?? 51.05;
+      const lng = here?.lng ?? 3.72;
+      warmBikeNetwork({ lat, lng });
+      fetchBikeNetwork(lat, lng, 16000)
+        .then((net) => {
+          if (net) ingestBikeNetwork(bikeNetworkRef.current, net);
+        })
+        .catch(() => {});
+      fetchKnooppunten(lat, lng, 18000)
+        .then((next) => {
+          if (!Array.isArray(next) || !next.length) return;
+          rememberNodes(...next);
+          setNodes(next);
+        })
+        .catch(() => {});
       return;
     }
 
@@ -1398,12 +1615,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       matchingUserPick(node, selectedNodes) ||
       node.on_route ||
       knoopOnRoute(node, routeNodes) ||
-      knoopOnGeometry(node, draft?.geometry || routePreview?.geometry)
+      knoopOnGeometry(node, draft?.geometry)
     ) {
       return "picked";
-    }
-    if (buildMode === "auto" && startChoice === "map") {
-      return "route";
     }
     return "idle";
   }
@@ -1433,12 +1647,24 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       );
       return;
     }
-    if (buildMode === "manual" && !selectedNodes.length) {
-      setGeoError("Kies minstens één knooppunt op de kaart.");
+    if (usesOfficialDraft && !selectedNodes.length) {
+      setGeoError(
+        buildMode === "auto"
+          ? "Wacht tot er knooppunten op de route staan, of pas start/afstand aan."
+          : "Kies minstens één knooppunt op de kaart.",
+      );
       return;
     }
     if (buildMode === "manual" && mode === "punt" && selectedNodes.length < 2) {
       setGeoError("Kies minstens twee knooppunten: het eerste is A, het laatste is B.");
+      return;
+    }
+    if ((buildMode === "auto" || buildMode === "suggest") && !(draft?.geometry?.length > 1)) {
+      setGeoError(
+        buildMode === "suggest"
+          ? "Wacht tot de magenta knooppuntenroute klaar is, of kies een andere Top 10-route."
+          : "Wacht tot de magenta knooppuntenroute klaar is.",
+      );
       return;
     }
     if (buildMode === "suggest" && !selectedSuggestion) {
@@ -1453,7 +1679,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           ? activeInterests
           : ["geschiedenis"];
     const distanceKm =
-      buildMode === "manual"
+      usesOfficialDraft
         ? Math.min(90, Math.max(8, Math.round(liveKm || distance)))
         : buildMode === "suggest" && selectedSuggestion
           ? Number(distance)
@@ -1474,7 +1700,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           ? end || null
           : null;
     const planKnoopNodes =
-      buildMode === "manual" && draft?.knooppunten?.length >= 2 ? draft.knooppunten : selectedNodes;
+      usesOfficialDraft && draft?.knooppunten?.length >= 2 ? draft.knooppunten : selectedNodes;
     onPlan({
       start: planStart,
       end: planEnd,
@@ -1491,7 +1717,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       profile: toApiProfile(profile),
       suggestion_id: buildMode === "suggest" ? selectedSuggestionId : null,
       knooppunten:
-        buildMode === "manual"
+        usesOfficialDraft
           ? planKnoopNodes.slice(0, 40).map((node) => ({
               id: node.id || "",
               number: node.number,
@@ -1511,11 +1737,15 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         interest: poi.interest || "geschiedenis",
       })),
       route_geometry:
-        buildMode === "manual" && draft?.geometry?.length > 1 ? draft.geometry : [],
+        usesOfficialDraft && draft?.geometry?.length > 1 ? draft.geometry : [],
       route_duration_min:
-        buildMode === "manual" && draft?.duration_min ? Math.round(draft.duration_min) : null,
-      local_manual: buildMode === "manual" && draft?.geometry?.length > 1,
-      wish_suggestions: buildMode === "manual" ? wishSuggestions : [],
+        usesOfficialDraft && draft?.duration_min ? Math.round(draft.duration_min) : null,
+      local_manual: usesOfficialDraft && draft?.geometry?.length > 1,
+      wish_suggestions: usesOfficialDraft
+        ? wishSuggestions.length
+          ? wishSuggestions
+          : manualWishSuggestionsRef.current
+        : [],
     });
   }
 
@@ -1553,15 +1783,15 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             onClick={() => enterBuildMode("auto")}
           >
             <strong>Plan mijn tocht</strong>
-            <span>Geef afstand of tijd. De gids kiest knooppunten en plekken op basis van je profiel.</span>
+            <span>Geef afstand of tijd. Knooppunten en magenta volgen het officiële netwerk — zelfde werkwijze als zelf kiezen.</span>
           </button>
           <button
             type="button"
             className={`choice-card ${buildMode === "suggest" ? "on" : ""}`}
             onClick={() => enterBuildMode("suggest")}
           >
-            <strong>Route Top 10</strong>
-            <span>Tien kant-en-klare tochten (~50 km) rond Vlaamse steden en bezienswaardigheden.</span>
+            <strong>Icoonroutes</strong>
+            <span>Officiële icoonroutes van Toerisme Vlaanderen — knooppunten en magenta op het echte traject.</span>
           </button>
         </div>
 
@@ -1596,11 +1826,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 
           {buildMode === "suggest" && (
             <div className="editor suggest-routes">
-              <strong>Route Top 10</strong>
+              <strong>Icoonroutes</strong>
               <p className="sources" style={{ margin: "6px 0 10px" }}>
                 {suggestionsBusy
-                  ? "Routes worden geladen..."
-                  : "Kant-en-klare tochten van ongeveer 50 km. Pas de lengte nadien aan."}
+                  ? "Icoonroutes worden geladen…"
+                  : "Officiële fiets-icoonroutes van Toerisme Vlaanderen. We tonen het stuk dichtst bij jou (~50 km)."}
+              </p>
+              <p className="sources" style={{ margin: "0 0 10px" }}>
+                Bron: Toerisme Vlaanderen · geodata WFS (icoonroutes)
               </p>
               <div className="suggest-route-list">
                 {suggestions.map((item) => (
@@ -1635,10 +1868,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           {buildMode === "suggest" && selectedSuggestion && (
             <div className="editor suggest-detail">
               <p className="sources" style={{ margin: "0 0 8px" }}>
-                <strong>Start:</strong> {selectedSuggestion.start}
+                <strong>Start:</strong> {start || selectedSuggestion.start}
               </p>
               <p className="sources" style={{ margin: "0 0 8px" }}>
-                <strong>Gemeenten:</strong> {(selectedSuggestion.municipalities || []).join(" · ")}
+                Officieel traject · Toerisme Vlaanderen icoonroute
               </p>
               <div className="guide-pill-row">
                 {interestLabels(suggestInterests).map((label) => (
@@ -1658,11 +1891,15 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             <label>
               <span className="range">
                 Lengte van het traject <b>{distance} km</b>
-                {suggestionPreview?.distance_km
-                  ? ` · voorbeeld ${suggestionPreview.distance_km} km`
-                  : suggestionPreviewBusy
-                    ? " · route wordt getekend..."
-                    : ""}
+                {draft?.geometry?.length > 1
+                  ? ` · echt ${formatKm(liveKm)} via knooppunten`
+                  : draftBusy
+                    ? " · magenta groeit mee…"
+                    : selectedNodes.length
+                      ? " · route wordt samengesteld…"
+                      : nodesBusy
+                        ? " · knooppunten laden…"
+                        : ""}
               </span>
               <input
                 type="range"
@@ -1674,31 +1911,52 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             </label>
           )}
 
-          {buildMode === "suggest" && selectedSuggestion && suggestionPreview?.knooppunten?.length > 0 && (
+          {buildMode === "suggest" && selectedSuggestion && (
             <div className="editor draft-box">
-              <strong>Te volgen knooppunten</strong>
+              <strong>Route via knooppunten</strong>
               <p className="sources" style={{ margin: "6px 0 8px" }}>
-                {previewRefreshing
-                  ? "Knooppuntenroute wordt berekend..."
-                  : `${suggestPreviewKnooppunten.length} knooppunten in volgorde`}
+                {nodesBusy && selectedNodes.length < 2
+                  ? "Knooppunten worden geladen…"
+                  : draftBusy && !(draft?.geometry?.length > 1)
+                    ? "Officiële trajecten groeien mee…"
+                    : selectedNodes.length
+                      ? `${routeNodes.length} knooppunten · ${formatKm(liveKm)}`
+                      : nodes.length
+                        ? "Route wordt samengesteld op het knooppuntennetwerk…"
+                        : "Nog geen knooppunten in beeld rond deze start."}
               </p>
-              {suggestPreviewKnooppunten.length > 0 && (
-                <ol className="picked-list route-knoop-list" key={loadedPreviewKey || previewKey}>
-                  {suggestPreviewKnooppunten.map((node, index) => (
-                    <li key={`${nodeId(node)}-${index}`}>
+              {routeNodes.length ? (
+                <ol className="picked-list route-knoop-list">
+                  {routeNodes.map((node, index) => (
+                    <li key={`${nodeId(node)}-${index}`} className="picked-stop">
                       <span className="num">{index + 1}</span>
                       <span>
                         <strong>Knooppunt {node.number}</strong>
                         {index > 0 &&
-                          index === suggestPreviewKnooppunten.length - 1 &&
-                          knoopMatches(node, suggestPreviewKnooppunten[0], 80) && (
+                          mode !== "punt" &&
+                          index === routeNodes.length - 1 &&
+                          knoopMatches(node, routeNodes[0], 80) && (
                             <small> · start</small>
                           )}
                       </span>
                     </li>
                   ))}
                 </ol>
-              )}
+              ) : null}
+              <div className="stats">
+                <div className="stat">
+                  <span>Afstand</span>
+                  <b>{routeNodes.length ? formatKm(liveKm) : "0 km"}</b>
+                </div>
+                <div className="stat">
+                  <span>Rijtijd</span>
+                  <b>{liveMin ? formatDuration(liveMin) : selectedNodes.length ? "…" : "—"}</b>
+                </div>
+                <div className="stat">
+                  <span>Knooppunten</span>
+                  <b>{routeNodes.length}</b>
+                </div>
+              </div>
             </div>
           )}
 
@@ -1794,7 +2052,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           </div>
           )}
 
-          {buildMode === "auto" && mode === "lus" && (
+          {buildMode === "auto" && (
             <>
               <div className="row">
                 <button
@@ -1816,6 +2074,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                 <label>
                   <span className="range">
                     Hoeveel kilometer? <b>{distance} km</b>
+                    {draft?.geometry?.length > 1 ? ` · echt ${formatKm(liveKm)}` : ""}
                   </span>
                   <input
                     type="range"
@@ -1840,39 +2099,61 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                   />
                 </label>
               )}
-              <p className="sources" style={{ margin: 0 }}>
-                We starten vanaf je huidige locatie (of het gekozen startpunt) via officiële
-                fietsknooppunten.
-              </p>
-              {routePreview?.knooppunten?.length > 0 && (
-                <div className="editor draft-box">
-                  <strong>Te volgen knooppunten</strong>
-                  <p className="sources" style={{ margin: "6px 0 8px" }}>
-                    {previewRefreshing
-                      ? "Knooppuntenroute wordt berekend..."
-                      : `${previewKnooppunten.length} knooppunten · voorbeeld ${routePreview.distance_km} km`}
-                  </p>
-                  <ol className="picked-list route-knoop-list" key={loadedPreviewKey || previewKey}>
-                    {previewKnooppunten.map((node, index) => (
-                      <li key={`${nodeId(node)}-${index}`}>
+              <div className="editor draft-box">
+                <strong>Route via knooppunten</strong>
+                <p className="sources" style={{ margin: "6px 0 8px" }}>
+                  {!startChoice
+                    ? "Kies eerst je startpunt."
+                    : !origin
+                      ? "Startpunt wordt gezet…"
+                      : nodesBusy && selectedNodes.length < 2
+                        ? "Knooppunten worden geladen…"
+                        : draftBusy && !(draft?.geometry?.length > 1)
+                          ? "Officiële trajecten groeien mee…"
+                          : selectedNodes.length
+                            ? `${routeNodes.length} knooppunten · ${formatKm(liveKm)}`
+                            : nodes.length
+                              ? "Route wordt samengesteld op het knooppuntennetwerk…"
+                              : "Nog geen knooppunten in beeld. Zoom in of kies een startpositie."}
+                </p>
+                {routeNodes.length ? (
+                  <ol className="picked-list route-knoop-list">
+                    {routeNodes.map((node, index) => (
+                      <li key={`${nodeId(node)}-${index}`} className="picked-stop">
                         <span className="num">{index + 1}</span>
                         <span>
                           <strong>Knooppunt {node.number}</strong>
                           {index > 0 &&
-                            index === previewKnooppunten.length - 1 &&
-                            knoopMatches(node, previewKnooppunten[0], 80) && (
+                            mode !== "punt" &&
+                            index === routeNodes.length - 1 &&
+                            knoopMatches(node, routeNodes[0], 80) && (
                               <small> · start</small>
                             )}
                         </span>
                       </li>
                     ))}
                   </ol>
+                ) : null}
+                <div className="stats">
+                  <div className="stat">
+                    <span>Afstand</span>
+                    <b>{routeNodes.length ? formatKm(liveKm) : "0 km"}</b>
+                  </div>
+                  <div className="stat">
+                    <span>Rijtijd</span>
+                    <b>{liveMin ? formatDuration(liveMin) : selectedNodes.length ? "…" : "—"}</b>
+                  </div>
+                  <div className="stat">
+                    <span>Knooppunten</span>
+                    <b>{routeNodes.length}</b>
+                  </div>
                 </div>
-              )}
+              </div>
             </>
           )}
 
-          {(buildMode === "auto" || buildMode === "manual") && (
+          {(buildMode === "auto" || buildMode === "manual" || buildMode === "suggest") &&
+            (buildMode !== "suggest" || selectedSuggestion) && (
           <label>
             Extra wens — cafés, kastelen, musea, natuur, …
             <textarea
@@ -1883,10 +2164,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             />
           </label>
           )}
-          {buildMode === "manual" && selectedNodes.length < 2 && (
+          {usesOfficialDraft && selectedNodes.length < 2 && (
             <p className="sources" style={{ margin: "0 0 12px" }}>
-              Kies minstens twee knooppunten op de kaart. Daarna verschijnen hier plekken op basis van je
-              profiel en Extra wens.
+              {buildMode === "manual"
+                ? "Kies minstens twee knooppunten op de kaart. Daarna verschijnen hier plekken op basis van je profiel en Extra wens."
+                : "Zodra er twee knooppunten op de route staan, verschijnen hier plekken op basis van je profiel en Extra wens."}
             </p>
           )}
 
@@ -1939,7 +2221,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               {pickedWishPois.length > 0 && (
                 <p className="sources" style={{ margin: "8px 0 0" }}>
                   {pickedWishPois.length} plek{pickedWishPois.length === 1 ? "" : "ken"} toegevoegd
-                  {previewRefreshing || wishBusy
+                  {wishBusy
                     ? " — route wordt aangepast…"
                     : draftBusy
                       ? " — traject groeit mee…"
@@ -1960,22 +2242,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             </p>
           )}
 
-          {buildMode === "auto" &&
-            !routePreviewBusy &&
-            !autoWishBusy &&
-            !wishSuggestions.length &&
-            routePreview?.geometry?.length > 1 &&
-            (notes.trim() || activeInterests.length > 0) && (
-            <p className="sources" style={{ margin: "0 0 12px" }}>
-              {notes.trim()
-                ? "Geen passende plekken gevonden voor je wens. Probeer een andere formulering."
-                : "Nog geen profielsuggesties gevonden rond deze route."}
-            </p>
-          )}
-
-          {buildMode === "manual" &&
+          {(buildMode === "auto" || buildMode === "manual" || buildMode === "suggest") &&
             selectedNodes.length >= 2 &&
-            (notes.trim() || activeInterests.length > 0) &&
+            (notes.trim() || activeInterests.length > 0 || interests?.length > 0) &&
             !manualWishBusy &&
             !wishSuggestions.length && (
             <p className="sources" style={{ margin: "0 0 12px" }}>
@@ -1984,17 +2253,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                   ? "Geen passende plekken gevonden voor je wens. Probeer “café” of “museum”, of even opnieuw zoeken."
                   : "Nog geen profielsuggesties gevonden rond deze route.")}
             </p>
-          )}
-
-          {buildMode === "suggest" && selectedSuggestion && (
-          <label>
-            Toelichting bij deze route
-            <textarea
-              rows="2"
-              value={notes}
-              onChange={(event) => setNotes(event.target.value)}
-            />
-          </label>
           )}
 
         </form>
@@ -2010,7 +2268,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               busy ||
               (buildMode === "suggest" && !selectedSuggestion) ||
               ((buildMode === "manual" || buildMode === "auto") && (!startChoice || !origin)) ||
-              (buildMode === "manual" && !(draft?.geometry?.length > 1))
+              (usesOfficialDraft && !(draft?.geometry?.length > 1))
             }
           >
             {busy
@@ -2050,7 +2308,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
           <MapPanFocus active={panFocusActive} onFocus={setViewFocus} />
           <HoldMapAfterUserPan />
           <MapZoomScale referenceZoom={zoom}>
-          {(buildMode === "manual" && manualRouteLine?.positions?.length > 1 && (
+          {(usesOfficialDraft && manualRouteLine?.positions?.length > 1 && (
             <RouteLine
               positions={manualRouteLine.positions}
               opacity={1}
@@ -2058,21 +2316,12 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             />
           ))}
           {/* Gekozen = groen; overgeslagen via-netwerk = rood. */}
-          {(buildMode === "manual" && routeNodes.length > 0) && (
+          {(usesOfficialDraft && routeNodes.length > 0) && (
             <RouteChainKnoopMarkers
               nodes={routeNodes}
               geometry={draft?.geometry}
               pool={mapNodes}
             />
-          )}
-          {(buildMode === "suggest" || buildMode === "auto") && routePreview?.geometry?.length > 1 && (
-            <RouteLine positions={routePreview.geometry} />
-          )}
-          {(buildMode === "auto" && previewKnooppunten.length > 0) && (
-            <RouteChainKnoopMarkers nodes={previewKnooppunten} geometry={routePreview?.geometry} pool={mapNodes} />
-          )}
-          {(buildMode === "suggest" && suggestPreviewKnooppunten.length > 0) && (
-            <RouteChainKnoopMarkers nodes={suggestPreviewKnooppunten} geometry={routePreview?.geometry} pool={mapNodes} />
           )}
           {wishSuggestions.length > 0 && (
             <WishRouteMarkers
@@ -2087,7 +2336,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             token={focusPulse?.key}
             onDone={() => setFocusPulse(null)}
           />
-          {(buildMode === "manual" || (buildMode === "auto" && startChoice === "map")) && (
+          {usesOfficialDraft && (
             <PlannerKnoopMarkers
               nodes={mapNodes}
               buildMode={buildMode}
@@ -2098,9 +2347,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               onToggle={toggleNode}
             />
           )}
-          {origin && origin.source === "map" && buildMode !== "suggest" && (
+          {origin && (origin.source === "map" || origin.source === "route") && (
             <Marker position={[origin.lat, origin.lng]} icon={startIcon} zIndexOffset={1100}>
-              <Popup>Zoekgebied / startpositie</Popup>
+              <Popup>{origin.source === "route" ? "Start Top 10-route" : "Zoekgebied / startpositie"}</Popup>
             </Marker>
           )}
           <HereMarker
@@ -2108,27 +2357,25 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             accuracy={here && startChoice !== "map" ? here.accuracy : 0}
           />
           <MapFlyTo
-            position={viewFocus || origin || (!startChoice ? here : null)}
+            position={
+              buildMode === "suggest" && origin
+                ? origin
+                : viewFocus || origin || (!startChoice ? here : null)
+            }
             trigger={locateTick}
-            zoom={viewFocus ? 12 : buildMode === "suggest" ? 12 : 14}
+            zoom={buildMode === "suggest" ? 12 : viewFocus ? 12 : 14}
           />
           <Recenter
             center={center}
             zoom={zoom}
             locked={
-              // GPS mag de kaart niet meer overschrijven zodra er start of route is.
               Boolean(origin) ||
-              (buildMode === "manual" && selectedIds.length > 0) ||
-              (buildMode === "suggest" && !!selectedSuggestion) ||
-              Boolean(
-                (buildMode === "manual" && draft?.geometry?.length > 1) ||
-                  ((buildMode === "suggest" || buildMode === "auto") &&
-                    routePreview?.geometry?.length > 1),
-              ) ||
+              (usesOfficialDraft && selectedIds.length > 0) ||
+              Boolean(usesOfficialDraft && draft?.geometry?.length > 1) ||
               !center
             }
           />
-          {buildMode === "manual" && lastSelectedNode && (
+          {usesOfficialDraft && lastSelectedNode && (
             <FocusLastSelected node={lastSelectedNode} trigger={selectedIds.join("|")} />
           )}
           {buildMode === "manual" &&
@@ -2138,26 +2385,13 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             origin.source === "map" && (
             <FitNodes origin={origin} />
           )}
-          {(buildMode === "suggest" || buildMode === "auto") && (
-            <FitPreview
-              geometry={routePreview?.geometry}
-              nodes={previewKnooppunten}
-              active={buildMode === "suggest" ? !!selectedSuggestion : !!origin}
-              deferAfterInteraction
-              fitKey={
-                buildMode === "suggest"
-                  ? selectedSuggestionId || ""
-                  : `${origin?.lat},${origin?.lng}|${previewKey}`
-              }
-            />
-          )}
-          {buildMode === "manual" && (
+          {usesOfficialDraft && (
             <FitPreview
               geometry={draft?.geometry}
               nodes={routeNodes}
               active={Boolean(draft?.geometry?.length > 1 && routeNodes.length > 0)}
               deferAfterInteraction
-              fitKey={selectedKey}
+              fitKey={selectedKey || selectedSuggestionId || ""}
             />
           )}
           </MapZoomScale>
@@ -2193,19 +2427,23 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
                     : "Klik een knooppunt als startpunt van je route"
             : buildMode === "suggest"
               ? selectedSuggestion
-                ? routePreviewBusy
-                  ? `${selectedSuggestion.title} · route laden...`
-                  : `${selectedSuggestion.title} · ${distance} km`
+                ? draftBusy && !(draft?.geometry?.length > 1)
+                  ? `${selectedSuggestion.title} · magenta groeit…`
+                  : selectedNodes.length >= 2
+                    ? `${selectedSuggestion.title} · ${routeNodes.length} knooppunten · ${formatKm(liveKm)}`
+                    : `${selectedSuggestion.title} · knooppunten laden…`
                 : "Kies een route uit de Top 10"
               : !startChoice
                 ? "Kies je startpunt in het venster"
-                : startChoice === "gps"
-                  ? origin
-                    ? "Start klaar. Stel afstand/tijd in en plan je tocht."
-                    : "Je locatie wordt opgehaald…"
-                  : origin
-                    ? "Start klaar. Stel afstand/tijd in en plan je tocht."
-                    : "Klik op de kaart of een knooppunt voor je start"}
+                : !origin
+                  ? startChoice === "gps"
+                    ? "Je locatie wordt opgehaald…"
+                    : "Klik op de kaart of een knooppunt voor je start"
+                  : draftBusy && !(draft?.geometry?.length > 1)
+                    ? "Magenta groeit via het knooppuntennetwerk…"
+                    : selectedNodes.length >= 2
+                      ? `${routeNodes.length} knooppunten · ${formatKm(liveKm)}`
+                      : "Route wordt samengesteld op knooppunten…"}
           </div>
         </div>
         </>

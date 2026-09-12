@@ -806,7 +806,7 @@ async def fetch_horeca_photon_along_points(
                         "osm_tag": osm_tag,
                         "bbox": "2.3,49.45,6.45,51.55",
                     },
-                    timeout=httpx.Timeout(12.0, connect=5.0),
+                    timeout=httpx.Timeout(4.0, connect=2.0),
                 )
                 if response.status_code >= 400:
                     return []
@@ -987,7 +987,7 @@ async def fetch_horeca_nominatim_along_points(
         viewbox = f"{lng - delta},{lat + delta},{lng + delta},{lat - delta}"
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(15.0, connect=5.0),
+                timeout=httpx.Timeout(4.0, connect=2.0),
                 headers={
                     "User-Agent": settings.nominatim_user_agent,
                     "Accept": "application/json",
@@ -1124,7 +1124,7 @@ async def fetch_theme_nominatim_along_points(
         viewbox = f"{lng - delta},{lat + delta},{lng + delta},{lat - delta}"
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(12.0, connect=4.0),
+                timeout=httpx.Timeout(4.0, connect=2.0),
                 headers={
                     "User-Agent": settings.nominatim_user_agent,
                     "Accept": "application/json",

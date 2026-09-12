@@ -1,5 +1,7 @@
 /** Bouw een Ride-plan uit de magenta draft — zonder te wachten op /api/plan. */
 
+import { routeLength } from "./geo.js";
+
 function placeFromNode(node, fallbackLabel = "Startknooppunt") {
   const number = node?.number != null ? String(node.number) : "";
   return {
@@ -109,7 +111,8 @@ export function buildManualPlanFromDraft({
   const start = placeFromNode(first);
   const end = mode === "punt" ? placeFromNode(last, "Eindknooppunt") : start;
   const label = chain.map((node) => String(node.number)).join(" → ");
-  const km = Math.max(0.5, Number(distanceKm) || 8);
+  const geomKm = routeLength(geom) / 1000;
+  const km = Math.max(0.5, geomKm || Number(distanceKm) || 8);
   const minutes = Math.max(1, Number(durationMin) || Math.round((km / 16) * 60));
 
   const knoopModels = chain.map((node) => ({

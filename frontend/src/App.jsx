@@ -62,6 +62,7 @@ export default function App() {
           wishSuggestions: Array.isArray(payload.wish_suggestions) ? payload.wish_suggestions : [],
           profile,
         });
+        if (payload.suggestion_id) recordRouteUse(payload.suggestion_id);
         setPlan(local);
         return;
       }

@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import httpx
 
-from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, BikeRouteRequest, GeocodeHit, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
+from app.models import AskRequest, AskResponse, BikeLegRequest, BikeLegResponse, BikeRouteRequest, GeocodeHit, IcoonrouteStretch, Knooppunt, PlanRequest, PoiHit, RerouteRequest, RerouteResponse, RoutePlan, RoutePreviewRequest, RoutePreviewResponse, RouteSuggestion, StopSummaryResponse, SurroundingsRequest, SurroundingsResponse, WishSuggestionsRequest, WishSuggestionsResponse
 from app.services.ai import answer_about_stop
 from app.services.geocoding import geocode, reverse
 from app.services import knooppunten as knoop_service
@@ -11,6 +11,7 @@ from app.services.planner import plan_route, preview_route, reroute, wish_sugges
 from app.services import pois as pois_service
 from app.services import routing as routing_service
 from app.services import suggestions as suggestion_service
+from app.services import icoonroutes as icoon_service
 from app.services import surroundings as surroundings_service
 from app.services import wikipedia as wikipedia_service
 
@@ -178,10 +179,53 @@ async def route_suggestions_endpoint(
     used: list[str] = Query(default=[]),
 ) -> list[RouteSuggestion]:
     try:
-        items = suggestion_service.suggest_routes(lat, lng, interests, used)
+        items = await suggestion_service.suggest_routes(lat, lng, interests, used)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return [RouteSuggestion(**item) for item in items]
+    return [RouteSuggestion(**{k: v for k, v in item.items() if k in RouteSuggestion.model_fields}) for item in items]
+
+
+@app.get("/api/icoonroute/{route_id}", response_model=IcoonrouteStretch)
+async def icoonroute_stretch_endpoint(
+    route_id: str,
+    lat: float = Query(ge=49.0, le=52.0),
+    lng: float = Query(ge=2.0, le=7.0),
+    target_km: float = Query(default=50, ge=8, le=90),
+) -> IcoonrouteStretch:
+    try:
+        data = await icoon_service.stretch_for_route(route_id, lat, lng, target_km)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    knoops = [
+        Knooppunt(
+            id=str(n.get("id") or ""),
+            number=str(n["number"]),
+            lat=float(n["lat"]),
+            lng=float(n["lng"]),
+            network=n.get("network"),
+            geoid=n.get("geoid"),
+        )
+        for n in data.get("knooppunten") or []
+    ]
+    return IcoonrouteStretch(
+        id=data["id"],
+        title=data["title"],
+        highlight=data.get("highlight") or "",
+        start=data.get("start") or data.get("start_label") or data["title"],
+        start_label=data.get("start_label") or "",
+        lat=float(data["lat"]),
+        lng=float(data["lng"]),
+        mode=data.get("mode") or "punt",
+        distance_km=float(data.get("distance_km") or target_km),
+        interests=list(data.get("interests") or []),
+        notes=data.get("notes") or "",
+        knooppunten=knoops,
+        geometry=list(data.get("geometry") or []),
+        legs=list(data.get("legs") or []),
+        source=data.get("source") or "Toerisme Vlaanderen icoonroutes",
+    )
 
 
 @app.post("/api/route-preview", response_model=RoutePreviewResponse)
@@ -215,7 +259,7 @@ async def wish_suggestions_endpoint(request: WishSuggestionsRequest) -> WishSugg
                 request.nodes,
                 list(request.interests),
             ),
-            timeout=14.0,
+            timeout=10.0,
         )
     except TimeoutError:
         # Liever leeg + client-retry dan hang tot browser-abort ("duurde te lang").

@@ -5,4 +5,4 @@ export const MAP_TILE = {
 };
 
 export const MAP_SOURCES =
-  "Kaart: OpenStreetMap. Route: OSRM. Knooppunten: Toerisme Vlaanderen (gratis WFS). Uitleg: Wikipedia.";
+  "Kaart: OpenStreetMap. Knooppunten & icoonroutes: Toerisme Vlaanderen (WFS). Uitleg: Wikipedia.";

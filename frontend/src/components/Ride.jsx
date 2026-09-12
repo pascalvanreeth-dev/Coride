@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
@@ -103,7 +103,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const [surroundingsError, setSurroundingsError] = useState("");
   const [wishBusy, setWishBusy] = useState(false);
   const [wishError, setWishError] = useState("");
-  const [wishRetryTick, setWishRetryTick] = useState(0);
   const [weatherOffer, setWeatherOffer] = useState(() => Boolean(plan.weather?.suggest_shorter));
   const [guideOpen, setGuideOpen] = useState(true);
   const guideOpenRef = useRef(true);
@@ -126,38 +125,38 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   modeRef.current = mode;
   planRef.current = plan;
 
-  const wishFetchStartedRef = useRef(false);
-  useEffect(() => {
-    wishFetchStartedRef.current = false;
-  }, [wishRetryTick]);
+  const wishAbortRef = useRef(null);
 
-  useEffect(() => {
-    if (wishFetchStartedRef.current) return;
+  const reloadWishSuggestions = useCallback(async () => {
     const current = planRef.current;
     const notes = (current.notes || "").trim();
     const wishStopsNow = (current.stops || []).filter((stop) => stop.matches_wish);
-    // Planner/App had al tegels → klaar, geen lange herzoektocht.
     if (wishStopsNow.length > 0) {
-      wishFetchStartedRef.current = true;
-      return undefined;
+      setWishBusy(false);
+      setWishError("");
+      return;
     }
 
-    const nodes = (current.knooppunten || []).map((node) => ({
-      id: node.id || "",
-      number: String(node.number ?? ""),
-      lat: node.lat,
-      lng: node.lng,
-      network: node.network || null,
-    }));
-    const nodeGeom = nodes
+    const nodes = (current.knooppunten || [])
       .filter((node) => Number.isFinite(Number(node.lat)) && Number.isFinite(Number(node.lng)))
-      .map((node) => [Number(node.lat), Number(node.lng)]);
+      .map((node) => ({
+        id: node.id || "",
+        number: String(node.number ?? ""),
+        lat: Number(node.lat),
+        lng: Number(node.lng),
+        network: node.network || null,
+      }));
+    const nodeGeom = nodes.map((node) => [node.lat, node.lng]);
     const geom =
-      nodeGeom.length >= 2 ? nodeGeom : samplePlanGeometry(current.geometry, 24);
+      current.geometry?.length > 1
+        ? samplePlanGeometry(current.geometry, 48)
+        : nodeGeom.length >= 2
+          ? nodeGeom
+          : [];
     if (geom.length < 2) {
-      wishFetchStartedRef.current = true;
+      setWishBusy(false);
       setWishError("Geen routepunten om suggesties te zoeken.");
-      return undefined;
+      return;
     }
 
     const interests = [...(current.interests || [])];
@@ -165,62 +164,63 @@ export default function Ride({ plan, onPlanChange, onBack }) {
       /caf[eéè]|taverne|tavern|herberg|koffie|pub|\bbar\b|brasserie|estaminet|bistro/i.test(notes);
     if (needHoreca && !interests.includes("horeca")) interests.push("horeca");
     if (!notes && !interests.length) {
-      wishFetchStartedRef.current = true;
-      return undefined;
+      setWishBusy(false);
+      return;
     }
     if (!interests.length) interests.push("geschiedenis");
 
-    wishFetchStartedRef.current = true;
+    // Annuleer vorige poging (Strict Mode / snelle retry) i.p.v. succes weg te gooien.
+    wishAbortRef.current?.abort();
+    const ac = new AbortController();
+    wishAbortRef.current = ac;
+
     setWishBusy(true);
     setWishError("");
 
-    const payload = { notes, interests, geometry: geom, nodes };
-
-    async function loadOnce(body, timeoutMs) {
-      const data = await fetchWishSuggestions(body, { timeoutMs });
-      return Array.isArray(data?.suggestions) ? data.suggestions : [];
-    }
-
-    async function tryLoad(body, timeoutMs) {
-      try {
-        return await loadOnce(body, timeoutMs);
-      } catch {
-        return null;
+    try {
+      const data = await fetchWishSuggestions(
+        { notes, interests, geometry: geom, nodes },
+        { timeoutMs: 10_000, signal: ac.signal },
+      );
+      if (ac.signal.aborted) return;
+      const items = Array.isArray(data?.suggestions) ? data.suggestions : [];
+      if (!items.length) {
+        setWishError(
+          data?.timed_out
+            ? "Suggesties laden lukte niet (timeout). Tik om opnieuw te proberen."
+            : "Geen plekken gevonden langs deze route. Tik om opnieuw te zoeken.",
+        );
+        return;
       }
-    }
-
-    function applyItems(items) {
       const extra = stopsFromWishPois(items, notes, interests);
-      if (!extra.length) return false;
+      if (!extra.length) {
+        setWishError("Geen plekken gevonden langs deze route. Tik om opnieuw te zoeken.");
+        return;
+      }
       const latest = planRef.current;
       const kept = (latest.stops || []).filter((stop) => !stop.matches_wish);
       onPlanChange({ ...latest, stops: [...extra, ...kept] });
       if (extra[0]) setActiveId((id) => id || extra[0].id);
       setWishError("");
-      return true;
-    }
-
-    (async () => {
-      try {
-        // Server cap ~14s; client iets ruimer. Eén fallback op profiel — geen 45s-ketting.
-        let items = notes ? await tryLoad(payload, 16_000) : null;
-        if (!items?.length) {
-          items = await tryLoad({ notes: "", interests, geometry: geom, nodes }, 12_000);
-        }
-        if (!items?.length) {
-          setWishError("Suggesties laden lukte niet. Tik om opnieuw te proberen.");
-          return;
-        }
-        if (!applyItems(items)) {
-          setWishError("Geen plekken gevonden langs deze route.");
-        }
-      } finally {
-        setWishBusy(false);
+    } catch (err) {
+      if (ac.signal.aborted || err?.code === "WISH_CANCELLED") return;
+      const msg = String(err?.message || "");
+      if (/duurde te lang/i.test(msg)) {
+        setWishError("Suggesties laden lukte niet (timeout). Tik om opnieuw te proberen.");
+      } else {
+        setWishError(msg || "Suggesties laden lukte niet. Tik om opnieuw te proberen.");
       }
-    })();
+    } finally {
+      if (wishAbortRef.current === ac) setWishBusy(false);
+    }
+  }, [onPlanChange]);
 
-    return undefined;
-  }, [onPlanChange, wishRetryTick]);
+  useEffect(() => {
+    void reloadWishSuggestions();
+    return () => {
+      wishAbortRef.current?.abort();
+    };
+  }, [reloadWishSuggestions]);
 
   const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
   const suggestionStops = useMemo(() => {
@@ -1200,7 +1200,8 @@ export default function Ride({ plan, onPlanChange, onBack }) {
                 }}
                 onClick={() => {
                   setWishError("");
-                  setWishRetryTick((tick) => tick + 1);
+                  setWishBusy(true);
+                  void reloadWishSuggestions();
                 }}
               >
                 {wishError}
@@ -1304,10 +1305,6 @@ export default function Ride({ plan, onPlanChange, onBack }) {
         )}
         <div className="editor">
           <strong>Eigen route</strong>
-          <p className="sources" style={{ margin: "6px 0 8px" }}>
-            Grijze nummers liggen in de buurt. Klik om ze toe te voegen of te schrappen. Overgeslagen
-            knooppunten worden via het netwerk aangevuld.
-          </p>
           {routeNodes.length ? (
             <ol className="picked-list route-knoop-list">
               {routeNodes.map((node, index) => {
