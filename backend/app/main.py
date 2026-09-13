@@ -252,6 +252,7 @@ async def route_preview_endpoint(request: RoutePreviewRequest) -> RoutePreviewRe
 @app.post("/api/wish-suggestions", response_model=WishSuggestionsResponse)
 async def wish_suggestions_endpoint(request: WishSuggestionsRequest) -> WishSuggestionsResponse:
     try:
+        # Lange tochten: Wikipedia + Nominatim kunnen >10s nodig hebben.
         data = await asyncio.wait_for(
             wish_suggestions_along_route(
                 request.notes,
@@ -259,7 +260,7 @@ async def wish_suggestions_endpoint(request: WishSuggestionsRequest) -> WishSugg
                 request.nodes,
                 list(request.interests),
             ),
-            timeout=10.0,
+            timeout=22.0,
         )
     except TimeoutError:
         # Liever leeg + client-retry dan hang tot browser-abort ("duurde te lang").

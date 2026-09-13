@@ -63,6 +63,7 @@ class PoiHit(BaseModel):
     hint: str | None = None
     # "wish" = Extra wens (zoekveld); "profile" = profielsuggestie
     source: str | None = None
+    wish_source: str | None = None
 
 
 class PlanRequest(BaseModel):
@@ -383,7 +384,7 @@ class WishSuggestionsRequest(BaseModel):
             if not (-90 <= lat <= 90 and -180 <= lng <= 180):
                 continue
             out.append([lat, lng])
-            if len(out) >= 80:
+            if len(out) >= 120:
                 break
         return out
 

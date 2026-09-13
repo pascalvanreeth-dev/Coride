@@ -180,7 +180,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     try {
       const data = await fetchWishSuggestions(
         { notes, interests, geometry: geom, nodes },
-        { timeoutMs: 10_000, signal: ac.signal },
+        { timeoutMs: 20_000, signal: ac.signal },
       );
       if (ac.signal.aborted) return;
       const items = Array.isArray(data?.suggestions) ? data.suggestions : [];

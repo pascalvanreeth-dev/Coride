@@ -22,10 +22,11 @@ class Settings(BaseSettings):
     )
     nominatim_url: str = "https://nominatim.openstreetmap.org"
     overpass_urls: str = (
-        "https://overpass.kumi.systems/api/interpreter,"
         "https://z.overpass-api.de/api/interpreter,"
         "https://overpass-api.de/api/interpreter,"
-        "https://lz4.overpass-api.de/api/interpreter"
+        "https://lz4.overpass-api.de/api/interpreter,"
+        "https://overpass.kumi.systems/api/interpreter,"
+        "https://overpass.openstreetmap.fr/api/interpreter"
     )
     osrm_bike_url: str = "https://routing.openstreetmap.de/routed-bike"
     wikipedia_langs: str = "nl,fr,de,en"

@@ -1,4 +1,4 @@
-import { fetchWishSuggestionsLocal, filterPoisNearRoute, WISH_ROUTE_CORRIDOR_M } from "./wishLocal.js";
+import { fetchWishSuggestionsLocal, filterPoisNearRoute, mergeWishSuggestionSources, wishCorridorM } from "./wishLocal.js";
 
 export async function geocode(q) {
   const controller = new AbortController();
@@ -139,22 +139,17 @@ export async function fetchRoutePreview(payload) {
   return data;
 }
 
-export async function fetchWishSuggestions(payload, { timeoutMs = 8_000, signal } = {}) {
-  // 1) Photon via Vite-proxy — snelle tegels, max. 2 km van de route.
-  try {
-    const local = await fetchWishSuggestionsLocal(payload, {
-      timeoutMs: Math.min(4000, timeoutMs),
-      maxDistanceM: WISH_ROUTE_CORRIDOR_M,
-    });
-    if (Array.isArray(local?.suggestions) && local.suggestions.length > 0) {
-      return local;
-    }
-  } catch {
-    /* val terug op backend */
-  }
+export async function fetchWishSuggestions(payload, { timeoutMs = 20_000, signal } = {}) {
+  // Backend (Wikipedia + Nominatim) is primair — Photon timeout vaak; lokaal snel falen.
+  const localMs = Math.min(2800, timeoutMs);
+  const backendMs = Math.min(18_000, timeoutMs);
+  const corridorM = wishCorridorM(payload?.geometry || [], payload?.nodes || []);
 
-  // 2) Backend-fallback, daarna zelfde 2 km-corridorfilter.
-  const backendMs = Math.min(4000, timeoutMs);
+  const localPromise = fetchWishSuggestionsLocal(payload, {
+    timeoutMs: localMs,
+    maxDistanceM: corridorM,
+  }).catch(() => null);
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), backendMs);
   const onExternalAbort = () => controller.abort();
@@ -168,46 +163,83 @@ export async function fetchWishSuggestions(payload, { timeoutMs = 8_000, signal 
     }
     signal.addEventListener("abort", onExternalAbort, { once: true });
   }
-  try {
-    const response = await apiFetch("/api/wish-suggestions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(formatApiError(data.detail, "Wenssuggesties konden niet geladen worden."));
+
+  const backendPromise = (async () => {
+    try {
+      const response = await apiFetch("/api/wish-suggestions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) return null;
+      return data;
+    } catch (err) {
+      if (isAbortError(err)) {
+        if (signal?.aborted || err?.code === "WISH_CANCELLED") throw err;
+        return { suggestions: [], timed_out: true };
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onExternalAbort);
     }
+  })();
+
+  let local = null;
+  let backend = null;
+  try {
+    [local, backend] = await Promise.all([localPromise, backendPromise]);
+  } catch (err) {
+    if (isAbortError(err) && (signal?.aborted || err?.code === "WISH_CANCELLED")) {
+      const cancelled = new Error("cancelled");
+      cancelled.name = "AbortError";
+      cancelled.code = "WISH_CANCELLED";
+      throw cancelled;
+    }
+    local = await localPromise.catch(() => null);
+  }
+
+  const merged = mergeWishSuggestionSources(
+    [local?.suggestions, backend?.suggestions],
+    {
+      notes: payload?.notes || "",
+      geometry: payload?.geometry || [],
+      nodes: payload?.nodes || [],
+    },
+  );
+
+  if (merged.suggestions.length > 0) {
+    return {
+      ...(backend || {}),
+      ...merged,
+      wish_summary: merged.wish_summary,
+    };
+  }
+
+  if (local?.suggestions?.length) return local;
+  if (backend?.suggestions?.length) {
     const filtered = filterPoisNearRoute(
-      data?.suggestions || [],
+      backend.suggestions,
       payload.geometry,
       payload.nodes,
-      WISH_ROUTE_CORRIDOR_M,
+      corridorM,
     );
     return {
-      ...data,
+      ...backend,
       suggestions: filtered,
       wish_summary:
         filtered.length > 0
-          ? data?.wish_summary || "Plekken binnen 2 km van je knooppuntenroute."
-          : data?.wish_summary || null,
+          ? backend.wish_summary || merged.wish_summary
+          : backend.wish_summary || null,
     };
-  } catch (err) {
-    if (isAbortError(err)) {
-      if (signal?.aborted || err?.code === "WISH_CANCELLED") {
-        const cancelled = new Error("cancelled");
-        cancelled.name = "AbortError";
-        cancelled.code = "WISH_CANCELLED";
-        throw cancelled;
-      }
-      return { suggestions: [], wish_summary: null, timed_out: true };
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener("abort", onExternalAbort);
   }
+
+  if (backend?.timed_out || local == null) {
+    return { suggestions: [], wish_summary: null, timed_out: Boolean(backend?.timed_out) };
+  }
+  return { suggestions: [], wish_summary: null };
 }
 
 export async function fetchRouteSuggestions(lat, lng, interests = [], used = []) {

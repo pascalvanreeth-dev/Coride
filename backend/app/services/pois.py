@@ -223,6 +223,15 @@ NOTE_INTEREST_KEYS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+def _key_in_blob(key: str, blob: str) -> bool:
+    """Substring-match met woordgrenzen voor korte tokens (voorkomt 'bar' in Barbara)."""
+    if not key or not blob:
+        return False
+    if len(key) <= 3 or key in {"bar", "bier", "ijs", "eten", "pub", "park", "bos", "meer", "toren"}:
+        return re.search(rf"(?<![a-zà-ÿ]){re.escape(key)}(?![a-zà-ÿ])", blob) is not None
+    return key in blob
+
+
 def infer_interest(poi: dict[str, Any], allowed: list[str] | None = None) -> str | None:
     """Raad het thema van een plek uit naam/soort, beperkt tot gekozen interesses."""
     blob = (
@@ -233,7 +242,7 @@ def infer_interest(poi: dict[str, Any], allowed: list[str] | None = None) -> str
     for interest, keys in NOTE_INTEREST_KEYS:
         if allowed_set is not None and interest not in allowed_set:
             continue
-        if any(key in blob for key in keys):
+        if any(_key_in_blob(key, blob) for key in keys):
             return interest
     current = poi.get("interest")
     if current and (allowed_set is None or current in allowed_set):
@@ -594,8 +603,8 @@ async def fetch_cafes_fast(
     points: list[tuple[float, float]],
     radius_m: int = 7000,
 ) -> list[dict[str, Any]]:
-    """Snelle café/taverne-zoektocht: één Overpass-query, geen volledige themascan."""
-    radius_m = max(4000, min(int(radius_m), 10000))
+    """Snelle café/taverne-zoektocht: één Overpass-query langs enkele midpunten."""
+    radius_m = max(4000, min(int(radius_m), 8000))
     cleaned: list[tuple[float, float]] = []
     seen: set[tuple[float, float]] = set()
     for lat, lng in points or []:
@@ -606,8 +615,8 @@ async def fetch_cafes_fast(
             continue
         seen.add(key)
         cleaned.append((float(lat), float(lng)))
-        if len(cleaned) >= 3:
-            break
+    if len(cleaned) > 3:
+        cleaned = [cleaned[0], cleaned[len(cleaned) // 2], cleaned[-1]]
     if not cleaned:
         return []
     clauses: list[str] = []
@@ -623,37 +632,54 @@ async def fetch_cafes_fast(
 
 
 async def _overpass_fast(query: str, *, timeout_s: float = 18.0) -> dict[str, Any]:
-    """Snelle Overpass: alleen eerste werkende mirror, raw POST."""
+    """Snelle Overpass: mirrors parallel racen — eerste goede antwoord wint."""
+    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()][:4]
+    if not mirrors:
+        raise RuntimeError("Geen Overpass-mirrors geconfigureerd")
+
+    per_mirror = max(3.0, min(float(timeout_s), 8.0))
     errors: list[str] = []
-    mirrors = [url.strip() for url in settings.overpass_urls.split(",") if url.strip()]
-    for url in mirrors[:2]:
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_s, connect=4.0),
-                headers={"User-Agent": settings.user_agent},
-                follow_redirects=True,
-            ) as http:
-                response = await http.post(
-                    url,
-                    content=query.encode("utf-8"),
-                    headers={
-                        "User-Agent": settings.user_agent,
-                        "Content-Type": "text/plain; charset=utf-8",
-                    },
-                )
-                if response.status_code >= 400:
-                    errors.append(f"{url} -> HTTP {response.status_code}")
+
+    async def _one(url: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(per_mirror, connect=2.5),
+            headers={"User-Agent": settings.user_agent},
+            follow_redirects=True,
+        ) as http:
+            response = await http.post(
+                url,
+                content=query.encode("utf-8"),
+                headers={
+                    "User-Agent": settings.user_agent,
+                    "Content-Type": "text/plain; charset=utf-8",
+                },
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"{url} -> HTTP {response.status_code}")
+            payload = response.json()
+            remark = str(payload.get("remark") or "")
+            if "error" in remark.lower() or "runtime error" in remark.lower():
+                raise RuntimeError(f"{url} -> {remark[:120]}")
+            return payload
+
+    tasks = [asyncio.create_task(_one(url)) for url in mirrors]
+    try:
+        while tasks:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            tasks = list(pending)
+            for task in done:
+                try:
+                    payload = task.result()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc)[:160])
                     continue
-                payload = response.json()
-                remark = str(payload.get("remark") or "")
-                if "error" in remark.lower() or "runtime error" in remark.lower():
-                    errors.append(f"{url} -> {remark[:120]}")
-                    continue
+                for pending_task in tasks:
+                    pending_task.cancel()
                 return payload
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{url} -> {type(exc).__name__}")
-            continue
-    raise RuntimeError("Overpass (fast) faalde: " + "; ".join(errors))
+    finally:
+        for task in tasks:
+            task.cancel()
+    raise RuntimeError("Overpass (fast) faalde: " + "; ".join(errors[:4]))
 
 
 async def fetch_horeca_along_points(
@@ -1067,11 +1093,11 @@ async def fetch_horeca_nominatim_along_points(
             }
 
     tasks = [_one(lat, lng, query) for lat, lng in cleaned for query in queries]
-    # Nominatim rate-limit: kleine batches, korte pauze.
-    for index in range(0, len(tasks), 4):
-        await asyncio.gather(*tasks[index : index + 4], return_exceptions=True)
-        if index + 4 < len(tasks):
-            await asyncio.sleep(0.85)
+    # Nominatim rate-limit: batches met korte pauze (0.85s was te traag voor lange tochten).
+    for index in range(0, len(tasks), 5):
+        await asyncio.gather(*tasks[index : index + 5], return_exceptions=True)
+        if index + 5 < len(tasks):
+            await asyncio.sleep(0.35)
     return list(merged.values())
 
 
@@ -1186,4 +1212,115 @@ async def fetch_theme_nominatim_along_points(
             *[_one(*spec) for spec in specs[index : index + 6]],
             return_exceptions=True,
         )
+    return list(merged.values())
+
+
+def _classify_wiki_title(title: str, preferred: list[str] | None = None) -> str | None:
+    """Map Wikipedia-titel naar interesse; None = overslaan."""
+    t = (title or "").lower().strip()
+    if not t or t.startswith("lijst ") or t.startswith("categorie:"):
+        return None
+    blocked = (
+        "snelweg",
+        "gewestweg",
+        "afrit",
+        "knooppunt",
+        "parking",
+        "industriepark",
+        "haven van",
+        "stadion",
+        "arena",
+        "station",
+        "hockey",
+    )
+    if any(b in t for b in blocked):
+        return None
+    # Brug/straat alleen houden als ook erfgoed-woord.
+    if any(w in t for w in ("brug", "straat", "laan", "steenweg", "baan", "dijk", "plein")):
+        if not any(
+            w in t
+            for w in ("hof", "kasteel", "kerk", "kapel", "museum", "molen", "abdij", "fort", "klooster")
+        ):
+            return None
+    if any(w in t for w in ("café", "cafe", "brasserie", "restaurant", "taverne", "herberg", "bistro", "pub")):
+        return "horeca"
+    if any(w in t for w in ("park", "bos", "natuur", "heide", "duin", "meer ", "vijver")):
+        return "natuur"
+    if any(w in t for w in ("kerk", "kapel", "abdij", "klooster", "molen", "basiliek", "kathedraal")):
+        return "architectuur"
+    if any(w in t for w in ("museum", "kasteel", "fort", "monument", "erfgoed", "begijnhof", "hof van", "toren")):
+        return "geschiedenis"
+    preferred = preferred or ["geschiedenis"]
+    if "geschiedenis" in preferred:
+        return "geschiedenis"
+    if "architectuur" in preferred:
+        return "architectuur"
+    return preferred[0]
+
+
+async def fetch_wikipedia_along_points(
+    points: list[tuple[float, float]],
+    *,
+    interests: list[str] | None = None,
+    max_points: int = 10,
+    radius_m: int = 9000,
+    per_point: int = 14,
+) -> list[dict[str, Any]]:
+    """Betrouwbare route-POIs via Wikipedia geosearch (werkt als Nominatim/Photon/Overpass plat liggen)."""
+    from app.services import wikipedia as wiki_service
+
+    cleaned: list[tuple[float, float]] = []
+    seen_pt: set[tuple[float, float]] = set()
+    for lat, lng in points or []:
+        if lat is None or lng is None:
+            continue
+        key = (round(float(lat), 3), round(float(lng), 3))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        cleaned.append((float(lat), float(lng)))
+    if not cleaned:
+        return []
+    if len(cleaned) > max_points:
+        step = max(1, (len(cleaned) - 1) // max(1, max_points - 1))
+        spaced = [cleaned[i] for i in range(0, len(cleaned), step)][: max_points - 1]
+        if cleaned[-1] not in spaced:
+            spaced.append(cleaned[-1])
+        cleaned = spaced[:max_points]
+
+    preferred = _unique_interests(interests or []) or ["geschiedenis"]
+    radius_m = max(2500, min(int(radius_m), 10000))
+    merged: dict[str, dict[str, Any]] = {}
+
+    async def _one(lat: float, lng: float) -> None:
+        try:
+            rows = await wiki_service.nearby_places(lat, lng, radius_m=radius_m, langs=["nl"])
+        except Exception:
+            return
+        for row in rows[:per_point]:
+            name = str(row.get("name") or "").strip()
+            interest = _classify_wiki_title(name, preferred)
+            if not interest:
+                continue
+            if interest == "horeca" and "horeca" not in preferred:
+                continue
+            pid = str(row.get("id") or unique_key(name, row["lat"], row["lng"]))
+            merged[pid] = {
+                "id": pid,
+                "name": name,
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
+                "kind": row.get("kind") or interest,
+                "kind_label": kind_label(row.get("kind") or interest),
+                "interest": interest,
+                "source": "Wikipedia",
+                "wikipedia": row.get("wikipedia"),
+                "wikidata": None,
+                "description": "",
+                "heritage": "",
+                "hint": "uit je profiel" if interest != "horeca" else "past bij je wens",
+            }
+
+    # Alle punten parallel — Wikipedia geosearch is licht.
+    await asyncio.gather(*[_one(*pt) for pt in cleaned], return_exceptions=True)
     return list(merged.values())
