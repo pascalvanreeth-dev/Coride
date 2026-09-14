@@ -1198,15 +1198,18 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     });
 
     const startNode = chain[0];
-    setOrigin({
-      lat: Number(stretch.lat) || startNode.lat,
-      lng: Number(stretch.lng) || startNode.lng,
-      source: "route",
-    });
-    setViewFocus({
-      lat: Number(stretch.lat) || startNode.lat,
-      lng: Number(stretch.lng) || startNode.lng,
-    });
+    const stretchLat = Number(stretch.lat);
+    const stretchLng = Number(stretch.lng);
+    const originLat = Number.isFinite(stretchLat) ? stretchLat : Number(startNode.lat);
+    const originLng = Number.isFinite(stretchLng) ? stretchLng : Number(startNode.lng);
+    if (Number.isFinite(originLat) && Number.isFinite(originLng)) {
+      setOrigin({ lat: originLat, lng: originLng, source: "route" });
+      setViewFocus({ lat: originLat, lng: originLng });
+      onPreview({ lat: originLat, lng: originLng, zoom: 12 });
+    } else {
+      setOrigin(null);
+      setViewFocus(null);
+    }
     setStart(stretch.start_label || stretch.start || suggestion.title);
     setMode(stretch.mode || "punt");
     const km = Math.max(8, Math.round(Number(stretch.distance_km) || suggestion.distance_km || 50));
@@ -1217,11 +1220,6 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
       setInterests(stretch.interests);
     }
     setLocateTick((tick) => tick + 1);
-    onPreview({
-      lat: Number(stretch.lat) || startNode.lat,
-      lng: Number(stretch.lng) || startNode.lng,
-      zoom: 12,
-    });
     warmBikeNetwork({
       lat: Number(stretch.lat) || startNode.lat,
       lng: Number(stretch.lng) || startNode.lng,
@@ -2401,7 +2399,10 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         ) : (
         <>
         <MapContainer
-          center={[mapSeed.lat, mapSeed.lng]}
+          center={[
+            Number.isFinite(Number(mapSeed.lat)) ? Number(mapSeed.lat) : 51.05,
+            Number.isFinite(Number(mapSeed.lng)) ? Number(mapSeed.lng) : 3.72,
+          ]}
           zoom={zoom}
           attributionControl
           zoomControl={false}
@@ -2452,8 +2453,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
               onToggle={toggleNode}
             />
           )}
-          {origin && (origin.source === "map" || origin.source === "route") && (
-            <Marker position={[origin.lat, origin.lng]} icon={startIcon} zIndexOffset={1100}>
+          {origin &&
+            (origin.source === "map" || origin.source === "route") &&
+            Number.isFinite(Number(origin.lat)) &&
+            Number.isFinite(Number(origin.lng)) && (
+            <Marker position={[Number(origin.lat), Number(origin.lng)]} icon={startIcon} zIndexOffset={1100}>
               <Popup>{origin.source === "route" ? "Start Top 10-route" : "Zoekgebied / startpositie"}</Popup>
             </Marker>
           )}
@@ -2694,12 +2698,14 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
 }
 
 function WishRouteMarkers({ items, pickedIds, focusedId, onSelect }) {
-  return items.map((item) => {
+  return items
+    .filter((item) => Number.isFinite(Number(item?.lat)) && Number.isFinite(Number(item?.lng)))
+    .map((item) => {
     const picked = pickedIds.has(poiId(item));
     return (
       <Marker
         key={item.id}
-        position={[item.lat, item.lng]}
+        position={[Number(item.lat), Number(item.lng)]}
         icon={wishPoiIcon({
           interest: item.interest,
           kind: item.kind_label || item.kind,
@@ -2776,8 +2782,12 @@ function RouteChainKnoopMarkers({ nodes, geometry, pool }) {
     let lng = Number(node.lng);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
     if (String(node.number) === "76" && corridor76) {
-      lat = corridor76.lat;
-      lng = corridor76.lng;
+      const cLat = Number(corridor76.lat);
+      const cLng = Number(corridor76.lng);
+      if (Number.isFinite(cLat) && Number.isFinite(cLng)) {
+        lat = cLat;
+        lng = cLng;
+      }
     } else if (!light && geometry?.length > 1 && !knoopOnGeometry(node, geometry, 150)) {
       const { prev, nxt } = nearestOnGeometryNeighbors(nodes, index, geometry);
       if (prev && nxt) {
@@ -2785,12 +2795,13 @@ function RouteChainKnoopMarkers({ nodes, geometry, pool }) {
         const nextIdx = geometryProgressIndex(Number(nxt.lat), Number(nxt.lng), geometry);
         const midIdx = Math.round((prevIdx + nextIdx) / 2);
         const pt = geometry[midIdx];
-        if (pt?.length >= 2) {
-          lat = pt[0];
-          lng = pt[1];
+        if (pt?.length >= 2 && Number.isFinite(Number(pt[0])) && Number.isFinite(Number(pt[1]))) {
+          lat = Number(pt[0]);
+          lng = Number(pt[1]);
         }
       }
     }
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
     return (
       <Marker
         key={`route-chain-${nodeId(node)}-${index}`}
@@ -2802,11 +2813,11 @@ function RouteChainKnoopMarkers({ nodes, geometry, pool }) {
       </Marker>
     );
   });
-  if (!has76 && corridor76) {
+  if (!has76 && corridor76 && Number.isFinite(Number(corridor76.lat)) && Number.isFinite(Number(corridor76.lng))) {
     markers.push(
       <Marker
         key="route-chain-76-corridor"
-        position={[corridor76.lat, corridor76.lng]}
+        position={[Number(corridor76.lat), Number(corridor76.lng)]}
         icon={nodeIcon("76", "picked", scale)}
         zIndexOffset={1500}
       >
@@ -2814,7 +2825,7 @@ function RouteChainKnoopMarkers({ nodes, geometry, pool }) {
       </Marker>,
     );
   }
-  return markers;
+  return markers.filter(Boolean);
 }
 
 function RoutePreviewKnoopMarkers({ nodes, geometry }) {
@@ -2824,12 +2835,14 @@ function RoutePreviewKnoopMarkers({ nodes, geometry }) {
 function PlannerKnoopMarkers({ nodes, buildMode, startChoice, selectedIds, origin, nodeVariant, onToggle }) {
   const { scale, showKnoopMarkers } = useMapZoom();
   if (!showKnoopMarkers) return null;
-  return nodes.map((node) => {
+  return nodes
+    .filter((node) => node && Number.isFinite(Number(node.lat)) && Number.isFinite(Number(node.lng)))
+    .map((node) => {
     const variant = nodeVariant(node);
     return (
       <Marker
         key={nodeId(node)}
-        position={[node.lat, node.lng]}
+        position={[Number(node.lat), Number(node.lng)]}
         icon={nodeIcon(node.number, variant, scale)}
         zIndexOffset={variant === "picked" || variant === "start" || variant === "end" ? 1200 : 1000}
         eventHandlers={{
@@ -2927,8 +2940,11 @@ function shortPlaceLabel(label) {
 function Recenter({ center, zoom, locked }) {
   const map = useMap();
   useEffect(() => {
-    if (locked || !center || center[0] == null || center[1] == null) return;
-    map.setView(center, zoom || map.getZoom());
+    if (locked || !center) return;
+    const lat = Number(center[0]);
+    const lng = Number(center[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    map.setView([lat, lng], zoom || map.getZoom());
   }, [center, locked, map, zoom]);
   return null;
 }
@@ -2938,11 +2954,14 @@ function FocusLastSelected({ node, trigger }) {
   const seen = useRef("");
   useEffect(() => {
     if (!node || !trigger) return;
+    const lat = Number(node.lat);
+    const lng = Number(node.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
     // Alleen bij een nieuwe selectie — niet opnieuw als coördinaten na routing wijzigen.
     if (trigger === seen.current) return;
     seen.current = trigger;
     noteMapUserInteraction();
-    map.flyTo([node.lat, node.lng], map.getZoom(), { duration: 0.45 });
+    map.flyTo([lat, lng], map.getZoom(), { duration: 0.45 });
   }, [map, node, trigger]);
   return null;
 }
@@ -2952,10 +2971,13 @@ function FitNodes({ origin }) {
   const seen = useRef("");
   useEffect(() => {
     if (!origin) return;
-    const key = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}`;
+    const lat = Number(origin.lat);
+    const lng = Number(origin.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
     if (key === seen.current) return;
     seen.current = key;
-    map.setView([origin.lat, origin.lng], Math.max(map.getZoom(), 14), { animate: true });
+    map.setView([lat, lng], Math.max(map.getZoom(), 14), { animate: true });
   }, [origin?.lat, origin?.lng, map]);
   return null;
 }

@@ -1,5 +1,6 @@
 import { Circle, Marker, Popup } from "react-leaflet";
 import L from "leaflet";
+import { isValidLatLng } from "../geo.js";
 
 export const hereIcon = L.divIcon({
   className: "here-marker",
@@ -9,14 +10,16 @@ export const hereIcon = L.divIcon({
 });
 
 export default function HereMarker({ position, accuracy = 0 }) {
-  if (!position) return null;
+  if (!position || !isValidLatLng(position.lat, position.lng)) return null;
+  const lat = Number(position.lat);
+  const lng = Number(position.lng);
   const radius = Math.min(Math.max(Number(accuracy) || 0, 0), 180);
 
   return (
     <>
       {radius > 8 && (
         <Circle
-          center={[position.lat, position.lng]}
+          center={[lat, lng]}
           radius={radius}
           pathOptions={{
             color: "#2563eb",
@@ -27,7 +30,7 @@ export default function HereMarker({ position, accuracy = 0 }) {
           }}
         />
       )}
-      <Marker position={[position.lat, position.lng]} icon={hereIcon} zIndexOffset={1400}>
+      <Marker position={[lat, lng]} icon={hereIcon} zIndexOffset={1400}>
         <Popup>Je bent hier</Popup>
       </Marker>
     </>

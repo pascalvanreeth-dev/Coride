@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Circle, Marker } from "react-leaflet";
 import L from "leaflet";
+import { isValidLatLng } from "../geo.js";
 
 const pulseIcon = L.divIcon({
   className: "focus-pulse-marker",
@@ -24,15 +25,18 @@ export default function FocusPulse({ position, token, durationMs = 3400, radiusM
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [position?.lat, position?.lng, token, durationMs]);
 
-  if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng) || !token) {
+  if (!position || !isValidLatLng(position.lat, position.lng) || !token) {
     return null;
   }
+
+  const lat = Number(position.lat);
+  const lng = Number(position.lng);
 
   return (
     <>
       <Circle
         key={`focus-circle-${token}`}
-        center={[position.lat, position.lng]}
+        center={[lat, lng]}
         radius={radiusM}
         pathOptions={{
           color: "#c70068",
@@ -45,7 +49,7 @@ export default function FocusPulse({ position, token, durationMs = 3400, radiusM
       />
       <Marker
         key={`focus-halo-${token}`}
-        position={[position.lat, position.lng]}
+        position={[lat, lng]}
         icon={pulseIcon}
         interactive={false}
         keyboard={false}

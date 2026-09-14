@@ -53,9 +53,15 @@ export default function MapChrome({
   }, [searchOpen]);
 
   function goToHit(hit) {
+    const lat = Number(hit?.lat);
+    const lng = Number(hit?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      setError("Geen geldige coördinaten voor deze plek.");
+      return;
+    }
     const zoom = 12;
-    map?.flyTo([hit.lat, hit.lng], zoom, { duration: 0.75 });
-    onGoTo?.({ lat: hit.lat, lng: hit.lng, label: hit.label, zoom });
+    map?.flyTo([lat, lng], zoom, { duration: 0.75 });
+    onGoTo?.({ lat, lng, label: hit.label, zoom });
     setSearchOpen(false);
     setQuery("");
     setResults([]);

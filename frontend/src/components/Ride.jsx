@@ -1536,7 +1536,11 @@ export default function Ride({ plan, onPlanChange, onBack }) {
             token={focusPulse?.key}
             onDone={() => setFocusPulse(null)}
           />
-          {mode === "demo" && <Marker position={[position.lat, position.lng]} icon={bikeIcon} />}
+          {mode === "demo" &&
+            Number.isFinite(Number(position?.lat)) &&
+            Number.isFinite(Number(position?.lng)) && (
+              <Marker position={[Number(position.lat), Number(position.lng)]} icon={bikeIcon} />
+            )}
           <HereMarker position={gps} accuracy={gps?.accuracy} />
           <MapFlyTo position={locateTick > 0 ? gps : null} trigger={locateTick} zoom={16} />
           <MapFlyTo
@@ -1866,13 +1870,16 @@ function FitRoute({ geometry, nodes, start }) {
   useEffect(() => {
     const points = [];
     for (const point of geometry || []) {
-      if (Array.isArray(point) && point.length >= 2) points.push([point[0], point[1]]);
+      if (!Array.isArray(point) || point.length < 2) continue;
+      const lat = Number(point[0]);
+      const lng = Number(point[1]);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
     }
     if (points.length < 2) {
       for (const node of nodes || []) {
-        if (Number.isFinite(node?.lat) && Number.isFinite(node?.lng)) {
-          points.push([node.lat, node.lng]);
-        }
+        const lat = Number(node?.lat);
+        const lng = Number(node?.lng);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
       }
     }
     if (points.length >= 2) {
@@ -1891,7 +1898,11 @@ function FitRoute({ geometry, nodes, start }) {
 function Follow({ position, enabled }) {
   const map = useMap();
   useEffect(() => {
-    if (enabled) map.panTo([position.lat, position.lng]);
+    if (!enabled || !position) return;
+    const lat = Number(position.lat);
+    const lng = Number(position.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    map.panTo([lat, lng]);
   }, [enabled, map, position]);
   return null;
 }

@@ -9,6 +9,34 @@ export function haversine(a, b) {
   return 2 * radius * Math.asin(Math.sqrt(sin));
 }
 
+/** Geldige WGS84-coördinaat — voorkomt Leaflet "Invalid LatLng (NaN, NaN)". */
+export function isValidLatLng(lat, lng) {
+  const la = Number(lat);
+  const ln = Number(lng);
+  return Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180;
+}
+
+export function toLatLngPair(input) {
+  if (!input) return null;
+  if (Array.isArray(input) && input.length >= 2) {
+    const lat = Number(input[0]);
+    const lng = Number(input[1]);
+    return isValidLatLng(lat, lng) ? [lat, lng] : null;
+  }
+  const lat = Number(input.lat);
+  const lng = Number(input.lng);
+  return isValidLatLng(lat, lng) ? [lat, lng] : null;
+}
+
+export function sanitizeLatLngPositions(positions) {
+  const out = [];
+  for (const point of positions || []) {
+    const pair = toLatLngPair(point);
+    if (pair) out.push(pair);
+  }
+  return out;
+}
+
 export function stopSpeaking() {
   if (typeof window !== "undefined") window.clearTimeout(speakTimer);
   window.speechSynthesis?.cancel();

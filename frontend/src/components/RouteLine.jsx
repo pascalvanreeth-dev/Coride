@@ -1,4 +1,5 @@
 import { Polyline } from "react-leaflet";
+import { sanitizeLatLngPositions } from "../geo.js";
 
 export const ROUTE_LINE = {
   color: "#c70068",
@@ -10,12 +11,13 @@ export const ROUTE_LINE = {
 const CAP = { lineCap: "round", lineJoin: "round" };
 
 export default function RouteLine({ positions, opacity = 1, dashed = false, color = ROUTE_LINE.color }) {
-  if (!positions?.length || positions.length < 2) return null;
+  const clean = sanitizeLatLngPositions(positions);
+  if (clean.length < 2) return null;
 
   return (
     <>
       <Polyline
-        positions={positions}
+        positions={clean}
         pathOptions={{
           color: ROUTE_LINE.halo,
           weight: ROUTE_LINE.haloWeight,
@@ -24,7 +26,7 @@ export default function RouteLine({ positions, opacity = 1, dashed = false, colo
         }}
       />
       <Polyline
-        positions={positions}
+        positions={clean}
         pathOptions={{
           color,
           weight: ROUTE_LINE.weight,
