@@ -5,7 +5,7 @@ import { haversine } from "./geo.js";
 /** Max. standaard-corridor (korte tochten). Langere routes: zie wishCorridorM. */
 export const WISH_ROUTE_CORRIDOR_M = 2000;
 
-/** Corridor schaalt met route-lengte: ~2,5 km kort → ~5 km op 60 km. */
+/** Corridor schaalt met route-lengte: ~2,5 km kort → ~7 km op 100+ km. */
 export function wishCorridorM(routeKmOrGeometry, nodes) {
   let km = Number(routeKmOrGeometry);
   if (!Number.isFinite(km) || km <= 0) {
@@ -17,7 +17,8 @@ export function wishCorridorM(routeKmOrGeometry, nodes) {
   }
   if (km < 20) return 2500;
   if (km < 40) return 3800;
-  return Math.min(5500, Math.round(2500 + km * 45));
+  if (km < 70) return Math.min(5500, Math.round(2500 + km * 45));
+  return Math.min(7500, Math.round(4000 + km * 30));
 }
 
 const THEME_QUERIES = {
@@ -42,7 +43,7 @@ const THEME_PHOTON_TAGS = {
   evenementen: ["amenity:theatre", "amenity:arts_centre"],
 };
 
-const WISH_RESULT_CAP = 28;
+const WISH_RESULT_CAP = 36;
 
 function toLatLng(point) {
   if (!point) return null;
@@ -152,8 +153,8 @@ function sampleSearchPoints(geometry, nodes) {
   const route = routePointsForWish(geometry, nodes);
   if (!route.length) return [];
   const km = routeLengthM(route) / 1000;
-  // ~elke 3 km, begrensd 8–22 punten (60 km → ~20).
-  const maxPoints = Math.max(8, Math.min(22, Math.round(km / 3) || 8));
+  // ~elke 3 km, begrensd 8–36 punten (110 km → ~36).
+  const maxPoints = Math.max(8, Math.min(36, Math.round(km / 3) || 8));
   if (route.length <= maxPoints) return route;
   const out = [];
   for (let i = 0; i < maxPoints; i += 1) {

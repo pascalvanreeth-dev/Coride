@@ -58,7 +58,7 @@ def _wish_poi_cache_key(
     knoop = "|".join(
         str(n.get("geoid") or n.get("number") or "") for n in (chain or [])[:4]
     )
-    return f"v9|{round(float(mid[0]), 2)}:{round(float(mid[1]), 2)}|{interests}|{note}|{knoop}"
+    return f"v11|{round(float(mid[0]), 2)}:{round(float(mid[1]), 2)}|{interests}|{note}|{knoop}"
 
 
 def _place_from_knoop(node: dict[str, Any]) -> Place:
@@ -1721,9 +1721,11 @@ async def _fast_wish_pois_for_manual(
     ]
     wish_set = set(wish_interests)
     route_km = _geometry_length_km(geometry) if geometry else 0.0
-    sample_budget = max(8, min(16, int(round(max(route_km, 12) / 4.0)) or 8))
+    # Lange tochten: dichter sampelen (~elke 4 km), tot 28 punten.
+    sample_budget = max(8, min(28, int(round(max(route_km, 12) / 4.0)) or 8))
     sample_points = _sample_route_points(geometry, sample_budget)
-    for node in (chain or [])[:: max(1, len(chain) // 8 or 1)][:10]:
+    knoop_step = max(1, len(chain) // max(10, min(16, sample_budget)) or 1)
+    for node in (chain or [])[::knoop_step][:16]:
         try:
             sample_points.append((float(node["lat"]), float(node["lng"])))
         except (KeyError, TypeError, ValueError):
@@ -1747,8 +1749,10 @@ async def _fast_wish_pois_for_manual(
     if not profile_themes and not cafe_focus:
         profile_themes = list(wish_interests)
 
-    # Wikipedia (profiel) + Nominatim-horeca (zoekvak) parallel — niet wachten tot wiki “vol” is.
-    search_pts = sample_points[: min(6, sample_budget)]
+    # Hele sample gebruiken (niet meer afkappen op 6 — dat gaf 1 hit op 100+ km).
+    search_pts = sample_points
+    wiki_max = min(len(search_pts) or 1, 14 if route_km >= 80 else (12 if route_km >= 45 else 8))
+    wiki_timeout = 18.0 if route_km >= 80 else (12.0 if route_km >= 45 else 7.5)
     wiki_themes = list(
         dict.fromkeys(
             [
@@ -1757,31 +1761,39 @@ async def _fast_wish_pois_for_manual(
             ]
         )
     )
-    wiki_task = asyncio.create_task(
-        _optional(
-            pois_service.fetch_wikipedia_along_points(
-                search_pts,
-                interests=wiki_themes,
-                max_points=len(search_pts) or 1,
-                radius_m=9000 if route_km >= 40 else 7000,
-                per_point=12,
-            ),
-            [],
-            6.5,
-        )
+    # Wikipedia eerst (volle bandbreedte); horeca daarna als bonus.
+    # Parallel met Overpass/Nominatim liet wiki vaak timeoutten → 0/1 suggestie op lange tochten.
+    wiki_rows = await _optional(
+        pois_service.fetch_wikipedia_along_points(
+            search_pts,
+            interests=wiki_themes,
+            max_points=wiki_max,
+            radius_m=10000 if route_km >= 60 else (9000 if route_km >= 40 else 7000),
+            per_point=10 if route_km >= 60 else 12,
+        ),
+        [],
+        wiki_timeout,
     )
+    groups: list[list[dict[str, Any]]] = [wiki_rows or []]
+
     horeca_tasks: list[asyncio.Task] = []
     if cafe_focus or want_horeca:
-        # 1–3 midpunten Overpass = sneller + minder 504 dan lange multi-around query.
-        mid_pts = search_pts[:2] or search_pts[:1]
-        if len(search_pts) >= 3:
-            mid_pts = [search_pts[0], search_pts[len(search_pts) // 2], search_pts[-1]][:3]
+        # Verspreide midpunten langs de hele tocht (niet alleen begin/midden/eind).
+        if len(search_pts) <= 3:
+            mid_pts = list(search_pts)
+        else:
+            n_mid = 6 if route_km >= 80 else (4 if route_km >= 40 else 3)
+            n_mid = min(n_mid, len(search_pts))
+            mid_pts = [
+                search_pts[int(round(i * (len(search_pts) - 1) / max(1, n_mid - 1)))]
+                for i in range(n_mid)
+            ]
         horeca_tasks.append(
             asyncio.create_task(
                 _optional(
-                    pois_service.fetch_cafes_fast(mid_pts, radius_m=6500),
+                    pois_service.fetch_cafes_fast(mid_pts, radius_m=7000 if route_km >= 60 else 6500),
                     [],
-                    7.0,
+                    8.0 if route_km >= 60 else 7.0,
                 )
             )
         )
@@ -1789,24 +1801,23 @@ async def _fast_wish_pois_for_manual(
             asyncio.create_task(
                 _optional(
                     pois_service.fetch_horeca_photon_along_points(
-                        mid_pts[:2],
-                        max_points=2,
+                        mid_pts[: min(4, len(mid_pts))],
+                        max_points=min(4, len(mid_pts)),
                         per_point=6,
                         queries=("café", "taverne", "cafe"),
                         osm_tags=("amenity:cafe", "amenity:pub", "amenity:bar"),
                     ),
                     [],
-                    2.5,
+                    2.8,
                 )
             )
         )
-        # Nominatim sparingly — publieke API is vaak 429.
         horeca_tasks.append(
             asyncio.create_task(
                 _optional(
                     pois_service.fetch_horeca_nominatim_along_points(
-                        mid_pts[:2],
-                        max_points=2,
+                        mid_pts[: min(3, len(mid_pts))],
+                        max_points=min(3, len(mid_pts)),
                         per_point=5,
                     ),
                     [],
@@ -1815,16 +1826,9 @@ async def _fast_wish_pois_for_manual(
             )
         )
 
-    groups: list[list[dict[str, Any]]] = []
-    wiki_rows: list[dict[str, Any]] = []
-    try:
-        wiki_rows = await wiki_task or []
-        groups.append(wiki_rows)
-    except Exception:
-        groups.append([])
-
     if horeca_tasks:
-        done, pending = await asyncio.wait(set(horeca_tasks), timeout=7.5)
+        horeca_wait = 8.5 if route_km >= 60 else 7.5
+        done, pending = await asyncio.wait(set(horeca_tasks), timeout=horeca_wait)
         for task in pending:
             task.cancel()
         for task in done:
@@ -1833,7 +1837,6 @@ async def _fast_wish_pois_for_manual(
             except Exception:
                 groups.append([])
     elif len(wiki_rows or []) < 6 and profile_themes:
-        # Geen café-wens: dunne wiki → korte Nominatim-thema-bonus.
         bonus = await _optional(
             pois_service.fetch_theme_nominatim_along_points(
                 search_pts[:3],
@@ -1899,8 +1902,8 @@ async def _fast_wish_pois_for_manual(
             poi["hint"] = poi.get("hint") or "uit je profiel"
             poi["source"] = "profile"
 
-    keep_geom_m = 7000 if route_km >= 40 else (5000 if route_km >= 20 else 3500)
-    keep_knoop_m = 10000 if route_km >= 40 else 7000
+    keep_geom_m = 9000 if route_km >= 80 else (7000 if route_km >= 40 else (5000 if route_km >= 20 else 3500))
+    keep_knoop_m = 12000 if route_km >= 80 else (10000 if route_km >= 40 else 7000)
 
     kept: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1993,8 +1996,10 @@ async def _fast_wish_pois_for_manual(
             other_hits.append(item)
 
     if cafe_focus and (wish_hits or profile_hits):
-        wish_pick = wish_hits[:12]
-        profile_pick = profile_hits[:12]
+        wish_n = 16 if route_km >= 60 else 12
+        profile_n = 16 if route_km >= 60 else 12
+        wish_pick = wish_hits[:wish_n]
+        profile_pick = profile_hits[:profile_n]
         seen_ids = {str(p.get("id") or "") for p in wish_pick}
         diverse = list(wish_pick)
         for poi in profile_pick:
@@ -2005,7 +2010,7 @@ async def _fast_wish_pois_for_manual(
             if pid:
                 seen_ids.add(pid)
         for poi in other_hits:
-            if len(diverse) >= 24:
+            if len(diverse) >= (32 if route_km >= 60 else 24):
                 break
             pid = str(poi.get("id") or "")
             if pid and pid in seen_ids:
@@ -2015,12 +2020,13 @@ async def _fast_wish_pois_for_manual(
                 seen_ids.add(pid)
     else:
         ordered = [*wish_hits, *profile_hits, *other_hits]
+        wanted = min(32 if route_km >= 60 else 24, max(12, _wish_suggestion_target(route_km, wish_interests)))
         diverse = pois_service.pick_diverse_pois(
             ordered,
             wish_interests,
-            wanted=min(24, max(12, len(wish_interests) * 4)),
-            min_distance_m=220,
-        ) or ordered[:24]
+            wanted=wanted,
+            min_distance_m=180 if route_km >= 60 else 220,
+        ) or ordered[:wanted]
 
     labels = [
         suggestion_service.INTEREST_LABELS.get(item, item)
@@ -2050,11 +2056,13 @@ async def _fast_wish_pois_for_manual(
             )
         poi["wish_source"] = "wish" if poi.get("source") == "wish" else "profile"
 
-    _WISH_POI_CACHE[cache_key] = (time.monotonic(), (list(diverse), summary))
-    if len(_WISH_POI_CACHE) > 80:
-        oldest = sorted(_WISH_POI_CACHE.items(), key=lambda item: item[1][0])[:20]
-        for key, _ in oldest:
-            _WISH_POI_CACHE.pop(key, None)
+    # Lege antwoorden niet cachen — anders blijft een timeout-misser 12 min hangen.
+    if diverse:
+        _WISH_POI_CACHE[cache_key] = (time.monotonic(), (list(diverse), summary))
+        if len(_WISH_POI_CACHE) > 80:
+            oldest = sorted(_WISH_POI_CACHE.items(), key=lambda item: item[1][0])[:20]
+            for key, _ in oldest:
+                _WISH_POI_CACHE.pop(key, None)
     return diverse, summary
 
 

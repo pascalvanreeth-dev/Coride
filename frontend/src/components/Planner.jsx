@@ -682,16 +682,23 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
         if (next.length) rememberNodes(...next);
         setNodes((prev) => {
           const out = new Map();
-          // Route/selectie altijd behouden; viewport daarna tot max ~220 markers.
+          // Selectie eerst (klein).
           for (const node of selectedIdsRef.current.map((id) => nodeLookupRef.current.get(id))) {
             if (node) out.set(nodeId(node), node);
           }
-          for (const node of draftRef.current?.knooppunten || []) {
-            if (node) out.set(nodeId(node), node);
-          }
+          // Viewport-fetch daarna — omgeving mag niet verdwijnen achter via-knopen van de draft.
           for (const node of next) {
             if (out.size >= 220) break;
             out.set(nodeId(node), node);
+          }
+          // Beperkte route-spine voor lookup/magenta (niet alle via's).
+          let spine = 0;
+          for (const node of draftRef.current?.knooppunten || []) {
+            if (!node || spine >= 48) break;
+            const id = nodeId(node);
+            if (!out.has(id)) spine += 1;
+            if (out.size >= 220) break;
+            out.set(id, node);
           }
           for (const node of prev || []) {
             if (out.size >= 220) break;
@@ -1011,7 +1018,7 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             geometry,
             nodes,
           },
-          20_000,
+          { timeoutMs: 28_000 },
         );
         const items = Array.isArray(data?.suggestions) ? data.suggestions : [];
         const summary = data?.wish_summary || "";
@@ -1407,14 +1414,24 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
   function chooseMapStart() {
     setStartChoice("map");
     setGeoError("");
-    setOrigin(null);
-    setStart("");
     setSelectedIds([]);
     setNodeCatalog({});
-    setViewFocus(null);
     setDraft(null);
     manualRouteIdsRef.current = [];
     reverseKeyRef.current = "";
+    // Seed met huidige kaartpositie — anders blijft "Startpunt wordt gezet…" hangen tot een klik.
+    const lat = Number(center?.[0] ?? here?.lat);
+    const lng = Number(center?.[1] ?? here?.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      setOrigin({ lat, lng, source: "map" });
+      setStart("Positie op de kaart");
+      setViewFocus({ lat, lng });
+      void setFromCoords({ lat, lng }, "map");
+    } else {
+      setOrigin(null);
+      setStart("");
+      setViewFocus(null);
+    }
   }
 
   function requestMapStart() {

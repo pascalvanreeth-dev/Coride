@@ -1321,6 +1321,10 @@ async def fetch_wikipedia_along_points(
                 "hint": "uit je profiel" if interest != "horeca" else "past bij je wens",
             }
 
-    # Alle punten parallel — Wikipedia geosearch is licht.
-    await asyncio.gather(*[_one(*pt) for pt in cleaned], return_exceptions=True)
+    # Batches van 6: Wikipedia vriendelijk houden op lange tochten (18 punten).
+    for index in range(0, len(cleaned), 6):
+        await asyncio.gather(
+            *[_one(*pt) for pt in cleaned[index : index + 6]],
+            return_exceptions=True,
+        )
     return list(merged.values())

@@ -139,10 +139,10 @@ export async function fetchRoutePreview(payload) {
   return data;
 }
 
-export async function fetchWishSuggestions(payload, { timeoutMs = 20_000, signal } = {}) {
+export async function fetchWishSuggestions(payload, { timeoutMs = 28_000, signal } = {}) {
   // Backend (Wikipedia + Nominatim) is primair — Photon timeout vaak; lokaal snel falen.
   const localMs = Math.min(2800, timeoutMs);
-  const backendMs = Math.min(18_000, timeoutMs);
+  const backendMs = Math.min(26_000, timeoutMs);
   const corridorM = wishCorridorM(payload?.geometry || [], payload?.nodes || []);
 
   const localPromise = fetchWishSuggestionsLocal(payload, {

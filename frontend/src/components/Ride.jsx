@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
+import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
-import { askAbout, fetchStopSummary, fetchSurroundings, fetchWishSuggestions, reroute } from "../api.js";
+import { askAbout, fetchKnooppunten, fetchStopSummary, fetchSurroundings, fetchWishSuggestions, reroute } from "../api.js";
 import { samplePlanGeometry, stopsFromWishPois } from "../manualPlan.js";
 import {
   bearingDeg,
@@ -80,13 +80,16 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const stopPickerTimerRef = useRef(null);
   const fetchedBlurbIds = useRef(new Set());
   const [locateBusy, setLocateBusy] = useState(false);
-  const [activeId, setActiveId] = useState(plan.stops[0]?.id || null);
+  const [activeId, setActiveId] = useState(plan.stops?.[0]?.id || null);
   const [phase, setPhase] = useState("intro");
   const [customIds, setCustomIds] = useState(() => uniqueChainIds(plan.knooppunten));
   const [rerouteBusy, setRerouteBusy] = useState(false);
   const [rerouteError, setRerouteError] = useState("");
   const [draft, setDraft] = useState(null);
   const [draftBusy, setDraftBusy] = useState(false);
+  const [nearbyNodes, setNearbyNodes] = useState([]);
+  const [viewFocus, setViewFocus] = useState(null);
+  const nearbyLoadGenRef = useRef(0);
   const [stepIndex, setStepIndex] = useState(0);
   const [question, setQuestion] = useState("");
   const [askBusy, setAskBusy] = useState(false);
@@ -147,9 +150,28 @@ export default function Ride({ plan, onPlanChange, onBack }) {
         network: node.network || null,
       }));
     const nodeGeom = nodes.map((node) => [node.lat, node.lng]);
+    const fullGeom = Array.isArray(current.geometry) ? current.geometry : [];
+    // Lange tochten: meer steekproefpunten zodat de backend langs heel traject zoekt.
+    let geomBudget = 48;
+    if (fullGeom.length > 1) {
+      let m = 0;
+      for (let i = 1; i < fullGeom.length; i += 1) {
+        const a = fullGeom[i - 1];
+        const b = fullGeom[i];
+        if (!a || !b) continue;
+        const dLat = (Number(b[0]) - Number(a[0])) * 110540;
+        const dLng =
+          (Number(b[1]) - Number(a[1])) *
+          111320 *
+          Math.cos((Number(a[0]) * Math.PI) / 180);
+        m += Math.hypot(dLat, dLng);
+      }
+      const km = m / 1000;
+      geomBudget = Math.max(48, Math.min(120, Math.round(km * 1.1) || 48));
+    }
     const geom =
-      current.geometry?.length > 1
-        ? samplePlanGeometry(current.geometry, 48)
+      fullGeom.length > 1
+        ? samplePlanGeometry(fullGeom, geomBudget)
         : nodeGeom.length >= 2
           ? nodeGeom
           : [];
@@ -180,7 +202,7 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     try {
       const data = await fetchWishSuggestions(
         { notes, interests, geometry: geom, nodes },
-        { timeoutMs: 20_000, signal: ac.signal },
+        { timeoutMs: 28_000, signal: ac.signal },
       );
       if (ac.signal.aborted) return;
       const items = Array.isArray(data?.suggestions) ? data.suggestions : [];
@@ -222,26 +244,30 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     };
   }, [reloadWishSuggestions]);
 
-  const active = plan.stops.find((stop) => stop.id === activeId) || plan.stops[0];
+  const stops = Array.isArray(plan?.stops) ? plan.stops : [];
+  const active = stops.find((stop) => stop.id === activeId) || stops[0];
   const suggestionStops = useMemo(() => {
     const wish = [];
     const rest = [];
-    for (const stop of plan.stops || []) {
+    for (const stop of stops) {
       if (stop.matches_wish) wish.push(stop);
       else rest.push(stop);
     }
     wish.sort((a, b) => Number(Boolean(a.on_route)) - Number(Boolean(b.on_route)));
     return [...wish, ...rest];
-  }, [plan.stops]);
-  const wishStops = useMemo(
-    () => (plan.stops || []).filter((stop) => stop.matches_wish),
-    [plan.stops],
-  );
-  const mapStops = useMemo(
-    () => (plan.stops || []).filter((stop) => !stop.matches_wish),
-    [plan.stops],
-  );
-  const allNodes = plan.all_knooppunten?.length ? plan.all_knooppunten : plan.knooppunten || [];
+  }, [stops]);
+  const wishStops = useMemo(() => stops.filter((stop) => stop.matches_wish), [stops]);
+  const mapStops = useMemo(() => stops.filter((stop) => !stop.matches_wish), [stops]);
+  const allNodes = useMemo(() => {
+    const byId = new Map();
+    for (const node of plan.all_knooppunten?.length ? plan.all_knooppunten : plan.knooppunten || []) {
+      if (node) byId.set(nodeId(node), node);
+    }
+    for (const node of nearbyNodes) {
+      if (node) byId.set(nodeId(node), node);
+    }
+    return Array.from(byId.values());
+  }, [plan.all_knooppunten, plan.knooppunten, nearbyNodes]);
   const nodeLookup = useMemo(() => {
     const map = new Map();
     for (const node of allNodes) map.set(nodeId(node), node);
@@ -267,12 +293,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
   const mapNodes = useMemo(
     () =>
       mergeMapKnooppunten(
-        allNodes,
+        nearbyNodes,
         routeNodes,
         [],
         dirty && draft?.geometry?.length ? draft.geometry : plan.geometry,
       ),
-    [allNodes, routeNodes, dirty, draft?.geometry, plan.geometry],
+    [nearbyNodes, routeNodes, dirty, draft?.geometry, plan.geometry],
   );
   const liveKm = dirty
     ? draft?.distance_km ?? estimateRouteKm(plan.start, selectedNodes, plan.mode !== "punt")
@@ -465,10 +491,58 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     setSurroundingsError("");
     setPosition({ lat: plan.start.lat, lng: plan.start.lng });
     setDraft(null);
+    setNearbyNodes([]);
     setChats({});
     setGuideOpen(true);
     guideOpenRef.current = true;
+    const geom = plan.geometry || [];
+    const mid = geom[Math.floor(geom.length / 2)];
+    if (Array.isArray(mid) && Number.isFinite(Number(mid[0])) && Number.isFinite(Number(mid[1]))) {
+      setViewFocus({ lat: Number(mid[0]), lng: Number(mid[1]) });
+    } else if (Number.isFinite(Number(plan.start?.lat)) && Number.isFinite(Number(plan.start?.lng))) {
+      setViewFocus({ lat: Number(plan.start.lat), lng: Number(plan.start.lng) });
+    }
   }, [plan.knoop_chain]);
+
+  const nearbyFocusKey = useDebounced(
+    viewFocus && Number.isFinite(viewFocus.lat) && Number.isFinite(viewFocus.lng)
+      ? `${viewFocus.lat.toFixed(2)},${viewFocus.lng.toFixed(2)}`
+      : "",
+    220,
+  );
+
+  useEffect(() => {
+    if (!nearbyFocusKey) return undefined;
+    const [latS, lngS] = nearbyFocusKey.split(",");
+    const lat = Number(latS);
+    const lng = Number(lngS);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return undefined;
+    const loadId = ++nearbyLoadGenRef.current;
+    let cancelled = false;
+    fetchKnooppunten(lat, lng, 12000)
+      .then((batch) => {
+        if (cancelled || loadId !== nearbyLoadGenRef.current) return;
+        const next = Array.isArray(batch) ? batch : [];
+        setNearbyNodes((prev) => {
+          const out = new Map();
+          for (const node of next) {
+            if (!node || out.size >= 220) break;
+            out.set(nodeId(node), node);
+          }
+          for (const node of prev || []) {
+            if (out.size >= 220) break;
+            out.set(nodeId(node), node);
+          }
+          return Array.from(out.values());
+        });
+      })
+      .catch(() => {
+        /* omgeving blijft optioneel */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nearbyFocusKey]);
 
   useEffect(() => {
     if (!dirty || !previewKey) {
@@ -1381,20 +1455,36 @@ export default function Ride({ plan, onPlanChange, onBack }) {
             <KnoopProgressCard label="Volgende" item={knoopProgress.next} />
           </div>
         )}
-        <MapContainer center={[plan.start.lat, plan.start.lng]} zoom={13} scrollWheelZoom zoomControl={false}>
+        <MapContainer
+          center={[
+            Number.isFinite(Number(plan.start?.lat)) ? Number(plan.start.lat) : 50.85,
+            Number.isFinite(Number(plan.start?.lng)) ? Number(plan.start.lng) : 4.35,
+          ]}
+          zoom={13}
+          scrollWheelZoom
+          zoomControl={false}
+        >
           <TileLayer attribution={MAP_TILE.attribution} url={MAP_TILE.url} />
           <MapResize />
           <MapReady onReady={setMap} />
+          <MapPanFocus active onFocus={setViewFocus} />
           <MapZoomScale referenceZoom={13}>
-          <RouteLine positions={plan.geometry} opacity={dirty ? 0.45 : 1} />
+          <RouteLine
+            positions={(Array.isArray(plan.geometry) ? plan.geometry : []).filter(
+              (pt) => Array.isArray(pt) && Number.isFinite(Number(pt[0])) && Number.isFinite(Number(pt[1])),
+            )}
+            opacity={dirty ? 0.45 : 1}
+          />
           {dirty && draft?.geometry?.length > 1 && (
             <RouteLine positions={draft.geometry} color="#4f8f43" dashed />
           )}
           <RideKnoopMarkers nodes={mapNodes} nodeVariant={nodeVariant} onToggle={toggleNode} customIds={customIds} />
-          {mapStops.map((stop, index) => (
+          {mapStops
+            .filter((stop) => Number.isFinite(Number(stop.lat)) && Number.isFinite(Number(stop.lng)))
+            .map((stop, index) => (
             <Marker
               key={stop.id}
-              position={[stop.lat, stop.lng]}
+              position={[Number(stop.lat), Number(stop.lng)]}
               icon={stopIcon(index + 1)}
               zIndexOffset={1000}
             >
@@ -1409,10 +1499,12 @@ export default function Ride({ plan, onPlanChange, onBack }) {
               </Popup>
             </Marker>
           ))}
-          {wishStops.map((stop) => (
+          {wishStops
+            .filter((stop) => Number.isFinite(Number(stop.lat)) && Number.isFinite(Number(stop.lng)))
+            .map((stop) => (
             <Marker
               key={`wish-${stop.id}`}
-              position={[stop.lat, stop.lng]}
+              position={[Number(stop.lat), Number(stop.lng)]}
               icon={wishPoiIcon({
                 interest: stop.interest,
                 kind: stop.kind_label || stop.kind,
@@ -1691,12 +1783,14 @@ function getStopPickerBlurb(stop, stopBlurbs, stopBlurbBusy) {
 function RideKnoopMarkers({ nodes, nodeVariant, onToggle, customIds }) {
   const { scale, showKnoopMarkers } = useMapZoom();
   if (!showKnoopMarkers) return null;
-  return nodes.map((node) => {
+  return nodes
+    .filter((node) => node && Number.isFinite(Number(node.lat)) && Number.isFinite(Number(node.lng)))
+    .map((node) => {
     const variant = nodeVariant(node);
     return (
       <Marker
         key={nodeId(node)}
-        position={[node.lat, node.lng]}
+        position={[Number(node.lat), Number(node.lng)]}
         icon={nodeIcon(node.number, variant, scale)}
         zIndexOffset={variant === "picked" ? 1200 : 1000}
         eventHandlers={{
@@ -1708,6 +1802,41 @@ function RideKnoopMarkers({ nodes, nodeVariant, onToggle, customIds }) {
       />
     );
   });
+}
+
+function MapPanFocus({ active, delayMs = 120, onFocus }) {
+  const map = useMap();
+  const timerRef = useRef(null);
+  const onFocusRef = useRef(onFocus);
+  onFocusRef.current = onFocus;
+
+  const schedule = () => {
+    if (!active) return;
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      const center = map.getCenter();
+      onFocusRef.current({ lat: center.lat, lng: center.lng });
+    }, delayMs);
+  };
+
+  useMapEvents({
+    dragstart() {
+      clearTimeout(timerRef.current);
+    },
+    moveend: schedule,
+    zoomend: schedule,
+  });
+
+  useEffect(() => {
+    if (!active) {
+      clearTimeout(timerRef.current);
+      return undefined;
+    }
+    schedule();
+    return () => clearTimeout(timerRef.current);
+  }, [active, delayMs, map]);
+
+  return null;
 }
 
 function formatElapsed(ms) {
