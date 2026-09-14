@@ -286,7 +286,14 @@ async def fetch_nodes(
     lng: float,
     radius_m: int,
     extra: tuple[float, float] | None = None,
+    *,
+    prefer_dominant: bool = False,
 ) -> list[dict[str, Any]]:
+    """Haal knooppunten op rond een punt.
+
+    Kaartweergave: prefer_dominant=False — toon alle netwerken (Waasland + Scheldeland + …).
+    Alleen bij expliciete routing-preferentie filteren op dominant netwerk.
+    """
     radius_m = max(4000, min(int(radius_m), 18000))
     points = [(lat, lng)]
     if extra:
@@ -294,9 +301,10 @@ async def fetch_nodes(
     # Nodes meteen; traject-warmte op de achtergrond → snellere UI + volgende legs.
     wfs = await _from_wfs(points, radius_m)
     asyncio.create_task(warm_area_network(lat, lng, min(radius_m, 14000)))
-    dominant = dominant_network_near(wfs, lat, lng, min(radius_m, 12000))
-    if dominant:
-        wfs = [node for node in wfs if node.get("network") == dominant]
+    if prefer_dominant:
+        dominant = dominant_network_near(wfs, lat, lng, min(radius_m, 12000))
+        if dominant:
+            wfs = [node for node in wfs if node.get("network") == dominant]
     osm: list[dict[str, Any]] = []
     if len(wfs) < 6:
         osm = await _from_osm(lat, lng, radius_m, extra)
@@ -330,7 +338,8 @@ async def _from_wfs(points: list[tuple[float, float]], radius_m: int) -> list[di
                         "typeName": "routes:knoop_fiets",
                         "outputFormat": "application/json",
                         "srsName": "EPSG:4326",
-                        "maxFeatures": 180,
+                        # Genoeg voor grenszones (meerdere FNWs in één viewport).
+                        "maxFeatures": 500,
                         "cql_filter": cql,
                     },
                     timeout=12.0,

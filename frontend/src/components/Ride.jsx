@@ -519,18 +519,19 @@ export default function Ride({ plan, onPlanChange, onBack }) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return undefined;
     const loadId = ++nearbyLoadGenRef.current;
     let cancelled = false;
-    fetchKnooppunten(lat, lng, 12000)
+    fetchKnooppunten(lat, lng, 18000)
       .then((batch) => {
         if (cancelled || loadId !== nearbyLoadGenRef.current) return;
         const next = Array.isArray(batch) ? batch : [];
         setNearbyNodes((prev) => {
           const out = new Map();
+          const budget = 420;
           for (const node of next) {
-            if (!node || out.size >= 220) break;
+            if (!node || out.size >= budget) break;
             out.set(nodeId(node), node);
           }
           for (const node of prev || []) {
-            if (out.size >= 220) break;
+            if (out.size >= budget) break;
             out.set(nodeId(node), node);
           }
           return Array.from(out.values());

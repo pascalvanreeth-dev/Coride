@@ -656,8 +656,19 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
     setNodesBusy(true);
 
     const suggestMode = buildMode === "suggest" && Boolean(selectedSuggestionId);
-    const radius = suggestMode ? 18000 : 12000;
+    // Altijd max viewport-radius: bij zoom-uit (Lokeren↔Temse) mist 12 km de randen.
+    const radius = 18000;
     const centers = [{ lat, lng }];
+    // Extra steekproeven zodat meerdere FNWs (Waasland/Scheldeland/…) meeladen.
+    const offsets = [
+      [0.06, 0],
+      [-0.06, 0],
+      [0, 0.09],
+      [0, -0.09],
+    ];
+    for (const [dLat, dLng] of offsets) {
+      centers.push({ lat: lat + dLat, lng: lng + dLng });
+    }
     if (suggestMode) {
       const suggestion = suggestions.find((item) => item.id === selectedSuggestionId);
       for (const loc of suggestion?.localities || []) {
@@ -687,8 +698,9 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             if (node) out.set(nodeId(node), node);
           }
           // Viewport-fetch daarna — omgeving mag niet verdwijnen achter via-knopen van de draft.
+          const markerBudget = 420;
           for (const node of next) {
-            if (out.size >= 220) break;
+            if (out.size >= markerBudget) break;
             out.set(nodeId(node), node);
           }
           // Beperkte route-spine voor lookup/magenta (niet alle via's).
@@ -697,11 +709,11 @@ export default function Planner({ busy, error, center, zoom = 14, profile, onEdi
             if (!node || spine >= 48) break;
             const id = nodeId(node);
             if (!out.has(id)) spine += 1;
-            if (out.size >= 220) break;
+            if (out.size >= markerBudget) break;
             out.set(id, node);
           }
           for (const node of prev || []) {
-            if (out.size >= 220) break;
+            if (out.size >= markerBudget) break;
             out.set(nodeId(node), node);
           }
           return Array.from(out.values());
